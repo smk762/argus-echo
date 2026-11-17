@@ -421,13 +421,11 @@ class MisoLoadError(RuntimeError):
 
 
 def _is_oom(exc: BaseException) -> bool:
-    try:
+    with contextlib.suppress(Exception):  # classification only: anything torch can't inspect is not an OOM
         import torch
 
         if isinstance(exc, torch.cuda.OutOfMemoryError):
             return True
-    except Exception:
-        pass
     return "out of memory" in str(exc).lower()
 
 
@@ -459,7 +457,7 @@ def _empty_cuda_cache() -> None:
     left ~2 GB reserved after unload (smk762/voluptas#26). Clearing the workspaces first
     lets empty_cache() release it; cuBLAS allocates a new one on its next call.
     Only call this when no GPU work is running."""
-    try:
+    with contextlib.suppress(Exception):  # best-effort cache release; there may be no CUDA context
         import torch
 
         if not torch.cuda.is_available():
@@ -469,18 +467,14 @@ def _empty_cuda_cache() -> None:
             torch.cuda.synchronize()
             clear()
         torch.cuda.empty_cache()
-    except Exception:
-        pass
 
 
 def _release_host_memory() -> None:
     """Free dropped tensors and hand the heap back to the OS."""
     gc.collect()
     _empty_cuda_cache()
-    try:  # glibc keeps freed arenas mapped otherwise, so RSS would not fall
+    with contextlib.suppress(Exception):  # glibc keeps freed arenas mapped, so RSS would not fall without malloc_trim; elsewhere it is absent
         _libc().malloc_trim(0)
-    except Exception:
-        pass
 
 
 @functools.lru_cache(maxsize=1)
@@ -661,7 +655,7 @@ class MisoModelManager:
                 try:
                     mod.to(torch.device(device))
                 except Exception:
-                    pass
+                    logger.warning("aux_module_move_failed", module=attr, device=device, exc_info=True)
         gen.device = torch.device(device)
         if device == "cpu":
             _empty_cuda_cache()
@@ -789,7 +783,7 @@ _clone_cache: OrderedDict = OrderedDict()
 
 
 def _gpu_memory_info() -> dict | None:
-    try:
+    with contextlib.suppress(Exception):  # /health reports memory when it can; a failed probe omits it
         import torch
 
         if torch.cuda.is_available():
@@ -798,8 +792,6 @@ def _gpu_memory_info() -> dict | None:
                 "reserved_mb": round(torch.cuda.memory_reserved() / 1024**2, 1),
                 "total_mb": round(torch.cuda.get_device_properties(0).total_memory / 1024**2, 1),
             }
-    except Exception:
-        pass
     return None
 
 
@@ -1419,7 +1411,7 @@ async def lifespan(app: FastAPI):
         try:
             await _mgr.ensure_ready()
         except Exception:
-            pass
+            logger.warning("preload_failed", hint="the first request retries the load; /health shows the error", exc_info=True)
     watchdog = asyncio.create_task(_stuck_watchdog())
     yield
     watchdog.cancel()

@@ -47,6 +47,7 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict
+import contextlib
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import AsyncIterator, Optional
@@ -295,10 +296,8 @@ class TTSModelManager:
         """Let an orphaned move finish (and set its state) before reading the state."""
         task = self._move_task
         if task is not None and not task.done():
-            try:
+            with contextlib.suppress(Exception):  # only waiting for the orphaned task; its own handler records any failure
                 await asyncio.shield(task)
-            except Exception:
-                pass
 
     async def _make_ready(self) -> None:
         # Caller holds self._lock.
@@ -409,10 +408,8 @@ class TTSModelManager:
         """Let an in-flight load finish before demoting/unloading, so the worker
         thread can't assign models after they were freed. Its failure is not ours.
         An orphaned GPU<->CPU move is waited for too."""
-        try:
+        with contextlib.suppress(Exception):  # only waiting for the orphaned load; its own handler records any failure
             await self._await_load()
-        except Exception:
-            pass
         await self._await_move()
 
     def _arm_evict(self) -> None:
@@ -965,11 +962,9 @@ def _free_vram_mb() -> Optional[int]:
     """Device-wide free VRAM, only when this process already holds a CUDA
     context: creating one just to answer /health would cost VRAM itself."""
     torch = sys.modules.get("torch")
-    try:
+    with contextlib.suppress(Exception):  # free VRAM is optional in /health
         if torch is not None and torch.cuda.is_initialized():
             return int(torch.cuda.mem_get_info()[0] / 1024**2)
-    except Exception:
-        pass
     return None
 
 

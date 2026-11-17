@@ -59,6 +59,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+import contextlib
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Optional
@@ -262,10 +263,8 @@ class XTTSModelManager:
         freed. Its failure is not ours: the state it left (ERROR) says so."""
         task = self._transition
         if task is not None and not task.done():
-            try:
+            with contextlib.suppress(Exception):  # only waiting for the orphaned task; its own handler records any failure
                 await asyncio.shield(task)
-            except Exception:
-                pass
 
     async def _ensure_gpu_locked(self) -> None:
         """Promote to GPU (loading first if needed). Caller holds ``_lock``.
@@ -573,20 +572,16 @@ def _audio_duration(path: str) -> float | None:
     Returns None if neither backend can read the container, so the caller can
     defer to XTTS's own loader rather than rejecting a usable upload.
     """
-    try:
+    with contextlib.suppress(Exception):  # fall through to the torchaudio probe
         import soundfile as sf
 
         return float(sf.info(path).duration)
-    except Exception:
-        pass
-    try:
+    with contextlib.suppress(Exception):  # fall through to the next duration estimate
         import torchaudio
 
         info = torchaudio.info(path)
         if info.sample_rate:
             return info.num_frames / info.sample_rate
-    except Exception:
-        pass
     return None
 
 
@@ -600,7 +595,7 @@ def _normalise_language(raw: str) -> str:
 
 
 def _gpu_memory_info() -> dict | None:
-    try:
+    with contextlib.suppress(Exception):  # /health reports memory when it can; a failed probe omits it
         import torch
 
         if torch.cuda.is_available():
@@ -612,8 +607,6 @@ def _gpu_memory_info() -> dict | None:
                 "reserved_mb": round(reserved, 1),
                 "total_mb": round(total, 1),
             }
-    except Exception:
-        pass
     return None
 
 
@@ -833,10 +826,8 @@ async def synthesise_stream(req: SynthesiseRequest):
             finally:
                 close = getattr(stream, "close", None)
                 if close is not None:
-                    try:
+                    with contextlib.suppress(Exception):  # closing an abandoned stream generator is best-effort
                         close()
-                    except Exception:
-                        pass
                 # The end-of-stream sentinel bypasses ``slots``: it is always
                 # delivered, so a consumer can never wait forever.
                 _deliver(None)
@@ -1792,11 +1783,9 @@ def _free_vram_mb() -> Optional[int]:
     """Device-wide free VRAM, only when this process already holds a CUDA
     context: creating one just to answer /health would cost VRAM itself."""
     torch = sys.modules.get("torch")
-    try:
+    with contextlib.suppress(Exception):  # free VRAM is optional in /health
         if torch is not None and torch.cuda.is_initialized():
             return int(torch.cuda.mem_get_info()[0] / 1024**2)
-    except Exception:
-        pass
     return None
 
 
