@@ -1,0 +1,6 @@
+.venv
+__pycache__
+*.egg-info
+miso-data
+run.env
+test_*.py

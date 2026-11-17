@@ -1,0 +1,43 @@
+# argus-iris tenant manifest for argus-echo. Validated by argus-cortex's TenantManifest
+# (CI job `gpu-tenant`); unknown fields are refused.
+#
+# echo takes no leases: its engines are observed residents that iris unloads, evicts and
+# wakes through the argus-http adapter. No `node` and no `base_url`: each engine runs on
+# whichever host can hold it (Miso needs ~17 GB VRAM; XTTS and Qwen fit in 8 GB), and the
+# deployment tells iris where, in iris's own `services` config. Container names match
+# compose.yaml.
+tenant_version: "1.0"
+tenant: argus-echo
+description: Speech servers (Miso TTS 8B, XTTS-v2, Qwen3-TTS) behind one HTTP contract.
+repo: smk762/argus-echo
+kinds: []
+residents:
+  # /admin/evict parks Miso on CPU (~17 GB of host RAM); MISO_KEEP_ALIVE_GPU still unloads it when idle.
+  - name: miso
+    adapter: argus-http
+    container: argus-echo-miso
+    vram_mb: 17000
+    health_path: /health
+    unload_path: /admin/unload
+    evict_path: /admin/evict
+    warm_path: /admin/wake
+    admin_auth: true
+
+  - name: xtts
+    adapter: argus-http
+    container: argus-echo-xtts
+    vram_mb: 2000
+    health_path: /health
+    unload_path: /admin/unload
+    evict_path: /admin/evict
+    warm_path: /admin/wake
+    admin_auth: true
+
+  - name: qwen
+    adapter: argus-http
+    container: argus-echo-qwen
+    health_path: /health
+    unload_path: /admin/unload
+    evict_path: /admin/evict
+    warm_path: /admin/wake
+    admin_auth: true

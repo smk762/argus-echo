@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+#
+# argus-echo's Qwen3-TTS engine. Build from the repo root:
+#   docker build -f engines/qwen/Dockerfile engines/qwen
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# sox is required by qwen-tts for audio processing
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends sox libsox-dev
+
+# torch + torchaudio with CUDA support (build arg selects wheel index)
+ARG TTS_TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch torchaudio --index-url "${TTS_TORCH_INDEX_URL}"
+
+# FastAPI + runtime deps; argus-cortex for the admin bearer check.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install fastapi "uvicorn[standard]" structlog python-multipart "argus-cortex[server]>=0.8,<0.10"
+
+# TTS-specific packages
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install qwen-tts soundfile boto3
+
+# Bake both model variants into the image so first-run is instant.
+ARG TTS_MODEL_SIZE=0.6b
+RUN python -c "\
+from qwen_tts import Qwen3TTSModel; \
+size='${TTS_MODEL_SIZE}'.upper(); \
+Qwen3TTSModel.from_pretrained(f'Qwen/Qwen3-TTS-12Hz-{size}-Base'); \
+Qwen3TTSModel.from_pretrained(f'Qwen/Qwen3-TTS-12Hz-{size}-CustomVoice')"
+
+COPY tts_server.py .
+
+EXPOSE 8031
+
+ENV TTS_MODEL_SIZE=${TTS_MODEL_SIZE}
+ENV TTS_DEVICE=cuda:0
+
+CMD ["uvicorn", "tts_server:app", "--host", "0.0.0.0", "--port", "8031"]

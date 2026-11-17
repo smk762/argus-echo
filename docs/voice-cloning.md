@@ -1,0 +1,64 @@
+# Voice cloning: getting the best results
+
+The engines clone differently, so the best reference differs per engine. argus-mask's
+[voices guide](https://github.com/smk762/argus-mask/blob/dev/docs/voices.md) covers recording, synthetic voices
+and consent in depth; this page is what each engine does with what you send.
+
+| | **XTTS-v2** | **Miso** | **Qwen3-TTS** |
+|---|---|---|---|
+| Strategy | Averages a speaker embedding across clips | One-shot: conditions on one reference | One-shot (Base model) |
+| Ideal input | 3–8 clips of 3–10 s, 6–60 s in total | **One** clean, expressive 6–15 s clip | One clean clip |
+| More clips help? | Yes, up to the conditioning window | No: the best-scoring clip is used | Takes one clip |
+| Transcript (`reference_text`) | Optional | **Needed**: a wrong or missing one degrades the clone. Without one, Miso transcribes the clip if `MISO_WHISPER_URL` is set | Recommended |
+| Strength | Robust, noise-averaged timbre | Expressive prosody and emotion | Voice design and delivery instructions on the built-in speakers |
+
+## Recording, for every engine
+
+- **Clean signal.** A quiet room with no music or TV and little reverb. A close mic (15–30 cm) beats a distant one.
+- **One speaker.** No overlapping voices or background chatter.
+- **Natural, expressive delivery.** Speak the way the clone should sound: monotone in, monotone out.
+- **Consistent capture.** Same mic, distance and room across clips.
+- **Good level, no clipping.** Well above the noise floor, but with no distorted peaks.
+- **Format.** WAV or FLAC preferred; MP3 and M4A work. Any sample rate; stereo is downmixed.
+
+## XTTS-v2
+
+- Send several short clips with **different sentences** but the same voice and capture conditions: varied words
+  cover more phonemes, and identical conditions average cleanly.
+- Call `POST /analyze-clips` first. It scores each clip (SNR, clipping, seconds of speech, consistency with the
+  rest of the set), leaves out low scorers, and orders the rest best first, which is the order that fills the
+  conditioning window (`XTTS_GPT_COND_LEN`, 30 s).
+- Each clip is standardised before the latents are computed: mono, resample, high-pass, VAD trim, denoise when
+  the SNR is low, loudness normalisation. `/clone-voice` returns a report per clip.
+
+## Miso
+
+- **Miso has no usable built-in voices.** Speakers `0` and `1` are conversation turns, not personas: without a
+  clone the voice is improvised and different on every request. Clone a voice for anything you keep.
+- Send **one** clip of clean, expressive speech. There is no averaging to hide a bad take.
+- Send its transcript as `reference_text`. Miso aligns the clone to it.
+- Pick a clip with the prosody you want (warmth, energy, pace); Miso copies emotion well.
+- You can still send several clips: they are scored and the best one is used.
+- Trim long silences at the start and end. Miso keeps the first 20 s (`MISO_REF_MAX_SECONDS`).
+- Miso has no tone or emotion setting; `voice_description`, `instruction` and `emotion` are ignored.
+
+## Qwen3-TTS
+
+- `/clone-voice` takes one clip and stores the Base model's prompt.
+- For a voice that doesn't exist, use a CustomVoice speaker with a `voice_description` or an `instruction`
+  instead of cloning. A common route: design a voice on Qwen, then clone the result on Miso for quality.
+
+## After cloning
+
+- A clone lives at `voice_clones/<companion_id>/` on the engine that made it (`prompt.pt` and `meta.json`), and is
+  used by passing `voice_clone_id`. **Clones don't move between engines**: each engine's `prompt.pt` is its own
+  format.
+- On Miso and XTTS, `GET /clones/<id>/download` backs a clone up as a zip and `POST /clones/import` restores it to
+  the same engine.
+- Clone a real person's voice only with their consent; see [api.md#security](api.md#security).
+
+## Home Assistant
+
+The Wyoming bridge exposes an engine to Home Assistant as a `tts` engine (`--profile wyoming-xtts` on `10240`,
+`--profile wyoming-miso` on `10241`). It advertises each stored clone as `clone:<companion_id>`. Add it under
+**Settings → Devices & Services → Wyoming Protocol** with this host's address and the port.

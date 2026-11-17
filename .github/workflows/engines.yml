@@ -1,0 +1,85 @@
+name: Engines
+
+# Each engine's unit tests, in that engine's own environment. They stub or mock the models, so no GPU or weights
+# are needed. Miso resolves its locked environment (torch 2.4) from engines/miso/uv.lock; XTTS and Qwen stub torch.
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+concurrency:
+  group: engines-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  SERVER_DEPS: >-
+    --with fastapi --with httpx --with structlog --with boto3 --with numpy --with soundfile
+    --with python-multipart --with pytest --with pydantic
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [miso, xtts, qwen]
+    defaults:
+      run:
+        working-directory: engines/${{ matrix.engine }}
+    steps:
+      - name: Free disk space
+        if: matrix.engine == 'miso'
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc && df -h /
+        working-directory: .
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: ruff (errors only)
+        run: uvx ruff@0.15.16 check --select E9,F63,F7,F82 .
+      - name: pytest (miso)
+        if: matrix.engine == 'miso'
+        run: >-
+          uv run --python 3.11 --with setuptools --with fastapi --with "uvicorn[standard]"
+          --with python-multipart --with structlog --with boto3 --with silero-vad --with pyloudnorm
+          --with noisereduce --with httpx --with pytest python -m pytest -q
+      - name: pytest (${{ matrix.engine }})
+        if: matrix.engine != 'miso'
+        run: uv run --no-project --python 3.11 --with "argus-cortex[server]>=0.8,<0.10" $SERVER_DEPS python -m pytest -q tests
+
+  wyoming:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engines/wyoming
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: ruff (errors only)
+        run: uvx ruff@0.15.16 check --select E9,F63,F7,F82 .
+      - name: imports
+        run: uv run --no-project --python 3.11 --with-requirements requirements.txt python -c "import tts_bridge"
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Every profile resolves
+        run: |
+          for p in miso xtts qwen wyoming-xtts wyoming-miso; do
+            docker compose --profile "$p" config -q && echo "$p ok"
+          done
+
+  gpu-tenant:
+    # gpu-tenant.yaml must validate as argus-cortex's TenantManifest (argus-iris refuses unknown fields).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: >-
+          uv run --no-project --python 3.12 --with "argus-cortex[yaml]>=0.9,<0.10"
+          python -c "from argus_cortex.gpu_wire import load_tenant_manifest as load;
+          m = load('gpu-tenant.yaml'); print(m.tenant, [r.name for r in m.residents])"
