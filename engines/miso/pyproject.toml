@@ -26,3 +26,9 @@ dependencies = [
 
 [tool.setuptools]
 py-modules = ["generator", "models", "moshi_compat", "watermarking"]
+
+[tool.uv]
+# Security floors past moshi 0.2.2's own pins (aiohttp<3.12, sentencepiece==0.2). Miso imports only
+# moshi.models and moshi.utils; aiohttp is used by moshi's client/server CLIs alone, and sentencepiece
+# 0.2.1 is a patch release. Drop these when moshi is upgraded.
+override-dependencies = ["aiohttp>=3.14.4", "sentencepiece>=0.2.1"]
