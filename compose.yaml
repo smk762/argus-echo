@@ -3,7 +3,8 @@
 #   docker compose --profile miso up -d                  # 24 GB GPU: Miso 8B (~17 GB VRAM)
 #   docker compose --profile xtts --profile qwen up -d   # 8 GB GPU: XTTS-v2 (~2 GB), Qwen3-TTS 0.6B
 #   docker compose --profile whisper up -d               # speech to text: Whisper large-v3-turbo (~3 GB VRAM)
-#   docker compose --profile wyoming-xtts up -d          # Wyoming bridge (CPU) in front of an engine
+#   docker compose --profile wyoming-xtts up -d          # Wyoming TTS bridge (CPU) in front of an engine
+#   docker compose --profile wyoming-whisper up -d       # Wyoming ASR bridge (CPU) in front of whisper
 #
 # Every port is published as ${ECHO_BIND}:<port>. ECHO_BIND defaults to loopback; set it to
 # 0.0.0.0 or a LAN address to serve other machines. /admin/* is closed until
@@ -159,7 +160,7 @@ services:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5).read()"]
     <<: *gpu
 
-  # Wyoming bridges (CPU). Each forwards to one engine's /synthesise/stream; point
+  # Wyoming TTS bridges (CPU). Each forwards to one engine's /synthesise/stream; point
   # *_ENGINE_URL elsewhere to bridge an engine on another host.
   wyoming-xtts:
     profiles: [wyoming-xtts]
@@ -189,3 +190,44 @@ services:
       WYOMING_TTS_ATTRIBUTION_NAME: Miso Labs
       WYOMING_TTS_ATTRIBUTION_URL: https://huggingface.co/MisoLabs/MisoTTS
       WYOMING_TTS_LANGUAGE: en
+      WYOMING_TTS_LANGUAGES: en
+
+  # Qwen renders the whole clip before sending it, so first audio arrives only when
+  # the utterance is done (Miso and XTTS start within a sentence). Qwen has no
+  # GET /clones, so only the default speaker is advertised.
+  wyoming-qwen:
+    profiles: [wyoming-qwen]
+    build:
+      context: ./engines/wyoming
+    image: ghcr.io/smk762/argus-echo-wyoming:${ECHO_TAG:-local}
+    container_name: argus-echo-wyoming-qwen
+    restart: unless-stopped
+    ports:
+      - "${ECHO_BIND:-127.0.0.1}:${WYOMING_QWEN_PORT:-10242}:10200"
+    environment:
+      TTS_URL: ${WYOMING_QWEN_ENGINE_URL:-http://qwen:8031}
+      XTTS_DEFAULT_SPEAKER: ${WYOMING_QWEN_SPEAKER:-ryan}
+      WYOMING_TTS_PROGRAM_NAME: qwen
+      WYOMING_TTS_PROGRAM_DESC: Qwen3-TTS (built-in speakers)
+      WYOMING_TTS_ATTRIBUTION_NAME: Qwen
+      WYOMING_TTS_ATTRIBUTION_URL: https://huggingface.co/Qwen
+      WYOMING_TTS_LANGUAGE: en
+      WYOMING_TTS_LANGUAGES: en,zh,ja,ko,de,fr,ru,pt,es,it
+
+  # Wyoming ASR bridge (CPU, same image): buffers each utterance and posts it to the
+  # whisper engine's POST /transcribe. Home Assistant adds it as a speech-to-text service.
+  wyoming-whisper:
+    profiles: [wyoming-whisper]
+    build:
+      context: ./engines/wyoming
+    image: ghcr.io/smk762/argus-echo-wyoming:${ECHO_TAG:-local}
+    container_name: argus-echo-wyoming-whisper
+    restart: unless-stopped
+    command: ["python", "asr_bridge.py"]
+    ports:
+      - "${ECHO_BIND:-127.0.0.1}:${WYOMING_WHISPER_PORT:-10243}:10300"
+    environment:
+      STT_URL: ${WYOMING_WHISPER_ENGINE_URL:-http://whisper:8031}
+      # Blank: the language Home Assistant sends, else detect.
+      WYOMING_ASR_LANGUAGE: ${WYOMING_WHISPER_LANGUAGE:-}
+      WYOMING_ASR_TIMEOUT: ${WYOMING_WHISPER_TIMEOUT:-120}

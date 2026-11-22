@@ -1,15 +1,15 @@
-"""Wyoming TTS bridge → XTTS-contract sidecar (XTTS-v2 or Miso).
+"""Wyoming TTS bridge → XTTS-contract sidecar (XTTS-v2, Miso or Qwen3-TTS).
 
 Speaks the Wyoming protocol on a TCP port and translates `synthesize` requests
 into calls to a TTS sidecar's streaming endpoint (`POST /synthesise/stream`,
-raw 24 kHz mono float32 PCM). The float samples are converted to signed 16-bit
+raw mono float32 PCM, 24 kHz on XTTS and Miso). The float samples are converted to signed 16-bit
 and re-emitted as Wyoming AudioChunks so Home Assistant can consume them as a
 normal `tts` engine.
 
 The bridge is engine-agnostic: it targets whatever sidecar ``TTS_URL`` (or the
 legacy ``XTTS_URL``) points at, and the advertised program name/attribution are
-configurable, so one module powers both the `wyoming-xtts` and `wyoming-miso`
-services. Both XTTS-v2 and Miso expose the same 24 kHz float32 stream contract.
+configurable, so one module powers the `wyoming-xtts`, `wyoming-miso` and `wyoming-qwen`
+services. Every engine streams float32 PCM; the rate is read from X-Sample-Rate.
 
 Voices advertised in the Wyoming `info` response:
   * one built-in studio speaker (``XTTS_DEFAULT_SPEAKER``)
@@ -66,11 +66,16 @@ SAMPLE_RATE = 24000
 SAMPLE_WIDTH = 2
 CHANNELS = 1
 
-# Languages XTTS-v2 supports (ISO codes accepted by the sidecar's normaliser).
-SUPPORTED_LANGS = [
+# Languages advertised per voice. Defaults to XTTS-v2's (ISO codes accepted by the
+# sidecar's normaliser); WYOMING_TTS_LANGUAGES (comma-separated) overrides it for an
+# engine with another list (compose sets Qwen's ten and Miso's English).
+_XTTS_LANGS = [
     "en", "es", "fr", "de", "it", "pt", "pl", "tr", "ru", "nl",
     "cs", "ar", "zh-cn", "ja", "hu", "ko", "hi",
 ]
+SUPPORTED_LANGS = [
+    code.strip() for code in os.getenv("WYOMING_TTS_LANGUAGES", "").split(",") if code.strip()
+] or _XTTS_LANGS
 
 
 def _attribution() -> Attribution:
@@ -256,10 +261,9 @@ class XttsEventHandler(AsyncEventHandler):
             return
         _LOGGER.debug("synthesize: %s", {k: v for k, v in payload.items() if k != "text"})
 
-        await self.write_event(
-            AudioStart(rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS).event()
-        )
-
+        # AudioStart waits for the response headers: the stream's X-Sample-Rate is the
+        # engine's (24 kHz on XTTS and Miso, the model's rate on Qwen).
+        rate: Optional[int] = None
         leftover = b""
         timestamp = 0
         try:
@@ -268,6 +272,10 @@ class XttsEventHandler(AsyncEventHandler):
                     "POST", f"{XTTS_URL}/synthesise/stream", json=payload
                 ) as resp:
                     resp.raise_for_status()
+                    rate = _stream_rate(resp.headers)
+                    await self.write_event(
+                        AudioStart(rate=rate, width=SAMPLE_WIDTH, channels=CHANNELS).event()
+                    )
                     async for raw in resp.aiter_bytes():
                         if not raw:
                             continue
@@ -279,7 +287,7 @@ class XttsEventHandler(AsyncEventHandler):
                             continue
                         f32 = np.frombuffer(buf[:usable], dtype="<f4")
                         chunk = AudioChunk(
-                            rate=SAMPLE_RATE,
+                            rate=rate,
                             width=SAMPLE_WIDTH,
                             channels=CHANNELS,
                             audio=_float_to_pcm16(f32),
@@ -290,7 +298,20 @@ class XttsEventHandler(AsyncEventHandler):
         except Exception as exc:  # noqa: BLE001 — always close the stream cleanly
             _LOGGER.error("synthesis failed: %s", exc)
         finally:
+            if rate is None:  # failed before the headers: still answer with an (empty) clip
+                await self.write_event(
+                    AudioStart(rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS).event()
+                )
             await self.write_event(AudioStop(timestamp=timestamp).event())
+
+
+def _stream_rate(headers: Any) -> int:
+    """The stream's sample rate from ``X-Sample-Rate``; 24 kHz if absent or unusable."""
+    try:
+        rate = int(headers.get("x-sample-rate") or SAMPLE_RATE)
+    except (TypeError, ValueError):
+        return SAMPLE_RATE
+    return rate if 8000 <= rate <= 192000 else SAMPLE_RATE
 
 
 async def main() -> None:

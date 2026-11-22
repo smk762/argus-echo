@@ -59,6 +59,26 @@ and consent in depth; this page is what each engine does with what you send.
 
 ## Home Assistant
 
-The Wyoming bridge exposes an engine to Home Assistant as a `tts` engine (`--profile wyoming-xtts` on `10240`,
-`--profile wyoming-miso` on `10241`). It advertises each stored clone as `clone:<companion_id>`. Add it under
-**Settings → Devices & Services → Wyoming Protocol** with this host's address and the port.
+The Wyoming bridges (one CPU image, [engines/wyoming/](../engines/wyoming/)) put echo's engines in Home Assistant's
+voice pipeline. Each is a Compose profile; run it next to its engine (or point its `WYOMING_*_ENGINE_URL` at an
+engine on another host) and add it under **Settings → Devices & Services → Wyoming Protocol** with this host's
+address and the port:
+
+| Profile | Port | Serves | Forwards to |
+| --- | --- | --- | --- |
+| `wyoming-xtts` | `10240` | text to speech (`tts`) | XTTS `POST /synthesise/stream` |
+| `wyoming-miso` | `10241` | text to speech (`tts`) | Miso `POST /synthesise/stream` |
+| `wyoming-qwen` | `10242` | text to speech (`tts`) | Qwen `POST /synthesise/stream` |
+| `wyoming-whisper` | `10243` | speech to text (`asr`) | Whisper `POST /transcribe` |
+
+- **Text to speech** advertises the engine's default speaker and, on XTTS and Miso, each stored clone as
+  `clone:<companion_id>`. Audio is streamed at the engine's `X-Sample-Rate`.
+- **Qwen sends its audio as one chunk at the end**: it renders the whole clip first, so the first audio arrives
+  only when the utterance is done, where XTTS and Miso start within a sentence. Qwen has no `GET /clones`, so the
+  bridge offers one built-in speaker, `WYOMING_QWEN_SPEAKER` (default `ryan`).
+- **Speech to text** buffers each utterance from `AudioStart` to `AudioStop` (Home Assistant does the endpointing),
+  converts it to 16 kHz mono 16-bit, and posts one WAV to `/transcribe` with the language from the pipeline
+  (`en-US` becomes `en`; one Whisper lacks, or none, means detect; `WYOMING_WHISPER_LANGUAGE` sets a default).
+  A failure (engine down, busy, a rejected clip) is logged by the bridge and answered with an empty transcript.
+  Utterances are capped at 300 s (`WYOMING_ASR_MAX_SECONDS`), and the bridge waits up to
+  `WYOMING_WHISPER_TIMEOUT` (120 s) for the transcript, which covers loading the model on first use.

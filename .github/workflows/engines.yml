@@ -55,7 +55,7 @@ jobs:
       - name: ruff (errors only)
         run: uvx ruff@0.15.16 check --select E9,F63,F7,F82 .
       - name: imports
-        run: uv run --no-project --python 3.11 --with-requirements requirements.txt python -c "import tts_bridge"
+        run: uv run --no-project --python 3.11 --with-requirements requirements.txt python -c "import tts_bridge, asr_bridge"
       - name: pytest
         run: uv run --no-project --python 3.11 --with-requirements requirements.txt --with pytest python -m pytest -q tests
 
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Every profile resolves
         run: |
-          for p in miso xtts qwen whisper wyoming-xtts wyoming-miso; do
+          for p in miso xtts qwen whisper wyoming-xtts wyoming-miso wyoming-qwen wyoming-whisper; do
             docker compose --profile "$p" config -q && echo "$p ok"
           done
 
