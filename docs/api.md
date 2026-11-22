@@ -163,11 +163,14 @@ a full one.
 
 ### Voices
 
+To clone a voice, use XTTS-v2: it is the suite's cloning engine (argus-echo#51; see
+[voice-cloning.md](voice-cloning.md)). Its weights are non-commercial (Coqui Public Model Licence).
+
 Built-in speakers (`GET /speakers` → `{"speakers": [{"id", "name", "language", "languages"}]}`):
 
 - **Miso** has no real built-in voices: `0` and `1` are conversation turns, and without a clone the voice is
   different every time (unless the request sends a `seed`). Clone a voice for anything you keep.
-- **XTTS-v2** has its studio speakers (`Claribel Dervla`, …).
+- **XTTS-v2** has 58 studio speakers (`Claribel Dervla`, …), each able to speak any of its 17 languages.
 - **Qwen3-TTS** has the CustomVoice model's speakers, which the 1.7b model steers by an `instruction` or a
   `voice_description`.
 

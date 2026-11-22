@@ -5,10 +5,16 @@ engine by changing a URL, and a speech-to-text engine:
 
 | Engine | Model | VRAM | Strengths |
 | --- | --- | --- | --- |
-| **miso** | [Miso TTS 8B](https://huggingface.co/MisoLabs/MisoTTS) | ~17 GB | Most natural and expressive; one-shot cloning; English |
-| **xtts** | [Coqui XTTS-v2](https://huggingface.co/coqui/XTTS-v2) | ~2 GB | Multi-clip cloning, 17 languages, low-latency streaming |
+| **xtts** | [Coqui XTTS-v2](https://huggingface.co/coqui/XTTS-v2) | ~2 GB | **The suite's cloning engine**: multi-clip cloning, 58 built-in speakers, 17 languages, low-latency streaming. Weights non-commercial (CPML) |
+| **miso** | [Miso TTS 8B](https://huggingface.co/MisoLabs/MisoTTS) | ~17 GB | Most natural and expressive, English only; one-shot cloning, but no built-in voices |
 | **qwen** | [Qwen3-TTS](https://huggingface.co/Qwen) 0.6B / 1.7B | small | Built-in speakers, steered by an instruction or a voice description (1.7B) |
 | **whisper** | [Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) (faster-whisper) | ~3 GB | Speech to text: 99 languages, word timestamps, live streaming with VAD |
+
+**Clone voices on XTTS.** It's the suite's one cloning engine (argus-echo#51): it has the most built-in speakers,
+takes several reference clips, speaks 17 languages and fits an 8 GB card. Clones and fine-tunes (argus-forge) go
+through it. Miso stays an English-only option where quality matters most, and Qwen offers its built-in speakers.
+The caveat: XTTS-v2's weights are non-commercial (Coqui Public Model Licence), so its clones and fine-tunes are
+too; Qwen3-TTS (Apache-2.0) is the fallback if that ever matters.
 
 Plus **Wyoming bridges** that put any engine, text to speech or speech to text, in front of Home Assistant or
 anything else that speaks [Wyoming](https://github.com/OHF-Voice/wyoming).

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Documentation
+- XTTS-v2 is the suite's cloning engine (#51): README, docs/voice-cloning.md, docs/api.md and docs/xtts.md say to
+  clone on XTTS, that fine-tunes go through argus-forge's XTTS-v2 path, and that its weights are non-commercial
+  (CPML), with Qwen3-TTS (Apache-2.0) as the fallback. The "design on Qwen, clone on Miso" suggestion is gone.
+
 ### Changed
 - `gpu-tenant.yaml` gives Qwen `vram_mb: 5800`, measured for compose's default (0.6b with `both`, which can clone)
   on dragon's RTX 4060 with 0.3.0: 4366 MiB loaded, 5178 MiB peak speaking a short clone, 5692 MiB speaking 27 s
