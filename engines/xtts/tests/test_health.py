@@ -18,3 +18,4 @@ def test_health_is_resident_health_and_advertises_tts(client):
     body = r.json()
     ResidentHealth.model_validate(body)
     assert body["capabilities"] == ["tts"]
+    assert body["engine"] == "xtts-v2"  # clients key on it (docs/api.md)

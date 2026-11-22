@@ -228,6 +228,7 @@ class HealthTest(EngineTest):
         body = self.client.get("/health").json()
         ResidentHealth.model_validate(body)
         self.assertEqual(body["capabilities"], ["stt"])
+        self.assertEqual(body["engine"], "whisper")  # clients key on it (docs/api.md)
         self.assertEqual(body["model_state"], "unloaded")
         self.assertEqual(FakeBackend.instances, [])  # health loads nothing
 
