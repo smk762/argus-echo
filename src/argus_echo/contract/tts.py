@@ -9,7 +9,9 @@ with every route and status code, is ``docs/api.md``.
   (:class:`StreamFormat`): 24 kHz mono little-endian float32 on every engine today.
 - ``GET /speakers``, ``GET /clones``, ``POST /clone-voice`` and the ``/clones/*`` routes manage voices.
 - ``GET /health`` is argus-cortex's :class:`~argus_cortex.gpu_wire.ResidentHealth`, plus engine fields
-  (``engine``, ``model``, ``device``). ``POST /admin/{unload,evict,wake}`` take
+  (``engine``, ``model``, ``device``), the image identity (:class:`ImageIdentity`, as ``image``) and, on engines
+  that load checkpoints, the loaded weights (:class:`Weights`, as ``weights``). ``POST /admin/{unload,evict,wake}``
+  and ``POST /admin/load`` (:class:`LoadCheckpointRequest`; XTTS and Qwen) take
   ``Authorization: Bearer $ARGUS_ADMIN_TOKEN`` and are closed (503) while it is unset.
 """
 
@@ -26,6 +28,12 @@ CHANNELS_HEADER = "X-Channels"
 
 #: Bytes per sample for each ``X-Audio-Format`` an engine may send.
 SAMPLE_WIDTH = {"pcm_f32le": 4, "pcm_s16le": 2}
+
+#: The largest ``seed`` (numpy's legacy seed range, so every engine can seed every RNG it uses).
+SEED_MAX = 2**32 - 1
+
+#: Loads a fine-tuned checkpoint (XTTS, Qwen); see :class:`LoadCheckpointRequest`.
+LOAD_PATH = "/admin/load"
 
 
 class SynthesiseRequest(BaseModel):
@@ -54,6 +62,48 @@ class SynthesiseRequest(BaseModel):
             "GPU lease). Miso and Qwen ignore it."
         ),
     )
+    seed: int | None = Field(
+        None,
+        ge=0,
+        le=SEED_MAX,
+        description=(
+            "Seeds the sampler (python, numpy, torch CPU and CUDA) for this request, on every engine. What it makes "
+            "reproducible differs by engine and route: see docs/api.md."
+        ),
+    )
+
+
+class LoadCheckpointRequest(BaseModel):
+    """The body of ``POST /admin/load`` (XTTS, Qwen): a checkpoint directory under the engine's checkpoint root
+    (``XTTS_CHECKPOINT_ROOT``, ``TTS_CHECKPOINT_ROOT``), or ``None`` for the stock weights."""
+
+    checkpoint: str | None
+
+
+class WeightFile(BaseModel):
+    """One file the loaded weights were read from, hashed once when they were loaded."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    bytes: int | None = Field(None, ge=0)
+
+
+class Weights(BaseModel):
+    """``GET /health``'s ``weights``: the selected checkpoint (``None`` = stock) and the files its last load read.
+    ``files`` is ``None`` until those weights have been loaded."""
+
+    checkpoint: str | None = None
+    files: list[WeightFile] | None = None
+
+
+class ImageIdentity(BaseModel):
+    """``GET /health``'s ``image``: the release and git revision baked into the engine image (``None`` for a local
+    build). A running container can't know its own digest; whoever deployed it can."""
+
+    version: str | None = None
+    revision: str | None = None
 
 
 class StreamFormat(BaseModel):

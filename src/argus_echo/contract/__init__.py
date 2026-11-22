@@ -12,10 +12,16 @@ from __future__ import annotations
 from argus_echo.contract.tts import (
     AUDIO_FORMAT_HEADER,
     CHANNELS_HEADER,
+    LOAD_PATH,
     SAMPLE_RATE_HEADER,
     SAMPLE_WIDTH,
+    SEED_MAX,
+    ImageIdentity,
+    LoadCheckpointRequest,
     StreamFormat,
     SynthesiseRequest,
+    WeightFile,
+    Weights,
 )
 
 #: The capabilities an engine may advertise in ``GET /health``.
@@ -29,8 +35,14 @@ __all__ = [
     "CAPABILITIES",
     "CHANNELS_HEADER",
     "DEFAULT_CAPABILITIES",
+    "LOAD_PATH",
     "SAMPLE_RATE_HEADER",
     "SAMPLE_WIDTH",
+    "SEED_MAX",
+    "ImageIdentity",
+    "LoadCheckpointRequest",
     "StreamFormat",
     "SynthesiseRequest",
+    "WeightFile",
+    "Weights",
 ]

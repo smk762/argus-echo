@@ -5,11 +5,12 @@ import struct
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from typer.testing import CliRunner
 
 from argus_echo.check import check
 from argus_echo.cli import app
-from argus_echo.contract import StreamFormat, SynthesiseRequest
+from argus_echo.contract import SEED_MAX, LoadCheckpointRequest, StreamFormat, SynthesiseRequest, Weights
 
 HEALTH = {"status": "ok", "engine": "miso", "model": "MisoLabs/MisoTTS", "model_state": "unloaded", "busy": False}
 PCM = struct.pack("<4f", 0.0, 0.1, -0.1, 0.0)
@@ -100,3 +101,59 @@ def test_cli_exit_code_follows_the_report(monkeypatch) -> None:
     result = CliRunner().invoke(app, ["check", "http://e"])
     assert result.exit_code == 1
     assert "FAIL GET /clones" in result.output
+
+
+SHA = "a" * 64
+
+
+def test_check_reports_the_loaded_checkpoint_and_its_hashes_without_loading_anything() -> None:
+    seen: list[str] = []
+    health = {
+        **HEALTH,
+        "engine": "xtts-v2",
+        "image": {"version": "0.2.0", "revision": "0123456789abcdef"},
+        "weights": {"checkpoint": "forge/run-7", "files": [{"name": "model.pth", "sha256": SHA, "bytes": 3}]},
+    }
+    report = check("http://e", transport=engine(health=health, seen=seen))
+    assert report.ok, report.findings
+    found = {f.name: f.detail for f in report.findings}
+    assert found["weights"] == f"checkpoint=forge/run-7; 1 file(s): model.pth sha256:{SHA}"
+    assert found["image"] == "version=0.2.0 revision=0123456789abcdef"
+    assert not any(s.startswith("POST") for s in seen)  # read-only: never POST /admin/load
+
+
+def test_check_reports_stock_weights_not_yet_hashed() -> None:
+    health = {**HEALTH, "image": {"version": None, "revision": None}, "weights": {"checkpoint": None, "files": None}}
+    report = check("http://e", transport=engine(health=health))
+    assert report.ok
+    found = {f.name: f.detail for f in report.findings}
+    assert found["weights"].startswith("stock; not loaded")
+    assert found["image"] == "version=unset revision=unset"
+
+
+def test_check_fails_malformed_weights() -> None:
+    health = {**HEALTH, "weights": {"checkpoint": None, "files": [{"name": "model.pth", "sha256": "nope"}]}}
+    report = check("http://e", transport=engine(health=health))
+    assert not report.ok
+    assert [f for f in report.findings if f.name == "weights"][0].detail.startswith("malformed")
+
+
+def test_engines_without_weights_report_nothing_extra() -> None:
+    report = check("http://e", transport=engine())
+    assert {f.name for f in report.findings}.isdisjoint({"weights", "image"})
+
+
+def test_seed_is_optional_and_bounded() -> None:
+    assert SynthesiseRequest(text="hi").seed is None
+    assert SynthesiseRequest(text="hi", seed=SEED_MAX).seed == SEED_MAX
+    for bad in (-1, SEED_MAX + 1):
+        with pytest.raises(ValidationError):
+            SynthesiseRequest(text="hi", seed=bad)
+
+
+def test_load_and_weights_models() -> None:
+    assert LoadCheckpointRequest(checkpoint=None).checkpoint is None
+    with pytest.raises(ValidationError):
+        LoadCheckpointRequest()
+    w = Weights.model_validate({"checkpoint": "x", "files": [{"name": "model.pth", "sha256": SHA}]})
+    assert w.files[0].bytes is None

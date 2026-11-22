@@ -17,7 +17,7 @@ import httpx
 from argus_cortex.gpu_wire import ResidentHealth
 from pydantic import ValidationError
 
-from argus_echo.contract import DEFAULT_CAPABILITIES, StreamFormat, SynthesiseRequest
+from argus_echo.contract import DEFAULT_CAPABILITIES, ImageIdentity, StreamFormat, SynthesiseRequest, Weights
 from argus_echo.contract.stt import TRANSCRIBE_PATH, Transcription
 
 #: The clip ``check --transcribe`` sends by default: President Kennedy's 1961 inaugural address (11 s, public domain
@@ -100,6 +100,7 @@ def check(
                     f"engine={engine} model={extra.get('model')} model_state={health.model_state} busy={health.busy} "
                     f"capabilities={','.join(capabilities)}",
                 )
+                _check_identity(report, extra)
 
         if "tts" in capabilities:
             _check_tts(client, report, loaded=loaded, speak=speak, speaker=speaker, speak_timeout=speak_timeout)
@@ -110,6 +111,30 @@ def check(
             else:
                 report.add(f"POST {TRANSCRIBE_PATH}", True, "skipped: transcribing loads the model (--transcribe)")
     return report
+
+
+def _check_identity(report: Report, health: dict) -> None:
+    """Report the image identity and the loaded weights from ``/health`` when the engine sends them. Read-only: it
+    never loads a checkpoint (``POST /admin/load``) to have something to report."""
+    if "image" in health:
+        try:
+            image = ImageIdentity.model_validate(health["image"])
+        except ValidationError as exc:
+            report.add("image", False, f"malformed `image`: {exc.errors()[0]['msg']}")
+        else:
+            report.add("image", True, f"version={image.version or 'unset'} revision={image.revision or 'unset'}")
+    if "weights" in health:
+        try:
+            weights = Weights.model_validate(health["weights"])
+        except ValidationError as exc:
+            report.add("weights", False, f"malformed `weights`: {exc.errors()[0]['msg']}")
+            return
+        name = f"checkpoint={weights.checkpoint}" if weights.checkpoint else "stock"
+        if weights.files is None:
+            report.add("weights", True, f"{name}; not loaded since selected, so no hashes yet")
+        else:
+            hashes = ", ".join(f"{f.name} sha256:{f.sha256}" for f in weights.files)
+            report.add("weights", True, f"{name}; {len(weights.files)} file(s): {hashes}")
 
 
 def _check_tts(
