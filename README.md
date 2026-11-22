@@ -7,7 +7,7 @@ engine by changing a URL, and a speech-to-text engine:
 | --- | --- | --- | --- |
 | **miso** | [Miso TTS 8B](https://huggingface.co/MisoLabs/MisoTTS) | ~17 GB | Most natural and expressive; one-shot cloning; English |
 | **xtts** | [Coqui XTTS-v2](https://huggingface.co/coqui/XTTS-v2) | ~2 GB | Multi-clip cloning, 17 languages, low-latency streaming |
-| **qwen** | [Qwen3-TTS](https://huggingface.co/Qwen) 0.6B / 1.7B | small | Built-in speakers, voice design from a description |
+| **qwen** | [Qwen3-TTS](https://huggingface.co/Qwen) 0.6B / 1.7B | small | Built-in speakers, steered by an instruction or a voice description (1.7B) |
 | **whisper** | [Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) (faster-whisper) | ~3 GB | Speech to text: 99 languages, word timestamps, live streaming with VAD |
 
 Plus **Wyoming bridges** that put any engine, text to speech or speech to text, in front of Home Assistant or

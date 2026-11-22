@@ -1,8 +1,9 @@
 # Qwen3-TTS engine
 
 [Qwen3-TTS](https://huggingface.co/Qwen) (12 Hz, 0.6B or 1.7B) loads two models: **Base**, which clones a voice
-from one reference clip, and **CustomVoice**, which has built-in speakers that take a delivery `instruction` and
-can design a voice from a `voice_description`. 10 languages. The 0.6B pair fits an 8 GB card.
+from one reference clip, and **CustomVoice**, which has built-in speakers that a delivery `instruction` or a
+`voice_description` steers (1.7B only: qwen-tts ignores instructions on 0.6B). 10 languages. The 0.6B pair fits an
+8 GB card.
 
 Source: [engines/qwen/tts_server.py](../engines/qwen/tts_server.py). Contract: [api.md](api.md). Published on
 `8142` by `compose.yaml` (`--profile qwen`). The weights are Apache-2.0 and are baked into the image at build
@@ -21,7 +22,12 @@ Differences from the other engines:
   (the clip's codec tokens plus its transcript); without it, only the speaker embedding (x-vector). It refuses
   to overwrite an existing clone unless `replace=true` (`409`), and writes a `meta.json` (`voice_name` sets its
   `name`).
-- `voice_description`, `instruction` and `emotion` are used (CustomVoice); the other engines ignore them.
+- `voice_description`, `instruction` and `emotion` steer a built-in CustomVoice speaker; the other engines ignore
+  them. A `voice_description` is not a new voice: it is the instruction given to a speaker (`speaker`, else
+  `QWEN_DEFAULT_SPEAKER`, else the first one `/speakers` lists), combined with any `instruction` or `emotion`.
+  Only the 1.7B CustomVoice model applies instructions. On 0.6B, qwen-tts drops them: a `voice_description` is a
+  `422` rather than a silently unchanged voice, while `instruction` and `emotion` are accepted and have no effect.
+  True voice design needs qwen-tts's separate VoiceDesign model (1.7B only), which echo doesn't load (#31).
 - `speed` is accepted and ignored.
 - `seed` seeds `/synthesise` once; `/synthesise/stream` seeds sentence *i* (from 0) with `seed + i`, so each
   sentence is reproducible on its own. See [api.md#reproducibility](api.md#reproducibility).

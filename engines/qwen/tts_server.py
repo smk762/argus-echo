@@ -2,8 +2,9 @@
 Qwen3-TTS server — FastAPI, port 8031.
 
 argus-echo's Qwen3-TTS engine. Speaks the same HTTP contract as the Miso and
-XTTS engines, and adds voice design: built-in speakers and instruction-based
-delivery (`instruction`, `voice_description`) from the CustomVoice model.
+XTTS engines, and adds built-in speakers steered by instructions (`instruction`,
+`emotion`, `voice_description`) from the CustomVoice model. qwen-tts applies
+instructions only on the 1.7B model; a `voice_description` on 0.6B is a 422.
 
 Loads two model variants:
   - Base: voice cloning from reference audio
@@ -1193,6 +1194,15 @@ def _to_pcm(audio_arrays, sample_rate, request_id: str, text: str):
     return audio, int(sample_rate)
 
 
+def _instruct_ignored(custom) -> bool:
+    """Whether this CustomVoice model drops ``instruct``: qwen-tts does for the 0.6B one (``tts_model_size`` "0b6").
+    Read from the loaded model, so a 1.7B custom_voice checkpoint counts as 1.7B; TTS_MODEL_SIZE otherwise."""
+    size = getattr(getattr(custom, "model", None), "tts_model_size", None)
+    if isinstance(size, str):
+        return size in "0b6"  # qwen-tts's own test (generate_custom_voice)
+    return MODEL_SIZE == "0.6b"
+
+
 async def _plan_generation(req: SynthesiseRequest, request_id: str):
     """Validate ``req`` and choose its model, before any audio is rendered.
 
@@ -1202,7 +1212,8 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
     is an error before ``/synthesise/stream`` sends its 200. The caller holds a lease.
 
     Uses the Base model for a ``voice_clone_id`` (voice cloning) and the
-    CustomVoice model otherwise (built-in speaker + instruction).
+    CustomVoice model otherwise (built-in speaker + instruction; a ``voice_description`` steers a speaker the
+    same way, and needs the 1.7B model, as the 0.6B one ignores instructions).
     """
     instruction = req.instruction
     if instruction is None:
@@ -1237,24 +1248,27 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
         return render
 
     if req.voice_description:
+        # A "designed voice" is a built-in CustomVoice speaker steered by the description as its instruction
+        # (#31). qwen-tts's generate_voice_design needs a separate VoiceDesign model (1.7B only), which echo doesn't
+        # load; the Base model refuses it.
         design_instruct = req.voice_description
         if instruction:
             design_instruct = f"{req.voice_description}. {instruction}"
 
-        base = _mgr.base_model
-        if base is not None:
-            def render(text: str):
-                return base.generate_voice_design(
-                    text, instruct=design_instruct, language=language,
-                    max_new_tokens=_max_new_tokens_for(text),
-                )
-
-            render.slot = "base"
-            return render
-
         custom = _mgr.custom_model
         if custom is None:
-            return JSONResponse(status_code=503, content={"error": "No model loaded"})
+            return JSONResponse(
+                status_code=503,
+                content={"error": "voice_description needs the CustomVoice model (TTS_LOAD_MODELS=base)"},
+            )
+        if _instruct_ignored(custom):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "voice_description needs the 1.7b CustomVoice model: the 0.6b one ignores "
+                    "instructions (TTS_MODEL_SIZE=1.7b, or a 1.7b custom_voice checkpoint)"
+                },
+            )
         fallback_speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER
         if not fallback_speaker:
             try:
@@ -1265,12 +1279,11 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
                 return JSONResponse(
                     status_code=503,
                     content={
-                        "error": "Voice design needs the Base model (TTS_LOAD_MODELS=custom_voice) "
-                        "and the CustomVoice model lists no speaker to fall back to."
+                        "error": "voice_description needs a speaker to steer, and the CustomVoice model lists no speaker"
                     },
                 )
             fallback_speaker = available[0]
-        logger.info("voice_design_fallback_to_speaker", speaker=fallback_speaker)
+        logger.info("voice_design_speaker", speaker=fallback_speaker)
 
         def render(text: str):
             return custom.generate_custom_voice(
@@ -1279,7 +1292,7 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
                 max_new_tokens=_max_new_tokens_for(text),
             )
 
-        render.slot = "custom_voice"  # the voice-design fallback speaks with CustomVoice
+        render.slot = "custom_voice"
         return render
 
     custom = _mgr.custom_model

@@ -8,6 +8,12 @@
   other engines.
 
 ### Fixed
+- Qwen: `voice_description` works with the Base model loaded (`TTS_LOAD_MODELS=both`, the default). It used to go
+  to Base's `generate_voice_design`, which qwen-tts refuses on anything but its separate VoiceDesign model, so
+  every designed-voice request failed (#31). A description now steers a built-in CustomVoice speaker as its
+  instruction. qwen-tts ignores instructions on the 0.6B model, so there a `voice_description` is a `422` saying
+  it needs 1.7B, rather than speaking an unchanged voice. The size is read from the loaded model, so a 1.7B
+  custom_voice checkpoint counts. The response's `model` is now always `custom_voice` for it.
 - Whisper decodes an MP4/M4A/MOV whose index (`moov`) comes after the audio, the default for ffmpeg and most
   recorders without faststart. Read from a pipe, the demuxer couldn't seek back to it, so anything past its
   read-ahead (a 2-minute AAC clip, say) was a `400` on `/transcribe` and `/transcriptions`. Those formats are now

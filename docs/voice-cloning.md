@@ -45,8 +45,8 @@ and consent in depth; this page is what each engine does with what you send.
 ## Qwen3-TTS
 
 - `/clone-voice` takes one clip and stores the Base model's prompt.
-- For a voice that doesn't exist, use a CustomVoice speaker with a `voice_description` or an `instruction`
-  instead of cloning. A common route: design a voice on Qwen, then clone the result on Miso for quality.
+- For a voice that doesn't exist, steer a CustomVoice speaker with a `voice_description` or an `instruction` (1.7B
+  model only) instead of cloning. A common route: design a voice on Qwen, then clone the result on Miso for quality.
 
 ## After cloning
 
