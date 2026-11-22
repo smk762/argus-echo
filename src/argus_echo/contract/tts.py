@@ -1,4 +1,4 @@
-"""The HTTP contract every argus-echo engine speaks.
+"""The ``tts`` contract: what every text-to-speech engine speaks.
 
 Each engine (Miso, XTTS-v2, Qwen3-TTS) is its own server with its own Python environment, so they share this
 contract rather than code. A client written against it can switch engines by changing a URL. The full reference,
