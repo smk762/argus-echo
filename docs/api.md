@@ -120,14 +120,30 @@ Same seed means same audio only when everything else is the same too:
   on their configured device;
 - the image (torch, CUDA and driver versions) and the GPU model: `/health` `image` names the release.
 
-With all of that fixed, the table says what to expect. None of it has been measured on a GPU yet (the tests fake
-the model): verify a claim you rely on by hashing the audio of two runs.
+**Measured.** On 2026-11-22 each case below ran twice with seed 42 and once with seed 43, and the outputs were
+compared byte for byte (SHA-256 of the WAV `/synthesise` stores, or of the PCM `/synthesise/stream` sends). Every
+seed-42 pair was **identical**, and every seed-43 run **differed**:
+
+| | XTTS-v2 | Qwen3-TTS |
+| --- | --- | --- |
+| Server code | this repo at `b3d78d8` | this repo at `b3d78d8` |
+| Runtime | image `argus-echo-xtts:0.1.0` (revision `d7092cd`; torch 2.6.0+cu124, coqui-tts 0.28.0) with that `xtts_server.py` mounted over it | torch 2.6.0+cu124, qwen-tts 0.1.1, transformers 4.57.3 (not an image: the qwen image installs unpinned versions) |
+| Model | stock XTTS-v2, `cuda:0` (`device: "cuda:0"` on every run) | stock 0.6B Base and CustomVoice, `cuda:0` |
+| Built-in voice | studio speaker `Aaron Dreschner` | speaker `aiden` (CustomVoice) |
+| Clone | `/clone-voice` from the bundled public-domain clip (`src/argus_echo/assets/jfk.flac`, 24 kHz) | the same clip (Base) |
+| Routes, each voice | `/synthesise` (one sentence), `/synthesise/stream` (two sentences) | the same |
+
+The GPU was an RTX 3090 (driver 580.178.04). Not measured: Miso, Qwen 1.7B, a fine-tuned checkpoint, XTTS's CPU
+path, other GPU models or torch versions, and the published 0.1.1+ images. Treat those as the "expected" rows
+below until someone hashes two runs.
+
+With everything above fixed, the table says what to expect for each engine; the measured cases are marked.
 
 | Engine | `/synthesise`, same seed twice | `/synthesise/stream`, same seed twice | Stream vs `/synthesise` |
 | --- | --- | --- | --- |
 | Miso | Expected identical | Expected identical | Different audio: the stream decodes incrementally and is not watermarked; `/synthesise` decodes once and watermarks |
-| XTTS-v2 | Expected identical (one seed; the text's sentences sample in order) | Expected identical if `XTTS_STREAM_CHUNK_SIZE` is the same: tokens sample in the same order, under one seed, for the whole stream | Different audio: `inference_stream` decodes chunk by chunk with a cross-fade and takes latents from the sampler, while `inference` runs a second GPT pass and decodes once |
-| Qwen3-TTS | Expected identical (one seed, one generation over the whole text) | Expected identical: sentence *i* (from 0) is generated alone with seed + *i* | Different audio for more than one sentence (each sentence is generated alone); the first sentence equals `/synthesise` of that sentence alone with the same seed |
+| XTTS-v2 | **Measured identical** (built-in speaker and clone, setup above); expected elsewhere (one seed; the text's sentences sample in order) | **Measured identical** (built-in speaker and clone, setup above); expected elsewhere if `XTTS_STREAM_CHUNK_SIZE` is the same: tokens sample in the same order, under one seed, for the whole stream | Different audio: `inference_stream` decodes chunk by chunk with a cross-fade and takes latents from the sampler, while `inference` runs a second GPT pass and decodes once |
+| Qwen3-TTS | **Measured identical** (0.6B, built-in speaker and clone, setup above); expected elsewhere (one seed, one generation over the whole text) | **Measured identical** (0.6B, built-in speaker and clone, setup above); expected elsewhere: sentence *i* (from 0) is generated alone with seed + *i* | Different audio for more than one sentence (each sentence is generated alone); the first sentence equals `/synthesise` of that sentence alone with the same seed |
 
 **Why "expected", not "guaranteed".** The engines run without `torch.use_deterministic_algorithms(True)` (some
 kernels have no deterministic version, and the rest cost speed), and PyTorch only promises run-to-run identical
