@@ -17,7 +17,15 @@ import httpx
 from argus_cortex.gpu_wire import ResidentHealth
 from pydantic import ValidationError
 
-from argus_echo.contract import DEFAULT_CAPABILITIES, ImageIdentity, StreamFormat, SynthesiseRequest, Weights
+from argus_echo.contract import (
+    DEFAULT_CAPABILITIES,
+    ImageIdentity,
+    StreamFormat,
+    SynthesiseRequest,
+    Weights,
+    stream_identity,
+    weights_fingerprint,
+)
 from argus_echo.contract.stt import TRANSCRIBE_PATH, Transcription
 
 #: The clip ``check --transcribe`` sends by default: President Kennedy's 1961 inaugural address (11 s, public domain
@@ -134,7 +142,18 @@ def _check_identity(report: Report, health: dict) -> None:
             report.add("weights", True, f"{name}; not loaded since selected, so no hashes yet")
         else:
             hashes = ", ".join(f"{f.name} sha256:{f.sha256}" for f in weights.files)
-            report.add("weights", True, f"{name}; {len(weights.files)} file(s): {hashes}")
+            detail = f"{name}; {len(weights.files)} file(s): {hashes}"
+            ok = True
+            if weights.fingerprint is not None:
+                detail += f"; fingerprint {weights.fingerprint}"
+                if weights.fingerprint != weights_fingerprint(weights.files):
+                    ok, detail = False, f"{detail} does not match its files (docs/api.md, Weights fingerprint)"
+            for slot, model in sorted((weights.models or {}).items()):
+                origin = f"checkpoint={model.checkpoint}" if model.checkpoint else "stock"
+                detail += f"; {slot}: {origin} fingerprint {model.fingerprint}"
+                if model.fingerprint is not None and model.fingerprint != weights_fingerprint(weights.files, slot):
+                    ok, detail = False, f"{detail} does not match its {slot}/ files"
+            report.add("weights", ok, detail)
 
 
 def _check_tts(
@@ -224,6 +243,7 @@ def _check_stream(client: httpx.Client, report: Report, req: SynthesiseRequest, 
                 return
             try:
                 fmt = StreamFormat.from_headers(r.headers)
+                identity = stream_identity(r.headers)
                 width = fmt.sample_width
             except (ValueError, KeyError) as exc:
                 report.add(name, False, f"bad stream headers: {exc}")
@@ -243,9 +263,13 @@ def _check_stream(client: httpx.Client, report: Report, req: SynthesiseRequest, 
         report.add(name, False, f"{n_bytes} bytes is not a whole number of {fmt.audio_format} frames")
         return
     audio_s = fmt.seconds(n_bytes)
+    weights = ""
+    if identity["weights_fingerprint"]:
+        model = f"{identity['model']} " if identity["model"] else ""
+        weights = f"; {model}{identity['checkpoint'] or 'stock'} weights {identity['weights_fingerprint']}"
     report.add(
         name,
         True,
         f"{audio_s:.2f} s of {fmt.audio_format} {fmt.sample_rate} Hz x{fmt.channels}; "
-        f"first byte {first:.2f} s, total {total:.2f} s (RTF {total / audio_s:.2f})",
+        f"first byte {first:.2f} s, total {total:.2f} s (RTF {total / audio_s:.2f}){weights}",
     )

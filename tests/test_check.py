@@ -10,7 +10,16 @@ from typer.testing import CliRunner
 
 from argus_echo.check import check
 from argus_echo.cli import app
-from argus_echo.contract import SEED_MAX, LoadCheckpointRequest, StreamFormat, SynthesiseRequest, Weights
+from argus_echo.contract import (
+    SEED_MAX,
+    LoadCheckpointRequest,
+    StreamFormat,
+    SynthesiseRequest,
+    SynthesiseResponse,
+    Weights,
+    stream_identity,
+    weights_fingerprint,
+)
 
 HEALTH = {"status": "ok", "engine": "miso", "model": "MisoLabs/MisoTTS", "model_state": "unloaded", "busy": False}
 PCM = struct.pack("<4f", 0.0, 0.1, -0.1, 0.0)
@@ -157,3 +166,86 @@ def test_load_and_weights_models() -> None:
         LoadCheckpointRequest()
     w = Weights.model_validate({"checkpoint": "x", "files": [{"name": "model.pth", "sha256": SHA}]})
     assert w.files[0].bytes is None
+
+
+# The worked examples in docs/api.md ("Weights fingerprint"); the engines' tests check the same digests.
+QWEN_FILES = [
+    {
+        "name": "custom_voice/model.safetensors",
+        "sha256": "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c",
+    },
+    {"name": "custom_voice/config.json", "sha256": "b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910"},
+    {"name": "base/model.safetensors", "sha256": "cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2"},
+]
+CV_FP = "b955ea711653a31092cf4acad596e71ac31cb8f85c6feabe209f32ada86fecfb"
+BASE_FP = "8763f2a5235402fc83d026fd46b563e7fa6c7b0c9d12a3cad770d4856148eebc"
+ALL_FP = "e205d97735019470b091f339590c5f050f068b0f7817439400ed4337db73c89c"
+
+
+def test_weights_fingerprint_matches_the_documented_examples() -> None:
+    assert weights_fingerprint(QWEN_FILES, "custom_voice") == CV_FP
+    assert weights_fingerprint(QWEN_FILES, "base") == BASE_FP
+    assert weights_fingerprint(QWEN_FILES) == ALL_FP
+    xtts = [
+        {
+            "name": f["name"].removeprefix("custom_voice/").replace("model.safetensors", "model.pth"),
+            "sha256": f["sha256"],
+        }
+        for f in QWEN_FILES[:2]
+    ]
+    assert weights_fingerprint(xtts) == "311b8ed7abed4ae45274fedccda241ff6d0a129db13ea34b25b9fe0431de2649"
+
+
+def _qwen_health(**models) -> dict:
+    return {
+        **HEALTH,
+        "engine": "qwen-tts",
+        "weights": {
+            "checkpoint": "voice",
+            "fingerprint": ALL_FP,
+            "files": QWEN_FILES,
+            "models": models
+            or {
+                "base": {"checkpoint": None, "fingerprint": BASE_FP},
+                "custom_voice": {"checkpoint": "voice", "fingerprint": CV_FP},
+            },
+        },
+    }
+
+
+def test_check_reports_and_verifies_the_fingerprints() -> None:
+    report = check("http://e", transport=engine(health=_qwen_health()))
+    assert report.ok, report.findings
+    detail = [f for f in report.findings if f.name == "weights"][0].detail
+    assert f"fingerprint {ALL_FP}" in detail
+    assert f"custom_voice: checkpoint=voice fingerprint {CV_FP}" in detail
+    assert f"base: stock fingerprint {BASE_FP}" in detail
+
+
+def test_check_fails_a_fingerprint_that_does_not_match_its_files() -> None:
+    health = _qwen_health(base={"checkpoint": None, "fingerprint": CV_FP})
+    report = check("http://e", transport=engine(health=health))
+    assert not report.ok
+    assert "does not match its base/ files" in [f for f in report.findings if f.name == "weights"][0].detail
+
+
+def test_speak_reports_the_streams_weights() -> None:
+    headers = {
+        **STREAM_HEADERS,
+        "X-Echo-Model": "custom_voice",
+        "X-Echo-Checkpoint": "forge/run%207",
+        "X-Echo-Weights": CV_FP,
+    }
+    report = check("http://e", speak="Hello.", transport=engine(stream_headers=headers))
+    stream = [f for f in report.findings if f.name == "POST /synthesise/stream"][0]
+    assert stream.detail.endswith(f"custom_voice forge/run 7 weights {CV_FP}")
+    assert stream_identity({"x-echo-weights": CV_FP, "X-Echo-Checkpoint": ""}) == {
+        "model": None,
+        "checkpoint": None,
+        "weights_fingerprint": CV_FP,
+    }
+
+
+def test_synthesise_response_model() -> None:
+    body = {"audio_url": "u", "seed": 1, "model": "base", "checkpoint": None, "weights_fingerprint": BASE_FP, "x": 1}
+    assert SynthesiseResponse.model_validate(body).weights_fingerprint == BASE_FP

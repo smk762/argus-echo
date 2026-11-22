@@ -17,14 +17,22 @@ with every route and status code, is ``docs/api.md``.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import hashlib
+from collections.abc import Iterable, Mapping
 from typing import Literal
+from urllib.parse import unquote
 
 from pydantic import BaseModel, ConfigDict, Field
 
 SAMPLE_RATE_HEADER = "X-Sample-Rate"
 AUDIO_FORMAT_HEADER = "X-Audio-Format"
 CHANNELS_HEADER = "X-Channels"
+#: On a stream (XTTS, Qwen): the checkpoint generating it, percent-encoded; empty for stock weights.
+CHECKPOINT_HEADER = "X-Echo-Checkpoint"
+#: On a stream (XTTS, Qwen): the fingerprint of the weights generating it (see :func:`weights_fingerprint`).
+WEIGHTS_HEADER = "X-Echo-Weights"
+#: On a stream (Qwen): the model slot generating it, ``base`` or ``custom_voice``.
+MODEL_HEADER = "X-Echo-Model"
 
 #: Bytes per sample for each ``X-Audio-Format`` an engine may send.
 SAMPLE_WIDTH = {"pcm_f32le": 4, "pcm_s16le": 2}
@@ -90,12 +98,65 @@ class WeightFile(BaseModel):
     bytes: int | None = Field(None, ge=0)
 
 
-class Weights(BaseModel):
-    """``GET /health``'s ``weights``: the selected checkpoint (``None`` = stock) and the files its last load read.
-    ``files`` is ``None`` until those weights have been loaded."""
+def weights_fingerprint(files: Iterable[WeightFile | Mapping[str, str]], slot: str | None = None) -> str:
+    """The fingerprint of a set of weight files, as the engines compute it (docs/api.md, "Weights fingerprint").
+
+    One line ``<name>:<sha256>`` per file, ``name`` exactly as ``/health`` lists it (Qwen's slot prefix kept), the
+    lines sorted byte-wise as UTF-8, each ending in ``\\n`` (the last one too); the sha256 of those bytes, lowercase
+    hex. *slot* keeps only the files named ``<slot>/...`` (Qwen's per-model fingerprint)."""
+    pairs = [(f.name, f.sha256) if isinstance(f, WeightFile) else (f["name"], f["sha256"]) for f in files]
+    if slot is not None:
+        pairs = [(n, s) for n, s in pairs if n.startswith(f"{slot}/")]
+    return hashlib.sha256(b"".join(sorted(f"{n}:{s}\n".encode() for n, s in pairs))).hexdigest()
+
+
+class ModelWeights(BaseModel):
+    """One loaded model in Qwen's ``weights.models``: the checkpoint it was loaded from (``None`` = stock) and its
+    fingerprint (:func:`weights_fingerprint` over its ``<slot>/`` files)."""
 
     checkpoint: str | None = None
+    fingerprint: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
+
+
+class Weights(BaseModel):
+    """``GET /health``'s ``weights``: the selected checkpoint (``None`` = stock), the files its last load read and
+    their :func:`weights_fingerprint`. ``files`` and ``fingerprint`` are ``None`` until those weights have been
+    loaded (engines load lazily). Qwen adds ``models``, per loaded slot (``base``, ``custom_voice``)."""
+
+    checkpoint: str | None = None
+    fingerprint: str | None = Field(None, pattern=r"^[0-9a-f]{64}$")
     files: list[WeightFile] | None = None
+    models: dict[str, ModelWeights] | None = None
+
+
+class SynthesiseResponse(BaseModel):
+    """The body of a ``POST /synthesise`` answer. ``checkpoint`` and ``weights_fingerprint`` name the weights that
+    generated the utterance, read under its model lease (XTTS, Qwen; Miso reports none); Qwen adds ``model``, the
+    slot that spoke it. Pin these, not a ``/health`` read, since another client can load other weights between."""
+
+    model_config = ConfigDict(extra="allow")
+
+    audio_url: str
+    duration: float | None = None
+    duration_seconds: float | None = None
+    format: str | None = None
+    seed: int | None = None
+    device: str | None = None
+    model: str | None = None
+    checkpoint: str | None = None
+    weights_fingerprint: str | None = None
+
+
+def stream_identity(headers: Mapping[str, str]) -> dict[str, str | None]:
+    """``{"model", "checkpoint", "weights_fingerprint"}`` from a ``/synthesise/stream`` response's headers (``None``
+    where absent or empty; the checkpoint is percent-decoded)."""
+    lower = {k.lower(): v for k, v in headers.items()}
+    checkpoint = lower.get(CHECKPOINT_HEADER.lower()) or None
+    return {
+        "model": lower.get(MODEL_HEADER.lower()) or None,
+        "checkpoint": unquote(checkpoint) if checkpoint else None,
+        "weights_fingerprint": lower.get(WEIGHTS_HEADER.lower()) or None,
+    }
 
 
 class ImageIdentity(BaseModel):
