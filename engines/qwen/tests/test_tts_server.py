@@ -2,7 +2,7 @@
 
 No torch, qwen_tts or S3 needed: torch is stubbed and S3 helpers are patched.
 Needs fastapi, python-multipart, httpx and structlog.
-Run from engines/qwen/: python -m pytest tests -q (see the README for the uv command)
+Run from engines/qwen/: uv run --no-project --python 3.11 --with-requirements requirements-test.txt python -m pytest -q tests
 """
 import asyncio
 import os

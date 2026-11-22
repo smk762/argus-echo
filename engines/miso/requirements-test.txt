@@ -1,0 +1,15 @@
+# What miso_server.py and its tests need on top of the locked inference environment
+# (pyproject.toml / uv.lock). The Dockerfile installs the server packages itself; CI
+# (engines.yml) and ai-code-auditor's validate_patch install this file for the tests.
+setuptools
+fastapi
+uvicorn[standard]
+python-multipart
+structlog
+boto3
+silero-vad
+pyloudnorm
+noisereduce
+soundfile
+httpx
+pytest
