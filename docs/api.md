@@ -84,7 +84,9 @@ On XTTS and Qwen, `GET /speakers` loads the model if it is not loaded.
 Miso needs it) and `companion_id` (`^[A-Za-z0-9_-]{1,64}$`). A clone is stored at
 `voice_clones/<companion_id>/prompt.pt` with a `meta.json`, and used by passing its id as `voice_clone_id`.
 **Clones are engine-specific**: each engine's `prompt.pt` is its own format, which is why each engine gets its
-own bucket. `POST /clones/import` (Miso, XTTS) answers `409` when the target id already has a clone, unless the
+own bucket. Download archives differ too: Miso's holds `prompt.safetensors` + `meta.json` and its import refuses
+an archive with only a pickled `prompt.pt` (an older Miso download; re-export it), while XTTS's still holds
+`prompt.pt`. `POST /clones/import` (Miso, XTTS) answers `409` when the target id already has a clone, unless the
 form field `replace=true` is sent. See [voice-cloning.md](voice-cloning.md) for what makes a good reference.
 
 ## Health and lifecycle

@@ -11,7 +11,7 @@ Endpoints (mirroring the XTTS sidecar):
   POST /analyze-clips       — multipart clips → per-clip quality score + ordering
   POST /clone-voice         — multipart clips → one-shot clone (ref audio+text), stored
   GET  /clones              — list stored clones (meta.json sidecars)
-  GET  /clones/{id}/download — clone prompt.pt + meta.json as a zip
+  GET  /clones/{id}/download — clone prompt.safetensors + meta.json as a zip
   DELETE /clones/{id}       — remove stored clone + evict in-memory cache
   POST /clones/import       — import a downloaded voice archive (zip)
   GET  /speakers            — built-in speaker ids (Miso is clone-first)
@@ -23,7 +23,9 @@ A Miso "voice clone" is one-shot: we store the (preprocessed) reference audio
 at 24 kHz mono + its transcript + speaker id as prompt.pt, then pass it as a
 conditioning Segment to generate() at synth time. This mirrors XTTS's
 `voice_clones/{companion_id}/{prompt.pt,meta.json}` storage layout so /clones,
-download and import keep working.
+download and import keep working. Stored prompt.pt objects are only ever written
+by this server; the clone *archive* (download/import) carries the prompt as
+prompt.safetensors instead, so uploaded bytes never reach a pickle loader.
 
 Native sample rate: 24 kHz (Mimi) — identical to XTTS, so no resample needed in
 the Wyoming bridge or browser PCM path.
@@ -153,7 +155,7 @@ STREAM_DECODE_FRAMES = int(os.getenv("MISO_STREAM_DECODE_FRAMES", "12"))
 REF_MAX_SECONDS = float(os.getenv("MISO_REF_MAX_SECONDS", "20"))
 # Upload caps. A clip is cut to REF_MAX_SECONDS after decoding, but callers send
 # whole recordings to pick from: 50 MB is ~4 min of 48 kHz 16-bit stereo WAV and
-# far longer in mp3/ogg. A clone archive holds prompt.pt (at most
+# far longer in mp3/ogg. A clone archive holds prompt.safetensors (at most
 # _MAX_PROMPT_BYTES, ~2 MB for 20 s of 24 kHz float32) and meta.json.
 MAX_CLIP_BYTES = int(float(os.getenv("MISO_MAX_CLIP_MB", "50")) * 1024 * 1024)
 MAX_ARCHIVE_BYTES = int(float(os.getenv("MISO_MAX_ARCHIVE_MB", "64")) * 1024 * 1024)
@@ -2259,19 +2261,118 @@ async def delete_clone(companion_id: str):
     return {"status": "deleted", "companion_id": companion_id}
 
 
+# Clone archive format (download and import). The prompt travels as
+# prompt.safetensors: every tensor of the stored prompt (ref_audio) as a tensor,
+# and its scalar fields (speaker, sample_rate, ref_text, engine) as strings in the
+# safetensors `__metadata__` header. A safetensors file is a JSON header plus raw
+# tensor bytes, so parsing one never runs code. A legacy prompt.pt (a torch pickle)
+# in an uploaded archive is refused: torch.load(weights_only=True) on untrusted
+# bytes is CVE-2025-32434 on torch 2.4, and later torch releases keep finding
+# unpickler bypasses. Stored clones stay prompt.pt: this server wrote them.
+_ARCHIVE_PROMPT = "prompt.safetensors"
+_LEGACY_ARCHIVE_PROMPT = "prompt.pt"
+_ARCHIVE_FORMAT = "miso-clone"
+_ARCHIVE_FORMAT_VERSION = "1"
+_ARCHIVE_INT_RE = re.compile(r"-?[0-9]{1,9}")
+
+
+def _prompt_to_safetensors(prompt: dict) -> bytes:
+    """Serialise a validated clone prompt as the archive's prompt.safetensors."""
+    import torch
+    from safetensors.torch import save
+
+    tensors = {k: v.detach().cpu().contiguous() for k, v in prompt.items() if torch.is_tensor(v)}
+    metadata = {
+        "format": _ARCHIVE_FORMAT,
+        "format_version": _ARCHIVE_FORMAT_VERSION,
+        "engine": "miso",
+        "speaker": str(int(prompt.get("speaker", DEFAULT_SPEAKER))),
+        "sample_rate": str(int(prompt.get("sample_rate", SAMPLE_RATE))),
+        "ref_text": str(prompt.get("ref_text", "") or ""),
+    }
+    return save(tensors, metadata=metadata)
+
+
+def _safetensors_metadata(data: bytes) -> dict:
+    """Read the `__metadata__` string map from a safetensors header (no tensors)."""
+    if len(data) < 8:
+        raise ValueError("prompt.safetensors is truncated")
+    header_len = int.from_bytes(data[:8], "little")
+    if header_len > len(data) - 8:
+        raise ValueError("prompt.safetensors has a malformed header")
+    try:
+        header = json.loads(data[8 : 8 + header_len].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"prompt.safetensors has a malformed header: {exc}") from exc
+    if not isinstance(header, dict):
+        raise ValueError("prompt.safetensors has a malformed header")
+    metadata = header.get("__metadata__") or {}
+    if not (isinstance(metadata, dict) and all(isinstance(v, str) for v in metadata.values())):
+        raise ValueError("prompt.safetensors metadata must map names to strings")
+    return metadata
+
+
+def _archive_int(metadata: dict, field: str, default: int) -> int:
+    value = metadata.get(field)
+    if value is None:
+        return default
+    if not _ARCHIVE_INT_RE.fullmatch(value.strip()):
+        raise ValueError(f"prompt.safetensors has a malformed {field}: {value[:32]!r}")
+    return int(value)
+
+
+def _prompt_from_safetensors(data: bytes, fallback_ref_text="") -> dict:
+    """Parse and validate an uploaded prompt.safetensors into a clone prompt.
+
+    Only safetensors' own parser touches the bytes: no pickle, no torch.load."""
+    import torch
+    from safetensors.torch import load
+
+    metadata = _safetensors_metadata(data)
+    try:
+        tensors = load(data)
+    except Exception as exc:
+        raise ValueError(f"Invalid prompt.safetensors: {exc}") from exc
+    ref_audio = tensors.get("ref_audio")
+    if ref_audio is None:
+        raise ValueError("prompt.safetensors must contain a Miso clone (ref_audio)")
+    if ref_audio.ndim < 1 or ref_audio.numel() == 0:
+        raise ValueError("ref_audio is empty")
+    if ref_audio.is_complex():
+        raise ValueError("ref_audio must be real-valued")
+    speaker = _archive_int(metadata, "speaker", DEFAULT_SPEAKER)
+    sample_rate = _archive_int(metadata, "sample_rate", SAMPLE_RATE)
+    if sample_rate <= 0:
+        raise ValueError("prompt.safetensors has a malformed sample_rate")
+    ref_text = metadata.get("ref_text")
+    if ref_text is None:
+        ref_text = fallback_ref_text if isinstance(fallback_ref_text, str) else ""
+    return {
+        "ref_audio": ref_audio.detach().cpu().to(torch.float32),
+        "ref_text": ref_text,
+        "speaker": speaker,
+        "sample_rate": sample_rate,
+        "engine": "miso",
+    }
+
+
 def _build_clone_zip(companion_id: str) -> bytes:
+    """Bundle a stored clone as prompt.safetensors (+ meta.json).
+
+    The stored prompt.pt was written by this server and loads through
+    _load_clone; legacy and new clones alike leave as safetensors."""
     if not _is_valid_companion_id(companion_id):
         raise ValueError(f"Invalid voice clone id: {companion_id!r}")
     prompt_key = f"voice_clones/{companion_id}/prompt.pt"
     meta_key = f"voice_clones/{companion_id}/meta.json"
     if not _storage.exists(prompt_key):
         raise FileNotFoundError(f"Voice clone not found: {companion_id}")
-    prompt_bytes = _storage.get(prompt_key)
+    prompt_bytes = _prompt_to_safetensors(_load_clone(companion_id))
     meta_bytes = _storage.get(meta_key) if _storage.exists(meta_key) else None
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("prompt.pt", prompt_bytes)
+        zf.writestr(_ARCHIVE_PROMPT, prompt_bytes)
         if meta_bytes is not None:
             zf.writestr("meta.json", meta_bytes)
     return zip_buf.getvalue()
@@ -2303,11 +2404,13 @@ class CloneExistsError(Exception):
 
 
 def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str, replace: bool = False) -> dict:
-    """Validate and store a clone archive (prompt.pt [+ meta.json]).
+    """Validate and store a clone archive (prompt.safetensors [+ meta.json]).
 
     The target id comes from the override, else the archive's own metadata, so
     an existing clone under it is never replaced unless ``replace`` is true
-    (``CloneExistsError`` otherwise), as on the XTTS engine."""
+    (``CloneExistsError`` otherwise), as on the XTTS engine. An archive holding
+    only a legacy prompt.pt is refused unread: uploaded bytes never reach
+    torch.load or any other unpickler."""
     import torch
 
     try:
@@ -2316,34 +2419,26 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
         raise ValueError(f"Not a valid zip archive: {exc}") from exc
 
     names = z.namelist()
-    prompt_name = next((n for n in names if n.rsplit("/", 1)[-1] == "prompt.pt"), None)
-    if not prompt_name:
-        raise ValueError("Archive does not contain prompt.pt")
-    if z.getinfo(prompt_name).file_size > _MAX_PROMPT_BYTES:
-        raise ValueError("prompt.pt is unexpectedly large")
+
+    def _member(basename: str):
+        return next((n for n in names if n.rsplit("/", 1)[-1] == basename), None)
+
+    prompt_name = _member(_ARCHIVE_PROMPT)
+    meta_name = _member("meta.json")
     # zipfile stops reading a member at its declared size, so checking that
     # size bounds what z.read() inflates.
-    meta_name = next((n for n in names if n.rsplit("/", 1)[-1] == "meta.json"), None)
+    if prompt_name and z.getinfo(prompt_name).file_size > _MAX_PROMPT_BYTES:
+        raise ValueError(f"{_ARCHIVE_PROMPT} is unexpectedly large")
     if meta_name and z.getinfo(meta_name).file_size > _MAX_META_BYTES:
         raise ValueError("meta.json is unexpectedly large")
-
-    try:
-        loaded = torch.load(io.BytesIO(z.read(prompt_name)), map_location="cpu", weights_only=True)
-    except Exception as exc:
-        raise ValueError(f"Invalid or untrusted prompt.pt: {exc}") from exc
-    if not (isinstance(loaded, dict) and "ref_audio" in loaded):
-        raise ValueError("prompt.pt must contain a Miso clone (ref_audio)")
-    if not torch.is_tensor(loaded["ref_audio"]):
-        raise ValueError("ref_audio is not a tensor")
-    if loaded["ref_audio"].ndim < 1 or loaded["ref_audio"].numel() == 0:
-        raise ValueError("ref_audio is empty")
-    try:
-        speaker = int(loaded.get("speaker", DEFAULT_SPEAKER))
-        sample_rate = int(loaded.get("sample_rate", SAMPLE_RATE))
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"prompt.pt has a malformed speaker or sample_rate: {exc}") from exc
-    if sample_rate <= 0:
-        raise ValueError("prompt.pt has a malformed sample_rate")
+    if not prompt_name:
+        if _member(_LEGACY_ARCHIVE_PROMPT):
+            raise ValueError(
+                "This archive holds a legacy prompt.pt (a pickle), which is no longer imported because "
+                "unpickling an uploaded file can run code. Re-export the clone from a Miso engine running "
+                "this version: its download now produces prompt.safetensors."
+            )
+        raise ValueError(f"Archive does not contain {_ARCHIVE_PROMPT}")
 
     src_meta: dict = {}
     if meta_name:
@@ -2353,6 +2448,9 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
             src_meta = {}
         if not isinstance(src_meta, dict):
             src_meta = {}  # valid JSON, but not an object: as good as no sidecar
+
+    prompt = _prompt_from_safetensors(z.read(prompt_name), src_meta.get("ref_text", ""))
+    sample_rate = prompt["sample_rate"]
 
     def _meta_str(field: str) -> str:
         value = src_meta.get(field)
@@ -2366,13 +2464,7 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
     if not replace and _storage.exists(f"voice_clones/{companion_id}/prompt.pt"):
         raise CloneExistsError(f"Voice clone {companion_id!r} already exists; send replace=true to overwrite")
 
-    prompt = {
-        "ref_audio": loaded["ref_audio"].detach().cpu().to(torch.float32),
-        "ref_text": str(loaded.get("ref_text", src_meta.get("ref_text", "")) or ""),
-        "speaker": speaker,
-        "sample_rate": sample_rate,
-        "engine": "miso",
-    }
+    # Stored clones stay prompt.pt, re-serialised here from the validated tensors.
     buf = io.BytesIO()
     torch.save(prompt, buf)
     s3_key = f"voice_clones/{companion_id}/prompt.pt"
