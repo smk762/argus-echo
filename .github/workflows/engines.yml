@@ -3,6 +3,7 @@ name: Engines
 # Each engine's unit tests, in that engine's own environment. They stub or mock the models, so no GPU or weights
 # are needed. Miso resolves its locked environment (torch 2.4) from engines/miso/uv.lock; XTTS and Qwen stub torch;
 # Whisper takes a fake model and VAD, so faster-whisper is not installed.
+# Each engine's test dependencies are in its requirements-test.txt, which ai-code-auditor's validate_patch also reads.
 
 on:
   push:
@@ -17,11 +18,6 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  SERVER_DEPS: >-
-    --with fastapi --with httpx --with structlog --with boto3 --with numpy --with soundfile
-    --with python-multipart --with pytest --with pydantic
-
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -29,10 +25,6 @@ jobs:
       fail-fast: false
       matrix:
         engine: [miso, xtts, qwen, whisper]
-        include:
-          # whisper reads uploads through argus_cortex.limits.open_audio (cortex 0.12+, [audio] extra).
-          - engine: whisper
-            cortex: "argus-cortex[server,audio]>=0.12,<0.14"
     defaults:
       run:
         working-directory: engines/${{ matrix.engine }}
@@ -47,15 +39,10 @@ jobs:
         run: uvx ruff@0.15.16 check --select E9,F63,F7,F82 .
       - name: pytest (miso)
         if: matrix.engine == 'miso'
-        run: >-
-          uv run --python 3.11 --with setuptools --with fastapi --with "uvicorn[standard]"
-          --with python-multipart --with structlog --with boto3 --with silero-vad --with pyloudnorm
-          --with noisereduce --with httpx --with pytest python -m pytest -q
+        run: uv run --python 3.11 --with-requirements requirements-test.txt python -m pytest -q
       - name: pytest (${{ matrix.engine }})
         if: matrix.engine != 'miso'
-        run: >-
-          uv run --no-project --python 3.11 --with "${{ matrix.cortex || 'argus-cortex[server]>=0.8,<0.10' }}"
-          $SERVER_DEPS python -m pytest -q tests
+        run: uv run --no-project --python 3.11 --with-requirements requirements-test.txt python -m pytest -q tests
 
   wyoming:
     runs-on: ubuntu-latest
@@ -69,6 +56,8 @@ jobs:
         run: uvx ruff@0.15.16 check --select E9,F63,F7,F82 .
       - name: imports
         run: uv run --no-project --python 3.11 --with-requirements requirements.txt python -c "import tts_bridge"
+      - name: pytest
+        run: uv run --no-project --python 3.11 --with-requirements requirements.txt --with pytest python -m pytest -q tests
 
   compose:
     runs-on: ubuntu-latest

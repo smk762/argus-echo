@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 from functools import partial
 from typing import Any, Optional
 
@@ -94,6 +95,13 @@ _CLONE_KEYS: dict[str, str] = {}
 # Built-in studio speaker names, cached once (the list is static; fetching it
 # wakes the XTTS GPU, so we only do it when WYOMING_TTS_LIST_SPEAKERS is set).
 _SPEAKER_CACHE: list[str] = []
+_SPEAKER_LOCK = asyncio.Lock()
+
+# What the sidecars accept as a companion_id, and the one key layout a clone's
+# prompt lives under. A voice name comes from the Wyoming client, so nothing
+# outside these (or the keys the sidecar itself listed) is forwarded as a key.
+_COMPANION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_CLONE_KEY_RE = re.compile(r"voice_clones/[A-Za-z0-9_-]{1,64}/prompt\.pt")
 
 
 async def _fetch_clones() -> list[dict]:
@@ -107,11 +115,18 @@ async def _fetch_clones() -> list[dict]:
         _LOGGER.warning("could not fetch clones from %s: %s", XTTS_URL, exc)
         return []
 
+    # A successful listing is the whole truth: replace the map, so a clone
+    # deleted on the sidecar stops resolving here too. (A failed fetch returned
+    # above and leaves the last known map in place.)
+    clones = [clone for clone in clones if isinstance(clone, dict)]
+    fresh: dict[str, str] = {}
     for clone in clones:
-        cid = (clone.get("companion_id") or "").strip()
-        key = (clone.get("voice_clone_id") or "").strip()
+        cid = str(clone.get("companion_id") or "").strip()
+        key = str(clone.get("voice_clone_id") or "").strip()
         if cid and key:
-            _CLONE_KEYS[cid] = key
+            fresh[cid] = key
+    _CLONE_KEYS.clear()
+    _CLONE_KEYS.update(fresh)
     return clones
 
 
@@ -119,16 +134,21 @@ async def _fetch_speakers() -> list[str]:
     """Enumerate built-in studio speakers (cached). Wakes the XTTS GPU once."""
     if _SPEAKER_CACHE:
         return _SPEAKER_CACHE
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(f"{XTTS_URL}/speakers")
-            resp.raise_for_status()
-            names = [s.get("name") for s in resp.json().get("speakers", []) if s.get("name")]
-    except Exception as exc:  # noqa: BLE001 — model may still be loading
-        _LOGGER.warning("could not fetch speakers from %s: %s", XTTS_URL, exc)
-        return []
-    _SPEAKER_CACHE.extend(names)
-    return names
+    # One fill at a time: several Describe events at startup would otherwise all
+    # see the empty cache, all fetch, and each append the same names.
+    async with _SPEAKER_LOCK:
+        if _SPEAKER_CACHE:
+            return _SPEAKER_CACHE
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.get(f"{XTTS_URL}/speakers")
+                resp.raise_for_status()
+                names = [s.get("name") for s in resp.json().get("speakers", []) if s.get("name")]
+        except Exception as exc:  # noqa: BLE001 — model may still be loading
+            _LOGGER.warning("could not fetch speakers from %s: %s", XTTS_URL, exc)
+            return []
+        _SPEAKER_CACHE[:] = names
+        return names
 
 
 def _clone_key(companion_id: str) -> str:
@@ -138,11 +158,22 @@ def _clone_key(companion_id: str) -> str:
     (``voice_clones/<companion_id>/prompt.pt``), not the bare id — passing the
     bare id yields a 422. Prefer the key learned from ``/clones``; fall back to
     the well-known layout when we have not listed clones on this connection.
+
+    The id comes from the Wyoming client. A full key is taken only if the
+    sidecar listed it or it is exactly ``voice_clones/<id>/prompt.pt``, and a
+    bare id only if it is a valid companion_id; anything else is a ValueError,
+    so a client can't point the sidecar at an arbitrary object in the bucket.
     """
     cid = companion_id.strip()
+    if cid in _CLONE_KEYS:
+        return _CLONE_KEYS[cid]
     if "/" in cid:  # already a full key
-        return cid
-    return _CLONE_KEYS.get(cid) or f"voice_clones/{cid}/prompt.pt"
+        if cid in _CLONE_KEYS.values() or _CLONE_KEY_RE.fullmatch(cid):
+            return cid
+        raise ValueError(f"not a clone key: {cid!r}")
+    if not _COMPANION_ID_RE.fullmatch(cid):
+        raise ValueError(f"not a clone id: {cid!r}")
+    return f"voice_clones/{cid}/prompt.pt"
 
 
 async def _build_info() -> Info:
@@ -215,7 +246,14 @@ class XttsEventHandler(AsyncEventHandler):
         if not (synth.text or "").strip():
             return
 
-        payload = self._resolve_payload(synth)
+        try:
+            payload = self._resolve_payload(synth)
+        except ValueError as exc:
+            # A voice we won't forward: answer with an empty clip, not a dead connection.
+            _LOGGER.error("synthesis refused: %s", exc)
+            await self.write_event(AudioStart(rate=SAMPLE_RATE, width=SAMPLE_WIDTH, channels=CHANNELS).event())
+            await self.write_event(AudioStop(timestamp=0).event())
+            return
         _LOGGER.debug("synthesize: %s", {k: v for k, v in payload.items() if k != "text"})
 
         await self.write_event(

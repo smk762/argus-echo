@@ -52,6 +52,39 @@ class LifecycleTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.01)
         return pred()
 
+    async def test_failed_demotion_drops_the_model(self):
+        """A move that fails half-way may leave weights on both devices: the
+        state must not stay "gpu" with that generator."""
+        self._configure(gpu=0.05, cpu=10)
+
+        def _move(mgr, dev):
+            self.moves.append(dev)
+            raise RuntimeError("cannot allocate memory")
+
+        with mock.patch.object(srv.MisoModelManager, "_move", _move), mock.patch.object(srv, "logger") as log:
+            await self.mgr.ensure_ready()
+            self.assertTrue(await self._until(lambda: self.mgr.state == srv.TTSState.UNLOADED))
+            self.assertEqual(self.moves, ["cpu"])
+            self.assertIsNone(self.mgr.generator)
+            self.assertFalse(self.mgr._ready_for_generation())
+            self.assertIn("cannot allocate memory", self.mgr.error)
+            self.assertIn("miso_demote_failed", [c.args[0] for c in log.error.call_args_list])
+        # The next request starts over with a fresh load.
+        await self.mgr.ensure_ready()
+        self.assertEqual(self.mgr.state, srv.TTSState.GPU)
+        self.assertEqual(self.loads, 2)
+
+    async def test_evict_loop_logs_a_failed_transition(self):
+        self._configure(gpu=0.05, cpu=10)
+        with mock.patch.object(
+            srv.MisoModelManager, "demote_to_cpu", mock.AsyncMock(side_effect=RuntimeError("boom"))
+        ), mock.patch.object(srv, "logger") as log:
+            await self.mgr.ensure_ready()
+            task = self.mgr._evict_task
+            await asyncio.wait_for(asyncio.shield(task), timeout=2.0)
+            self.assertIsNone(task.exception())
+            self.assertIn("miso_evict_failed", [c.args[0] for c in log.error.call_args_list])
+
     async def test_cpu_zero_skips_cpu_stage_and_unloads(self):
         self._configure(gpu=0.05, cpu=0)
         await self.mgr.ensure_ready()

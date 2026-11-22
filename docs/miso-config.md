@@ -136,15 +136,16 @@ One generation holds the GPU at a time.
 | `MISO_PUBLIC_URL` | empty | Base URL put in `audio_url` for the local backend, for example `http://tts.lan:8140`. **Set this** whenever clients are on another machine or the server runs in a container |
 | `MISO_PUBLIC_HOST` | empty | Host used if `MISO_PUBLIC_URL` is empty: `http://<host>:<MISO_PORT>`. If both are empty the server uses the IP its hostname resolves to |
 
-S3 backend (`MISO_STORAGE_BACKEND=s3`). The defaults are a MinIO on
-`localhost` with MinIO's stock credentials, which suit a quick local test only;
-**set all five** for anything else:
+S3 backend (`MISO_STORAGE_BACKEND=s3`). The endpoint, bucket and public URL
+default to a MinIO on `localhost`, which suits a quick local test only. The
+credentials have no default: the server refuses to start without both.
+**Set all five** for anything else:
 
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `S3_ENDPOINT_URL` | `http://localhost:9000` | S3 API endpoint |
-| `S3_ACCESS_KEY_ID` | `minioadmin` | Access key |
-| `S3_SECRET_ACCESS_KEY` | `minioadmin` | Secret key |
+| `S3_ACCESS_KEY_ID` | none, required | Access key. Use a key scoped to the bucket, not the store's root account |
+| `S3_SECRET_ACCESS_KEY` | none, required | Secret key |
 | `S3_BUCKET_NAME` | `voice` | Bucket (must exist) |
 | `S3_PUBLIC_URL` | `http://localhost:9000/voice` | Public base for returned URLs: `<S3_PUBLIC_URL>/<key>`. The objects must be readable there |
 

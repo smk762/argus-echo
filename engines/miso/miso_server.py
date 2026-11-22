@@ -277,19 +277,44 @@ class LocalStorage(Storage):
         os.makedirs(self.root, exist_ok=True)
 
     def _path(self, key: str) -> str:
-        # Keys are app-generated (no user path traversal), but normalise anyway.
-        safe = os.path.normpath(key).lstrip("/")
-        if safe.startswith(".."):
+        # GET /media/{key:path} passes a client-chosen key, so every key is
+        # confined to the root here: no NUL or backslash, and no `..` that
+        # climbs out once normalised. A leading "/" is taken as relative.
+        if "\x00" in key or "\\" in key:
             raise ValueError("invalid key")
-        return os.path.join(self.root, safe)
+        safe = os.path.normpath(key).lstrip("/")
+        if safe == ".." or safe.startswith("../"):
+            raise ValueError("invalid key")
+        path = os.path.join(self.root, safe)
+        if os.path.commonpath([self.root, path]) != self.root:
+            raise ValueError("invalid key")
+        return path
+
+    @staticmethod
+    def _open_tmp(tmp: str):
+        """Open the temp file, creating its directory. A concurrent delete()
+        prunes empty parents, so it can remove the directory between makedirs
+        and open; make it again rather than fail the write."""
+        for attempt in range(3):
+            os.makedirs(os.path.dirname(tmp), exist_ok=True)
+            try:
+                return open(tmp, "wb")
+            except FileNotFoundError:
+                if attempt == 2:
+                    raise
 
     def put(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
         path = self._path(key)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = f"{path}.tmp-{uuid.uuid4().hex}"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
+        try:
+            with self._open_tmp(tmp) as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except BaseException:
+            # Don't leave the partial file: list_keys() hides it and nothing else removes it.
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(tmp)
+            raise
         return self.url_for(key)
 
     def get(self, key: str) -> bytes:
@@ -334,8 +359,14 @@ class LocalStorage(Storage):
 class S3Storage(Storage):
     def __init__(self) -> None:
         self.endpoint = os.getenv("S3_ENDPOINT_URL", "http://localhost:9000")
-        self.access_key = os.getenv("S3_ACCESS_KEY_ID", "minioadmin")
-        self.secret_key = os.getenv("S3_SECRET_ACCESS_KEY", "minioadmin")
+        # No default credentials: a deployment that forgot them must not start
+        # on MinIO's well-known root account.
+        self.access_key = os.getenv("S3_ACCESS_KEY_ID", "").strip()
+        self.secret_key = os.getenv("S3_SECRET_ACCESS_KEY", "").strip()
+        if not (self.access_key and self.secret_key):
+            raise RuntimeError(
+                "MISO_STORAGE_BACKEND=s3 needs S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY; there are no defaults"
+            )
         self.bucket = os.getenv("S3_BUCKET_NAME", "voice")
         self.public_url = os.getenv("S3_PUBLIC_URL", "http://localhost:9000/voice").rstrip("/")
         self._client = None
@@ -707,9 +738,23 @@ class MisoModelManager:
                 return
             if if_idle and self._in_use():
                 return  # a request arrived while the evict loop waited for the lock
+            failure: Optional[str] = None
             # Never move weights while a generation (incl. a stream) is running.
             async with self._gen_lock:
-                await asyncio.to_thread(self._move, "cpu")
+                try:
+                    await asyncio.to_thread(self._move, "cpu")
+                except Exception as exc:
+                    # Weights may now be split across devices, as after a failed
+                    # promotion in ensure_ready(): drop the model, don't keep "gpu".
+                    failure = str(exc)
+                    traceback.clear_frames(exc.__traceback__)
+                    self._generator = None
+            if failure is not None:
+                await asyncio.to_thread(_release_host_memory)
+                self._state = TTSState.UNLOADED
+                self._error = failure
+                logger.error("miso_demote_failed", error=failure, **_mem_fields())
+                return
             self._state = TTSState.CPU
             logger.info("miso_demoted_cpu", keep_alive_cpu=KEEP_ALIVE_CPU, **_mem_fields())
 
@@ -776,6 +821,9 @@ class MisoModelManager:
             await asyncio.shield(self.unload(if_idle=True))
         except asyncio.CancelledError:
             pass
+        except Exception:
+            # Nothing awaits this task; log instead of dying with an unretrieved exception.
+            logger.error("miso_evict_failed", state=self._state.value, exc_info=True)
 
 
 _mgr = MisoModelManager()
@@ -1181,21 +1229,21 @@ def _fit_context(base: list, extra: list, text: str, speaker: int, max_audio_ms:
 
     The prompt must stay below max_seq_len minus the generation budget. ``base``
     (the clone reference) is never dropped; ``extra`` loses its oldest first."""
-    if not extra:
-        return base
     # Generator.generate / generate_stream hard-code max_seq_len = 2048.
     max_seq_len = int(getattr(generator, "max_seq_len", 2048))
     limit = max_seq_len - _max_frames(max_audio_ms) - CONTEXT_TOKEN_MARGIN
     used = sum(_segment_prompt_len(s, generator) for s in base) + _text_token_count(generator, text, speaker)
+    if used >= limit:
+        # Same check Generator makes, raised here (with or without ``extra``) so
+        # /synthesise/stream answers 422 instead of a 200 with an empty body.
+        raise ValueError(f"voice reference and text are too long for the prompt ({used} >= {limit} tokens)")
+    if not extra:
+        return base
     lengths = [_segment_prompt_len(s, generator) for s in extra]
     kept = list(extra)
     while kept and used + sum(lengths) >= limit:
         kept.pop(0)
         lengths.pop(0)
-    if used >= limit:
-        # Same check Generator makes, raised here so /synthesise/stream answers
-        # 422 instead of a 200 with an empty body.
-        raise ValueError(f"voice reference and text are too long for the prompt ({used} >= {limit} tokens)")
     if len(kept) < len(extra):
         logger.warning(
             "miso_context_trimmed",
@@ -1277,6 +1325,23 @@ def _load_audio_24k_mono(path: str):
     return wav.squeeze(0).to(torch.float32).contiguous()
 
 
+def _padded_speech_spans(timestamps: list[dict], pad: float, sr: int, total: int) -> list[tuple[int, int]]:
+    """Speech timestamps (seconds) → sample spans widened by ``pad`` seconds,
+    with overlapping spans merged. Silero allows gaps shorter than two pads,
+    and slicing overlapping spans would repeat the audio between them."""
+    spans: list[list[int]] = []
+    for t in sorted(timestamps, key=lambda t: t["start"]):
+        a = max(0, int((t["start"] - pad) * sr))
+        b = min(total, int((t["end"] + pad) * sr))
+        if b <= a:
+            continue
+        if spans and a <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([a, b])
+    return [(a, b) for a, b in spans]
+
+
 def _preprocess_reference(path: str) -> tuple["object", dict]:
     """Standardise a reference clip for cloning: mono → 24 kHz → DC removal →
     high-pass → VAD trim → length cap → peak/loudness guard. Returns
@@ -1303,13 +1368,7 @@ def _preprocess_reference(path: str) -> tuple["object", dict]:
             vad_wav = AF.resample(samples.unsqueeze(0), sr, 16000).squeeze(0)
             ts = get_speech_timestamps(vad_wav, model, sampling_rate=16000, return_seconds=True)
             if ts:
-                pad = 0.1
-                segs = []
-                for t in ts:
-                    a = max(0, int((t["start"] - pad) * sr))
-                    b = min(samples.shape[-1], int((t["end"] + pad) * sr))
-                    if b > a:
-                        segs.append(samples[a:b])
+                segs = [samples[a:b] for a, b in _padded_speech_spans(ts, 0.1, sr, samples.shape[-1])]
                 if segs:
                     samples = torch.cat(segs)
                     report["applied"].append("vad_trim")
@@ -1357,6 +1416,15 @@ def _get_vad_model():
 
         _vad_model = load_silero_vad()
     return _vad_model
+
+
+def _ref_wav_bytes(ref_audio) -> bytes:
+    """The stored reference tensor as a WAV file, for the transcriber."""
+    import soundfile as sf
+
+    buf = io.BytesIO()
+    sf.write(buf, _to_numpy_audio(ref_audio), SAMPLE_RATE, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
 
 
 def _transcribe_reference(wav_bytes: bytes) -> str:
@@ -1837,6 +1905,7 @@ def _quick_clip_metrics(path: str) -> dict:
         ts = get_speech_timestamps(s16, _get_vad_model(), sampling_rate=16000, return_seconds=True)
         if not ts:
             m["flags"].append("vad_no_speech")
+            m["speech_seconds"] = 0.0  # known, unlike the vad_failed fallback above
             return m
         total = s16.shape[-1]
         inset = int(0.05 * 16000)
@@ -1995,7 +2064,6 @@ async def clone_voice(
 
     raw_paths: list[str] = []
     reports: list[dict] = []
-    first_clip_bytes: Optional[bytes] = None
     try:
         segments = []
         for clip in clips:
@@ -2003,8 +2071,6 @@ async def clone_voice(
                 clip_bytes = await read_upload(clip, MAX_CLIP_BYTES, what="audio clip")
             except (TooLarge, BadInput) as exc:
                 return _upload_refused(exc)
-            if first_clip_bytes is None:
-                first_clip_bytes = clip_bytes
             suffix = os.path.splitext(clip.filename or "")[1] or ".wav"
             with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
                 f.write(clip_bytes)
@@ -2039,8 +2105,11 @@ async def clone_voice(
                 pass
 
     ref_text = (reference_text or "").strip()
-    if not ref_text and first_clip_bytes is not None:
-        ref_text = await asyncio.to_thread(_transcribe_reference, first_clip_bytes)
+    if not ref_text and WHISPER_URL:
+        # Transcribe what is stored (the clips that survived preprocessing, trimmed
+        # and capped), not an upload: Miso conditions on the (audio, text) pair.
+        wav_bytes = await asyncio.to_thread(_ref_wav_bytes, ref_audio)
+        ref_text = await asyncio.to_thread(_transcribe_reference, wav_bytes)
 
     speaker = DEFAULT_SPEAKER
     prompt = {
@@ -2061,7 +2130,7 @@ async def clone_voice(
         "voice_clone_id": s3_key,
         "companion_id": companion_id,
         "name": voice_name or companion_id,
-        "num_clips": len(clips),
+        "num_clips": len(segments),  # the clips used; one that failed preprocessing is not in the clone
         "total_seconds": total_seconds,
         "has_transcript": bool(ref_text),
         "engine": "miso",
@@ -2077,7 +2146,7 @@ async def clone_voice(
     if len(_clone_cache) > _CLONE_CACHE_MAX:
         _clone_cache.popitem(last=False)
 
-    logger.info("voice_cloned", companion_id=companion_id, clips=len(clips), duration=total_seconds, s3_key=s3_key)
+    logger.info("voice_cloned", companion_id=companion_id, clips=len(segments), uploaded=len(clips), duration=total_seconds, s3_key=s3_key)
     return {**meta, "duration": total_seconds, "clips": reports}
 
 
@@ -2090,10 +2159,18 @@ def _list_clones() -> list[dict]:
         if not key.endswith("/meta.json"):
             continue
         try:
-            clones.append(json.loads(_storage.get(key).decode("utf-8")))
+            meta = json.loads(_storage.get(key).decode("utf-8"))
+            if not isinstance(meta, dict):
+                raise ValueError("meta.json is not an object")
+            clones.append(meta)
         except Exception as exc:
             logger.warning("clone_meta_unreadable", key=key, error=str(exc))
-    clones.sort(key=lambda c: c.get("created_at", 0), reverse=True)
+
+    def _created(c: dict) -> float:
+        value = c.get("created_at")
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+    clones.sort(key=_created, reverse=True)
     return clones
 
 
@@ -2221,7 +2298,16 @@ _MAX_PROMPT_BYTES = 64 * 1024 * 1024
 _MAX_META_BYTES = 1024 * 1024
 
 
-def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str) -> dict:
+class CloneExistsError(Exception):
+    """The import's target companion_id already has a clone (and replace was not set)."""
+
+
+def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str, replace: bool = False) -> dict:
+    """Validate and store a clone archive (prompt.pt [+ meta.json]).
+
+    The target id comes from the override, else the archive's own metadata, so
+    an existing clone under it is never replaced unless ``replace`` is true
+    (``CloneExistsError`` otherwise), as on the XTTS engine."""
     import torch
 
     try:
@@ -2249,6 +2335,15 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str)
         raise ValueError("prompt.pt must contain a Miso clone (ref_audio)")
     if not torch.is_tensor(loaded["ref_audio"]):
         raise ValueError("ref_audio is not a tensor")
+    if loaded["ref_audio"].ndim < 1 or loaded["ref_audio"].numel() == 0:
+        raise ValueError("ref_audio is empty")
+    try:
+        speaker = int(loaded.get("speaker", DEFAULT_SPEAKER))
+        sample_rate = int(loaded.get("sample_rate", SAMPLE_RATE))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"prompt.pt has a malformed speaker or sample_rate: {exc}") from exc
+    if sample_rate <= 0:
+        raise ValueError("prompt.pt has a malformed sample_rate")
 
     src_meta: dict = {}
     if meta_name:
@@ -2256,18 +2351,26 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str)
             src_meta = json.loads(z.read(meta_name).decode("utf-8"))
         except (ValueError, json.JSONDecodeError):
             src_meta = {}
+        if not isinstance(src_meta, dict):
+            src_meta = {}  # valid JSON, but not an object: as good as no sidecar
 
-    companion_id = (companion_override or src_meta.get("companion_id") or "").strip()
-    companion_id = _slugify(companion_id or name_override or src_meta.get("name") or "imported-voice")
+    def _meta_str(field: str) -> str:
+        value = src_meta.get(field)
+        return value.strip() if isinstance(value, str) else ""
+
+    companion_id = (companion_override or "").strip() or _meta_str("companion_id")
+    companion_id = _slugify(companion_id or name_override or _meta_str("name") or "imported-voice")
     companion_id = companion_id[:64].strip("-") or f"voice-{int(time.time())}"
     if not _is_valid_companion_id(companion_id):
         raise ValueError(f"Invalid companion_id: {companion_id!r}")
+    if not replace and _storage.exists(f"voice_clones/{companion_id}/prompt.pt"):
+        raise CloneExistsError(f"Voice clone {companion_id!r} already exists; send replace=true to overwrite")
 
     prompt = {
         "ref_audio": loaded["ref_audio"].detach().cpu().to(torch.float32),
         "ref_text": str(loaded.get("ref_text", src_meta.get("ref_text", "")) or ""),
-        "speaker": int(loaded.get("speaker", DEFAULT_SPEAKER)),
-        "sample_rate": int(loaded.get("sample_rate", SAMPLE_RATE)),
+        "speaker": speaker,
+        "sample_rate": sample_rate,
         "engine": "miso",
     }
     buf = io.BytesIO()
@@ -2278,9 +2381,10 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str)
     meta = {
         "voice_clone_id": s3_key,
         "companion_id": companion_id,
-        "name": name_override or src_meta.get("name") or companion_id,
+        "name": name_override or _meta_str("name") or companion_id,
         "num_clips": src_meta.get("num_clips", 0),
-        "total_seconds": src_meta.get("total_seconds", round(prompt["ref_audio"].shape[-1] / SAMPLE_RATE, 2)),
+        # The clone's own rate: an imported prompt need not be at this server's SAMPLE_RATE.
+        "total_seconds": src_meta.get("total_seconds", round(prompt["ref_audio"].shape[-1] / sample_rate, 2)),
         "imported": True,
         "engine": "miso",
         "created_at": time.time(),
@@ -2300,13 +2404,18 @@ async def import_clone(
     archive: UploadFile = File(...),
     voice_name: str = Form(""),
     companion_id: str = Form(""),
+    replace: bool = Form(False),
 ):
+    """Import a downloaded voice archive. 409 when the target id already has a
+    clone, unless ``replace`` is true."""
     try:
         data = await read_upload(archive, MAX_ARCHIVE_BYTES, what="clone archive")
     except (TooLarge, BadInput) as exc:
         return _upload_refused(exc)
     try:
-        meta = await asyncio.to_thread(_import_clone, data, companion_id, voice_name)
+        meta = await asyncio.to_thread(_import_clone, data, companion_id, voice_name, replace)
+    except CloneExistsError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
     except ValueError as exc:
         return JSONResponse(status_code=422, content={"error": str(exc)})
     except Exception as exc:
@@ -2378,7 +2487,11 @@ _MEDIA_CTYPES = {".wav": "audio/wav", ".json": "application/json", ".pt": "appli
 async def serve_media(key: str):
     if not isinstance(_storage, LocalStorage):
         return JSONResponse(status_code=404, content={"error": "media route only serves the local backend"})
-    if not _storage.exists(key):
+    try:
+        found = _storage.exists(key)
+    except ValueError:
+        found = False  # a key that would leave the storage root
+    if not found:
         return JSONResponse(status_code=404, content={"error": "not found"})
     data = await asyncio.to_thread(_storage.get, key)
     ext = os.path.splitext(key)[1].lower()

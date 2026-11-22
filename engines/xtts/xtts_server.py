@@ -114,8 +114,10 @@ MAX_CLIPS: int = int(os.getenv("XTTS_MAX_CLIPS", "16"))
 CLIP_MAX_BYTES: int = int(os.getenv("XTTS_CLIP_MAX_BYTES", str(16 * 1024 * 1024)))
 
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "http://localhost:9000")
-S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "minioadmin")
-S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "minioadmin")
+# No default credentials: a deployment that forgot them must not run on MinIO's
+# well-known root account. See _require_s3_credentials().
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "").strip()
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "").strip()
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "voice")
 S3_PUBLIC_URL = os.getenv("S3_PUBLIC_URL", "http://localhost:9000/voice")
 
@@ -440,9 +442,17 @@ def _get_vad_model():
         return _vad_model
 
 
+def _require_s3_credentials() -> None:
+    """Raise unless both S3 credentials are configured. Called at startup, and
+    again before the first client is built for anything that skips the lifespan."""
+    if not (S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY):
+        raise RuntimeError("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be set; there are no defaults")
+
+
 def _get_s3_client():
     global _s3_client
     if _s3_client is None:
+        _require_s3_credentials()
         import boto3
 
         _s3_client = boto3.client(
@@ -580,8 +590,41 @@ def _audio_duration(path: str) -> float | None:
         import torchaudio
 
         info = torchaudio.info(path)
-        if info.sample_rate:
+        # Some backends report num_frames == 0 for a compressed or streamed
+        # container whose length they can't tell up front: unknown, not 0 s.
+        if info.sample_rate > 0 and info.num_frames > 0:
             return info.num_frames / info.sample_rate
+    return None
+
+
+# Set by a CUDA error that is not an out-of-memory (device-side assert, illegal
+# memory access…). Those leave the process's CUDA context unusable, so every
+# later request fails too: /health answers 503 from then on, until a restart.
+_gpu_fault: Optional[str] = None
+
+
+def _is_oom(exc: BaseException) -> bool:
+    torch = sys.modules.get("torch")  # imported with the model; nothing raises its errors before that
+    oom_type = getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+    if isinstance(oom_type, type) and isinstance(exc, oom_type):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _gpu_error_response(exc: RuntimeError, event: str) -> Optional[JSONResponse]:
+    """The response for a RuntimeError out of the model, or None if it is not a GPU error.
+
+    Only a real out-of-memory is the retryable 503 "GPU OOM". Any other CUDA
+    error is a 500 without the exception text, and marks the worker unhealthy."""
+    global _gpu_fault
+    if _is_oom(exc):
+        gpu_info = _gpu_memory_info()
+        logger.error(event, error=str(exc), gpu=gpu_info)
+        return JSONResponse(status_code=503, content={"error": "GPU OOM", "detail": str(exc), "gpu": gpu_info})
+    if "cuda" in str(exc).lower():
+        _gpu_fault = str(exc)
+        logger.error("xtts_gpu_fault", error=str(exc), exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "GPU error; this worker needs a restart"})
     return None
 
 
@@ -623,6 +666,7 @@ def _list_speakers() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _require_s3_credentials()  # fail at startup, not on the first upload
     if PRELOAD:
         await _mgr.ensure_gpu()
     yield
@@ -690,11 +734,9 @@ async def synthesise(req: SynthesiseRequest):
         try:
             wav = await asyncio.to_thread(_run_inference, req.text, language, gpt, spk, speed)
         except RuntimeError as exc:
-            err_str = str(exc).lower()
-            if "out of memory" in err_str or "cuda" in err_str:
-                gpu_info = _gpu_memory_info()
-                logger.error("xtts_gpu_oom", error=str(exc), gpu=gpu_info)
-                return JSONResponse(status_code=503, content={"error": "GPU OOM", "detail": str(exc), "gpu": gpu_info})
+            refused = _gpu_error_response(exc, "xtts_gpu_oom")
+            if refused is not None:
+                return refused
             raise
         except Exception as exc:
             logger.error("xtts_generation_failed", error=str(exc), exc_info=True)
@@ -823,6 +865,9 @@ async def synthesise_stream(req: SynthesiseRequest):
                         break  # client went away: stop generating
             except Exception as exc:  # surface as stream termination
                 logger.error("xtts_stream_failed", error=str(exc), exc_info=True)
+                if isinstance(exc, RuntimeError) and not _is_oom(exc) and "cuda" in str(exc).lower():
+                    global _gpu_fault
+                    _gpu_fault = str(exc)  # /health reports it; see _gpu_error_response
             finally:
                 close = getattr(stream, "close", None)
                 if close is not None:
@@ -880,6 +925,43 @@ def _padded_spans(ts: list[dict], pad: float, sr: int, total_len: int) -> list[t
             spans.append((a, b))
             last_b = b
     return spans
+
+
+def _normalise_loudness(audio_np, sr: int, report: dict):
+    """LUFS-normalise ``audio_np`` to PREPROCESS_TARGET_LUFS with a peak guard,
+    falling back to peak normalisation. Records in ``report`` what the returned
+    samples actually are: ``lufs_out`` and ``gain_db`` include the guard."""
+    import numpy as np
+
+    try:
+        import pyloudnorm as pyln
+
+        meter = pyln.Meter(sr)
+        loud_in = meter.integrated_loudness(audio_np)
+        if np.isfinite(loud_in):
+            report["lufs_in"] = round(float(loud_in), 1)
+            normed = pyln.normalize.loudness(audio_np, loud_in, PREPROCESS_TARGET_LUFS)
+            peak = float(np.max(np.abs(normed))) if normed.size else 0.0
+            limited_db = 0.0
+            if peak > 0.99:
+                # The peak guard scales the clip back down, so it lands below the
+                # target by exactly this much: report what was written.
+                normed = normed * (0.99 / peak)
+                limited_db = 20.0 * math.log10(0.99 / peak)
+                report["warnings"].append("peak_limited")
+            audio_np = normed.astype(np.float32)
+            report["lufs_out"] = round(float(PREPROCESS_TARGET_LUFS + limited_db), 1)
+            report["gain_db"] = round(float(PREPROCESS_TARGET_LUFS - loud_in + limited_db), 1)
+            report["applied"].append("lufs_norm")
+        else:
+            report["warnings"].append("lufs_unmeasurable")
+    except Exception as exc:
+        report["warnings"].append(f"lufs_failed:{exc}")
+        peak = float(np.max(np.abs(audio_np))) if audio_np.size else 0.0
+        if peak > 0:
+            audio_np = (audio_np * (0.97 / peak)).astype(np.float32)
+            report["applied"].append("peak_norm")
+    return audio_np
 
 
 def _preprocess_clip(in_path: str) -> tuple[str, dict]:
@@ -1004,29 +1086,7 @@ def _preprocess_clip(in_path: str) -> tuple[str, dict]:
     report["kept_seconds"] = round(samples.shape[-1] / sr, 2)
     audio_np = samples.numpy().astype(np.float32)
 
-    try:
-        import pyloudnorm as pyln
-
-        meter = pyln.Meter(sr)
-        loud_in = meter.integrated_loudness(audio_np)
-        if np.isfinite(loud_in):
-            report["lufs_in"] = round(float(loud_in), 1)
-            normed = pyln.normalize.loudness(audio_np, loud_in, PREPROCESS_TARGET_LUFS)
-            peak = float(np.max(np.abs(normed))) if normed.size else 0.0
-            if peak > 0.99:
-                normed = normed * (0.99 / peak)
-            audio_np = normed.astype(np.float32)
-            report["lufs_out"] = PREPROCESS_TARGET_LUFS
-            report["gain_db"] = round(float(PREPROCESS_TARGET_LUFS - loud_in), 1)
-            report["applied"].append("lufs_norm")
-        else:
-            report["warnings"].append("lufs_unmeasurable")
-    except Exception as exc:
-        report["warnings"].append(f"lufs_failed:{exc}")
-        peak = float(np.max(np.abs(audio_np))) if audio_np.size else 0.0
-        if peak > 0:
-            audio_np = (audio_np * (0.97 / peak)).astype(np.float32)
-            report["applied"].append("peak_norm")
+    audio_np = _normalise_loudness(audio_np, sr, report)
 
     out = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
     out.close()
@@ -1274,9 +1334,9 @@ async def analyze_clips(audio: list[UploadFile] = File(...)):
         async with _mgr.lease():
             result = await asyncio.to_thread(_analyze_clips, raw_paths, names)
     except RuntimeError as exc:
-        err_str = str(exc).lower()
-        if "out of memory" in err_str or "cuda" in err_str:
-            return JSONResponse(status_code=503, content={"error": "GPU OOM", "detail": str(exc)})
+        refused = _gpu_error_response(exc, "xtts_analyze_gpu_oom")
+        if refused is not None:
+            return refused
         raise
     finally:
         for path in raw_paths:
@@ -1342,6 +1402,7 @@ async def clone_voice(
         except _ClipTooLarge as exc:
             return JSONResponse(status_code=413, content={"error": str(exc)})
         total_duration = 0.0
+        measured = False  # some clip's duration is known (even if it is 0 s of speech)
         for clip, raw_path in zip(clips, raw_paths):
             if PREPROCESS:
                 try:
@@ -1350,6 +1411,7 @@ async def clone_voice(
                     latent_paths.append(proc_path)
                     reports.append(report)
                     total_duration += report.get("kept_seconds") or 0.0
+                    measured = measured or report.get("kept_seconds") is not None
                     continue
                 except Exception as exc:
                     logger.warning("clip_preprocess_failed", name=clip.filename, error=str(exc))
@@ -1359,10 +1421,12 @@ async def clone_voice(
             latent_paths.append(raw_path)
             dur = await asyncio.to_thread(_audio_duration, raw_path)
             total_duration += dur or 0.0
+            measured = measured or dur is not None
 
-        # total_duration stays 0 only when no clip could be probed (e.g. exotic
-        # container); let get_conditioning_latents be the real arbiter then.
-        if total_duration and total_duration < 3.0:
+        # Nothing measured means no clip could be probed (e.g. exotic container);
+        # let get_conditioning_latents be the real arbiter then. A measured total
+        # of 0 is different: preprocessing found no speech in any clip.
+        if measured and total_duration < 3.0:
             return JSONResponse(
                 status_code=422,
                 content={"error": "Usable speech totals under 3 seconds after preprocessing (6+ recommended)"},
@@ -1374,11 +1438,9 @@ async def clone_voice(
                     _conditioning_latents, latent_paths
                 )
         except RuntimeError as exc:
-            err_str = str(exc).lower()
-            if "out of memory" in err_str or "cuda" in err_str:
-                gpu_info = _gpu_memory_info()
-                logger.error("xtts_clone_gpu_oom", error=str(exc), gpu=gpu_info)
-                return JSONResponse(status_code=503, content={"error": "GPU OOM", "detail": str(exc), "gpu": gpu_info})
+            refused = _gpu_error_response(exc, "xtts_clone_gpu_oom")
+            if refused is not None:
+                return refused
             raise
     finally:
         for path in set(raw_paths + latent_paths):
@@ -1448,13 +1510,22 @@ def _list_clones() -> list[dict]:
                 buf = io.BytesIO()
                 try:
                     client.download_fileobj(S3_BUCKET_NAME, key, buf)
-                    clones.append(json.loads(buf.getvalue().decode("utf-8")))
+                    meta = json.loads(buf.getvalue().decode("utf-8"))
+                    if not isinstance(meta, dict):
+                        raise ValueError("meta.json is not an object")
+                    clones.append(meta)
                 except (ClientError, ValueError, json.JSONDecodeError) as exc:
                     logger.warning("clone_meta_unreadable", key=key, error=str(exc))
     except ClientError as exc:
         logger.error("clone_list_failed", error=str(exc))
         raise
-    clones.sort(key=lambda c: c.get("created_at", 0), reverse=True)
+
+    def _created(c: dict) -> float:
+        # One type for the sort key: a sidecar with a string or missing created_at sorts last.
+        value = c.get("created_at")
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+    clones.sort(key=_created, reverse=True)
     return clones
 
 
@@ -1733,7 +1804,7 @@ async def list_speakers():
 async def health():
     if _mgr.state == TTSState.LOADING:
         return JSONResponse(status_code=503, content={"status": "loading"})
-    return {
+    body = {
         "status": "ok",
         "engine": "xtts-v2",
         "model": XTTS_MODEL,
@@ -1745,6 +1816,12 @@ async def health():
         "keep_alive_cpu": KEEP_ALIVE_CPU,
         "gpu": _resident_gpu(),
     }
+    if _gpu_fault is not None:
+        # A fatal CUDA error: fail the container healthcheck so the worker is recycled.
+        body["status"] = "gpu_error"
+        body["error"] = _gpu_fault
+        return JSONResponse(status_code=503, content=body)
+    return body
 
 
 # ── Resident contract (argus-iris argus-http adapter) ─────────────────────────

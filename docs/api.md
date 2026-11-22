@@ -79,13 +79,16 @@ On XTTS and Qwen, `GET /speakers` loads the model if it is not loaded.
 Miso needs it) and `companion_id` (`^[A-Za-z0-9_-]{1,64}$`). A clone is stored at
 `voice_clones/<companion_id>/prompt.pt` with a `meta.json`, and used by passing its id as `voice_clone_id`.
 **Clones are engine-specific**: each engine's `prompt.pt` is its own format, which is why each engine gets its
-own bucket. See [voice-cloning.md](voice-cloning.md) for what makes a good reference.
+own bucket. `POST /clones/import` (Miso, XTTS) answers `409` when the target id already has a clone, unless the
+form field `replace=true` is sent. See [voice-cloning.md](voice-cloning.md) for what makes a good reference.
 
 ## Health and lifecycle
 
 `GET /health` is argus-cortex's `ResidentHealth`, which argus-iris reads: top-level `model_state` (`unloaded`,
 `loading`, `cpu`, `gpu`, `error`), `busy`, `idle_s`, and a `gpu` memory block, plus `engine`, `model` and
-`device`. It answers `503 {"status": "loading"}` while a model loads.
+`device`. It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
+`"status": "gpu_error"` after a CUDA error that is not an out-of-memory: such an error breaks the process's GPU
+context, so the worker needs a restart. (An out-of-memory is a `503 GPU OOM` on the request and can be retried.)
 
 Each engine loads its model on first use and leaves the GPU after an idle period (`MISO_KEEP_ALIVE_GPU`,
 `XTTS_KEEP_ALIVE_GPU`, `TTS_KEEP_ALIVE_GPU`). The admin routes move it on demand:

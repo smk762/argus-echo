@@ -1,0 +1,12 @@
+# What the server and its tests need. The tests use a fake model and a fake VAD, so faster-whisper is not
+# listed. CI (engines.yml) and ai-code-auditor's validate_patch install this file; the Dockerfile installs
+# requirements.txt. open_audio needs cortex 0.12+ with the [audio] extra.
+argus-cortex[server,audio]>=0.12,<0.14
+fastapi
+httpx
+structlog
+numpy
+soundfile
+python-multipart
+pydantic
+pytest

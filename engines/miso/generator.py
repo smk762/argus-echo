@@ -169,6 +169,11 @@ class Generator:
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
+        if not samples:
+            # End-of-speech on the first frame (or a budget under one frame): an
+            # empty clip, as generate_stream yields nothing. torch.stack([]) raises.
+            return torch.zeros(0, device=self.device)
+
         audio = self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
 
         # This applies an imperceptible watermark to identify audio as AI-generated.
@@ -340,7 +345,9 @@ def _load_model(
             for name in f.keys():
                 state_dict[name] = f.get_tensor(name).to(dtype)
     else:
-        checkpoint = torch.load(model_file, map_location="cpu")
+        # weights_only: a .pt/.bin checkpoint is a pickle, and only its tensors
+        # are wanted. Never let one run code in the server process.
+        checkpoint = torch.load(model_file, map_location="cpu", weights_only=True)
         raw_state_dict = _state_dict_from_checkpoint(checkpoint)
         state_dict = {name: tensor.to(dtype) for name, tensor in raw_state_dict.items()}
 
