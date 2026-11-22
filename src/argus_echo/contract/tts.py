@@ -44,7 +44,7 @@ class SynthesiseRequest(BaseModel):
     voice_description: str | None = Field(None, description="Qwen3-TTS: describe a voice to design.")
     instruction: str | None = Field(None, description="Qwen3-TTS: delivery instruction for a built-in speaker.")
     emotion: str = Field("neutral", description="Qwen3-TTS: delivery hint.")
-    speed: float | None = Field(None, description="Reserved; no engine applies it yet.")
+    speed: float | None = Field(None, description="Speaking-rate multiplier. XTTS applies it; Miso and Qwen ignore it.")
 
 
 class StreamFormat(BaseModel):
