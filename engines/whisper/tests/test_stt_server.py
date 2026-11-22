@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from argus_cortex.gpu_wire import ResidentHealth  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
+from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 import stt_server  # noqa: E402
 
@@ -329,7 +330,7 @@ class StreamTest(EngineTest):
             ws.receive_json()
             ws.send_bytes(pcm(2.0, 0.0))
             ws.send_text(json.dumps({"type": "end"}))
-            with self.assertRaises(Exception):
+            with self.assertRaises(WebSocketDisconnect):
                 ws.receive_json()
         self.assertEqual(FakeBackend.instances, [])
 

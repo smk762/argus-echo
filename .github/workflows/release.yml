@@ -131,7 +131,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        engine: [miso, xtts, qwen, wyoming]
+        engine: [miso, xtts, qwen, whisper, wyoming]
     permissions:
       contents: read
       packages: write

@@ -2,6 +2,7 @@
 # can hold:
 #   docker compose --profile miso up -d                  # 24 GB GPU: Miso 8B (~17 GB VRAM)
 #   docker compose --profile xtts --profile qwen up -d   # 8 GB GPU: XTTS-v2 (~2 GB), Qwen3-TTS 0.6B
+#   docker compose --profile whisper up -d               # speech to text: Whisper large-v3-turbo (~3 GB VRAM)
 #   docker compose --profile wyoming-xtts up -d          # Wyoming bridge (CPU) in front of an engine
 #
 # Every port is published as ${ECHO_BIND}:<port>. ECHO_BIND defaults to loopback; set it to
@@ -122,6 +123,34 @@ services:
       TTS_PRELOAD: ${QWEN_PRELOAD:-0}
       TTS_KEEP_ALIVE_GPU: ${QWEN_KEEP_ALIVE_GPU:-120}
       TTS_KEEP_ALIVE_CPU: ${QWEN_KEEP_ALIVE_CPU:-600}
+      ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
+      ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    healthcheck:
+      <<: *health
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5).read()"]
+    <<: *gpu
+
+  # Speech to text (the stt contract). No storage: audio is transcribed in memory and kept nowhere.
+  whisper:
+    profiles: [whisper]
+    build:
+      context: ./engines/whisper
+    image: ghcr.io/smk762/argus-echo-whisper:${ECHO_TAG:-local}
+    container_name: argus-echo-whisper
+    restart: unless-stopped
+    ports:
+      - "${ECHO_BIND:-127.0.0.1}:${WHISPER_PORT:-8144}:8031"
+    environment:
+      STT_DEVICE: ${WHISPER_DEVICE:-cuda}
+      STT_PRELOAD: ${WHISPER_PRELOAD:-0}
+      STT_KEEP_ALIVE_GPU: ${WHISPER_KEEP_ALIVE_GPU:-300}
+      STT_KEEP_ALIVE_CPU: ${WHISPER_KEEP_ALIVE_CPU:-600}
+      STT_BEAM_SIZE: ${WHISPER_BEAM_SIZE:-5}
+      STT_MAX_UPLOAD_MB: ${WHISPER_MAX_UPLOAD_MB:-50}
+      STT_MAX_SECONDS: ${WHISPER_MAX_SECONDS:-600}
+      STT_QUEUE_TIMEOUT_S: ${WHISPER_QUEUE_TIMEOUT_S:-30}
+      STT_STREAM_MAX_SESSIONS: ${WHISPER_STREAM_MAX_SESSIONS:-4}
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
