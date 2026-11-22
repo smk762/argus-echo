@@ -1,4 +1,4 @@
-"""POST /transcriptions (agent-composer's JSON route for kimini-api), with the fake model: no weights, no GPU.
+"""POST /transcriptions (from a URL or base64; imported from agent-composer), with the fake model: no weights, no GPU.
 
 Ports voice-stack/tests/test_whisper_audio_url.py from agent-composer: the SSRF policy on audio_url, the download
 and base64 caps, and the generic error bodies, against echo's fetch (argus_cortex.net.afetch) and caps.
@@ -96,7 +96,7 @@ class Base64Test(TranscriptionsTest):
         self.assertEqual(self.backend.calls[0]["language"], "en")
         self.assertEqual(r.json()["confidence"], 1.0)
 
-    def test_data_uri_and_kiminis_nulls_are_accepted(self):
+    def test_data_uri_and_explicit_nulls_are_accepted(self):
         r = self.tx(audio_base64="data:audio/wav;base64," + b64(wav()), audio_url=None, language=None)
         self.assertEqual(r.status_code, 200, r.text)
 
