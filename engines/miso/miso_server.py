@@ -2570,6 +2570,7 @@ async def health():
         "busy": busy is not None,
         "active": busy,
         "engine": "miso",
+        "capabilities": ["tts"],  # the echo contracts this engine serves (docs/api.md)
         "model": MODEL_SOURCE,
         "device": DEVICE,
         "model_state": _mgr.state.value,

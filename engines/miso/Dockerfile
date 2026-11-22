@@ -16,7 +16,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get install -y --no-install-recommends \
         ffmpeg libsndfile1 git build-essential curl
 
-# uv for the lockfile-driven env (pins torch==2.4.0 + the Miso deps).
+# uv for the lockfile-driven env (pins torch==2.9.1 + the Miso deps).
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 ENV PATH="/root/.local/bin:${PATH}"
 

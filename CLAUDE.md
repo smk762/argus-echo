@@ -4,7 +4,7 @@ Guidance for AI agents working in this repo. Human-facing usage lives in [README
 
 ## What this is
 
-The Argus suite's speech servers: Miso TTS 8B, XTTS-v2 and Qwen3-TTS behind one HTTP contract (docs/api.md), plus a Wyoming bridge. Each engine is a separate server with its own Python environment in `engines/<engine>/`; `src/argus_echo/` states the contract in Python and checks a running engine against it. The engines were salvaged from smk762/voluptas (Miso) and smk762/agent-composer (`voice-stack/`), which still run them for older apps until those move to echo.
+The Argus suite's speech repo: text to speech (Miso TTS 8B, XTTS-v2, Qwen3-TTS), speech to text (Whisper large-v3-turbo) and, later, full-duplex dialogue. Echo has one HTTP contract per capability (`tts`, `stt`; docs/api.md), and each engine names the ones it serves in `/health` `capabilities`. A Wyoming bridge fronts the TTS engines. Each engine is a separate server with its own Python environment in `engines/<engine>/`; `src/argus_echo/` states the contracts in Python and checks a running engine against the capabilities it advertises. The engines were salvaged from smk762/voluptas (Miso) and smk762/agent-composer (`voice-stack/`), which still run them for older apps until those move to echo.
 
 Shared code (admin bearer auth, upload caps, `ResidentHealth`, the tenant manifest) lives in **argus-cortex**; import it rather than re-implementing.
 
@@ -29,18 +29,23 @@ it **UNENFORCED** until something checks it. When a rule bites, add a check rath
 | A new suite-rule violation (argus-ci's lint catalogue) | CI `suite-rules` job; `.suite-rules-baseline.json` may only shrink |
 | A CLAUDE.md without the argus-suite block | CI `suite` job (argus-ci suite-check) |
 | An engine's `/admin/*` open while `ARGUS_ADMIN_TOKEN` is unset, unless `ARGUS_ADMIN_INSECURE=1` | `engines/miso/test_admin_uploads.py`; xtts/qwen admin tests (CI `engines`) |
-| A `/health` that isn't argus-cortex `ResidentHealth` | `argus-echo check` against a running engine; **UNENFORCED** in CI for xtts/qwen |
-| Two engines sharing an S3 bucket (clone keys collide, formats differ) | `compose.yaml` per-engine `*_S3_BUCKET`; **UNENFORCED** beyond that |
-| An engine importing `argus_echo` (their environments conflict) | **UNENFORCED** |
+| A `/health` that isn't argus-cortex `ResidentHealth`, or that doesn't name the engine's capabilities | each engine's `test_health` (`engines/miso/test_health.py`, `engines/{xtts,qwen}/tests/test_health.py`, `engines/whisper/tests/test_stt_server.py`; CI `engines`); `argus-echo check` against a running engine |
+| Two engines sharing an S3 bucket (clone keys collide, formats differ) | `tests/test_repo_rules.py::test_no_two_engines_share_an_s3_bucket` (distinct `S3_BUCKET_NAME` defaults and variables in `compose.yaml`) |
+| An engine importing `argus_echo` (their environments conflict) | `tests/test_repo_rules.py::test_no_engine_imports_argus_echo` |
+| `check` sending TTS requests to an engine that advertises only `stt` | `tests/test_stt.py::test_an_stt_engine_gets_no_tts_checks_and_a_read_only_check_loads_nothing` |
+| An STT upload decoded before its byte, format and duration caps (it goes through `argus_cortex.limits.open_audio`) | `engines/whisper/tests/test_stt_server.py` (`test_upload_over_the_cap_is_413_and_never_loads`, `test_not_wav_or_flac_is_400`, `test_audio_over_the_duration_cap_is_413`) |
+| An STT stream holding the model lease while it waits for audio | **UNENFORCED** (by design in `_stream`; needs a test that an idle open stream lets keep-alive evict) |
 | `gpu-tenant.yaml` that iris would refuse | CI `engines` / `gpu-tenant` job |
 
 ## Layout
 
-- `src/argus_echo/contract.py` — the shared request fields and PCM stream headers (the API surface; see docs/api.md).
-- `src/argus_echo/check.py`, `cli.py` — `argus-echo check <url>`: read-only checks of a running engine; `--speak` streams one utterance.
+- `src/argus_echo/contract/` — one module per capability: `tts.py` (request fields, PCM stream headers), `stt.py`; `__init__.py` lists the capabilities (the API surface; see docs/api.md).
+- `src/argus_echo/check.py`, `cli.py` — `argus-echo check <url>`: read-only checks of a running engine, per advertised capability; `--speak` streams one utterance, `--transcribe` sends a bundled clip.
 - `engines/miso/` — Miso server plus the vendored upstream MisoTTS inference code (`models.py`, `moshi_compat.py`, `watermarking.py`, patched `generator.py`), locked by its own `uv.lock`. Flat test files.
 - `engines/xtts/`, `engines/qwen/` — single-file servers with `tests/` (torch stubbed).
+- `engines/whisper/` — speech to text (faster-whisper large-v3-turbo), single-file server with `tests/` (fake model and VAD).
 - `engines/wyoming/` — the Wyoming TTS bridge (CPU).
+- `docs/new-engine.md` — the checklist a new engine follows (copy from `engines/whisper/`).
 - `compose.yaml` — one profile per engine; `gpu-tenant.yaml` — iris residents (no node: placement is the deployment's).
 
 ## Commands
@@ -58,7 +63,7 @@ Run one test: `uv run --no-sync pytest tests/test_x.py::test_name -q`.
 
 - **Versioning is git-tag-derived** (`hatch-vcs`). Never hand-edit a version; `src/argus_echo/_version.py` is generated (gitignored). Tag `vX.Y.Z` to release.
 - **`src/` layout, `py.typed`, Pydantic v2, `structlog`.** Ruff line-length 120; keep it clean (`make lint`) before committing.
-- **A change to the contract changes three servers.** Edit each engine and `contract.py` together, and say in docs/api.md which engines differ.
+- **A change to a contract changes every engine of that capability.** Edit each engine that advertises it and `contract/<capability>.py` together, and say in docs/api.md which engines differ. A new engine adds its capabilities to `/health` and a `test_health` that validates them.
 - **`GET /speakers` loads the model on XTTS and Qwen** (it takes a model lease). Nothing read-only may call it on an unloaded engine; `check` skips it.
 - **Engines keep their own environment variable prefixes** (`MISO_*`, `XTTS_*`, `TTS_*` for Qwen); compose maps `QWEN_*` onto Qwen's `TTS_*`.
 - The engines are linted for errors only (ruff E9/F63/F7/F82); `engines/` is excluded from the package's ruff config until they are cleaned up.
