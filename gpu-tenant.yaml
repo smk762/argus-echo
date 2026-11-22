@@ -12,11 +12,13 @@ description: Speech servers (Miso TTS 8B, XTTS-v2, Qwen3-TTS; Whisper speech-to-
 repo: smk762/argus-echo
 kinds: []
 residents:
+  # Miso 8B (bf16, torch 2.9.1): torch reserves 17.7 GB; measured peak 18.1 GB of device memory on an RTX 3090,
+  # CUDA context included, across /synthesise, /clone-voice and /synthesise/stream.
   # /admin/evict parks Miso on CPU (~17 GB of host RAM); MISO_KEEP_ALIVE_GPU still unloads it when idle.
   - name: miso
     adapter: argus-http
     container: argus-echo-miso
-    vram_mb: 17000
+    vram_mb: 18500
     health_path: /health
     unload_path: /admin/unload
     evict_path: /admin/evict
