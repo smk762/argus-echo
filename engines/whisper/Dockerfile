@@ -10,6 +10,11 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# POST /transcriptions decodes audio that isn't WAV/FLAC with the ffmpeg CLI (pipe-only, demuxer allowlist).
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install huggingface_hub
 COPY requirements.txt .

@@ -10,7 +10,14 @@ from typer.testing import CliRunner
 from argus_echo.check import check
 from argus_echo.cli import app
 from argus_echo.contract import DEFAULT_CAPABILITIES, SynthesiseRequest
-from argus_echo.contract.stt import StreamFinal, StreamStart, TranscribeOptions, Transcription
+from argus_echo.contract.stt import (
+    StreamFinal,
+    StreamStart,
+    TranscribeOptions,
+    Transcription,
+    TranscriptionsRequest,
+    TranscriptionsResult,
+)
 
 HEALTH = {"status": "ok", "engine": "whisper", "model": "m", "model_state": "unloaded", "busy": False}
 RESULT = {
@@ -61,6 +68,17 @@ def test_options_default_to_detection_and_refuse_unknown_fields() -> None:
     assert TranscribeOptions().language is None
     with pytest.raises(ValidationError):
         TranscribeOptions(task="translate")
+
+
+def test_transcriptions_takes_exactly_one_source_and_answers_composers_shape() -> None:
+    # kimini-api sends all three keys, nulls included, and composer ignored anything else.
+    req = TranscriptionsRequest.model_validate({"audio_url": "https://cdn.example/a.mp3", "audio_base64": None, "x": 1})
+    assert req.language is None
+    for body in ({}, {"audio_url": None, "audio_base64": ""}, {"audio_url": "https://a/b", "audio_base64": "AAAA"}):
+        with pytest.raises(ValidationError):
+            TranscriptionsRequest.model_validate(body)
+    out = {"text": "hello", "language": "en", "duration_seconds": 1.5, "confidence": 0.98}
+    assert TranscriptionsResult.model_validate(out).model_dump() == out
 
 
 def test_stream_messages() -> None:
