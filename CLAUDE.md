@@ -45,6 +45,7 @@ it **UNENFORCED** until something checks it. When a rule bites, add a check rath
 - `engines/xtts/`, `engines/qwen/` — single-file servers with `tests/` (torch stubbed).
 - `engines/whisper/` — speech to text (faster-whisper large-v3-turbo), single-file server with `tests/` (fake model and VAD).
 - `engines/wyoming/` — the Wyoming TTS bridge (CPU).
+- `docs/new-engine.md` — the checklist a new engine follows (copy from `engines/whisper/`).
 - `compose.yaml` — one profile per engine; `gpu-tenant.yaml` — iris residents (no node: placement is the deployment's).
 
 ## Commands
