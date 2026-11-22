@@ -6,12 +6,14 @@ and base64 caps, and the generic error bodies, against echo's fetch (argus_corte
 
 import asyncio
 import base64
+import contextlib
 import ipaddress
 import os
 import shutil
 import socket
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -357,6 +359,133 @@ class AudioUrlTest(TranscriptionsTest):
         with mock.patch.object(stt_server, "INPUT_FORMATS", ""):
             self.assertEqual(self.url("http://public.example/a.wav").status_code, 400)
         self.assert_nothing_loaded()
+
+
+class CortexReasonsTest(TranscriptionsTest):
+    """fetch_audio_url tells a failed fetch (502) and an oversized one (413) from a refused URL (400) by the start of
+    argus-cortex's UrlRefused message, which has no structured reason. Each case here makes the real afetch raise
+    one of those messages, so a cortex release that rewords one fails this test instead of turning 502s into 400s."""
+
+    def reason_and_status(self, upstream, **patches):
+        self.upstream = upstream
+        log = mock.Mock()
+        multiple = mock.patch.multiple(stt_server, **patches) if patches else contextlib.nullcontext()
+        with mock.patch.object(stt_server, "logger", log), multiple:
+            r = self.url("http://public.example/a.wav")
+        reasons = [c.kwargs["reason"] for c in log.warning.call_args_list if c.args[0] == "stt_audio_url_refused"]
+        self.assertEqual(len(reasons), 1, log.warning.call_args_list)
+        return reasons[0], r
+
+    @staticmethod
+    def streamed(*chunks, **headers):
+        async def body():
+            for chunk in chunks:
+                yield chunk
+
+        return lambda r: httpx.Response(200, headers=headers, content=body())
+
+    def test_every_upstream_failure_reason_is_still_a_502(self):
+        def read_timeout(request):
+            raise httpx.ReadTimeout("timed out")
+
+        def connect_refused(request):
+            raise httpx.ConnectError("refused")
+
+        def slow(request):
+            time.sleep(0.05)
+            return httpx.Response(200, content=wav())
+
+        redirect = lambda r: httpx.Response(302, headers={"Location": "http://public.example/b.wav"})  # noqa: E731
+        cases = [
+            ("could not fetch", read_timeout, {}),
+            ("could not connect", connect_refused, {}),
+            ("the fetch took longer", slow, {"DOWNLOAD_TIMEOUT": 0.01}),
+            ("more than", redirect, {"AUDIO_URL_MAX_REDIRECTS": 1}),
+            ("the response has an unsupported", self.streamed(b"x", **{"Content-Encoding": "br"}), {}),
+            ("the response body could not", self.streamed(b"not gzip", **{"Content-Encoding": "gzip"}), {}),
+        ]
+        # "a redirect without" (a Location header) can't be reached through httpx, whose is_redirect needs one.
+        triggered = {"a redirect without"}
+        for prefix, upstream, patches in cases:
+            with self.subTest(prefix):
+                reason, r = self.reason_and_status(upstream, **patches)
+                self.assertTrue(reason.startswith(prefix), reason)
+                self.assertEqual(r.status_code, 502, reason)
+                self.assertEqual(r.json(), {"error": stt_server.AUDIO_URL_FAILED})
+                triggered.add(prefix)
+        self.assertEqual(triggered, set(stt_server._UPSTREAM_FAILURES))
+        self.assert_nothing_loaded()
+
+    def test_the_size_cap_reason_is_still_a_413(self):
+        reason, r = self.reason_and_status(self.streamed(b"x" * 600, b"x" * 600), MAX_UPLOAD_BYTES=1000)
+        self.assertTrue(reason.startswith("the response is larger than"), reason)
+        self.assertEqual(r.status_code, 413)
+
+    def test_a_refused_url_is_still_a_400(self):
+        log = mock.Mock()
+        with mock.patch.object(stt_server, "logger", log):
+            r = self.url("http://internal.example/a.wav")
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.seen, [])
+
+
+class IntakeTest(TranscriptionsTest):
+    """At most STT_MAX_DECODES requests fetch and decode at once; the rest wait, then 503."""
+
+    def test_a_full_intake_is_503_and_fetches_nothing(self):
+        for send in (lambda: self.url("http://public.example/a.wav"), lambda: self.tx(audio_base64=b64(wav()))):
+            # A fresh semaphore each time: one that made a request wait is bound to that request's event loop.
+            with mock.patch.object(stt_server, "_intake", asyncio.Semaphore(0)), mock.patch.object(
+                stt_server, "QUEUE_TIMEOUT_S", 0.01
+            ):
+                r = send()
+            self.assertEqual(r.status_code, 503)
+        self.assertIn("Retry-After", r.headers)
+        self.assertIn("decode", r.json()["error"])
+        self.assertEqual(self.seen, [])
+        self.assert_nothing_loaded()
+
+    def test_the_slot_is_given_back_however_the_request_ends(self):
+        self.upstream = lambda r: httpx.Response(404)
+        with mock.patch.object(stt_server, "_intake", asyncio.Semaphore(1)), mock.patch.object(
+            stt_server, "QUEUE_TIMEOUT_S", 0.5
+        ):
+            self.assertEqual(self.url("http://public.example/a.wav").status_code, 502)
+            self.assertEqual(self.tx(audio_base64="!!!").status_code, 400)
+            with mock.patch.object(stt_server, "MAX_SECONDS", 0.1):
+                self.assertEqual(self.tx(audio_base64=b64(wav())).status_code, 413)
+            self.assertEqual(self.tx(audio_base64=b64(wav())).status_code, 200)
+
+
+class WavFallbackTest(TranscriptionsTest):
+    """A WAV or FLAC that open_audio refuses (a rate outside ALLOWED_RATES) still gets ffmpeg's try, as
+    agent-composer's sidecar decoded it. ADPCM, a-law and mu-law WAVs open_audio reads itself."""
+
+    ODD_RATE = wav(rate=12000)
+
+    def test_an_odd_rate_wav_goes_to_ffmpeg(self):
+        self.assertNotIn(12000, stt_server.ALLOWED_RATES)
+        with mock.patch.object(stt_server, "ffmpeg_decode", return_value=np.zeros(16000, np.float32)) as dec:
+            r = self.tx(audio_base64=b64(self.ODD_RATE))
+        self.assertEqual(r.status_code, 200, r.text)
+        dec.assert_called_once()
+
+    def test_not_with_formats_none(self):
+        with mock.patch.object(stt_server, "INPUT_FORMATS", ""), mock.patch.object(stt_server, "ffmpeg_decode") as dec:
+            self.assertEqual(self.tx(audio_base64=b64(self.ODD_RATE)).status_code, 400)
+        dec.assert_not_called()
+
+    def test_not_past_the_duration_cap(self):
+        with mock.patch.object(stt_server, "MAX_SECONDS", 0.5), mock.patch.object(stt_server, "ffmpeg_decode") as dec:
+            self.assertEqual(self.tx(audio_base64=b64(wav(seconds=1.0))).status_code, 413)
+        dec.assert_not_called()
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_an_odd_rate_wav_is_decoded_by_the_real_ffmpeg(self):
+        r = self.tx(audio_base64=b64(self.ODD_RATE))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.backend.calls[0]["rate"], 16000)
+        self.assertAlmostEqual(self.backend.calls[0]["n"], 16000, delta=1600)
 
 
 class WhisperBackendTest(unittest.TestCase):

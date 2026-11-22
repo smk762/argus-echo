@@ -75,6 +75,7 @@ class EngineTest(unittest.TestCase):
             mock.patch.object(stt_server, "backend_factory", FakeBackend),
             mock.patch.object(stt_server, "mgr", stt_server.ModelManager()),
             mock.patch.object(stt_server, "_slots", asyncio.Semaphore(1)),
+            mock.patch.object(stt_server, "_intake", asyncio.Semaphore(stt_server.MAX_DECODES)),
         ]
         for p in patches:
             p.start()

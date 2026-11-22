@@ -33,6 +33,12 @@ Env vars:
                           unload.  -1 = forever, 0 = immediate.  Default 600.
   TTS_CHECKPOINT_ROOT  — directory of fine-tuned checkpoints POST /admin/load may
                           load (unset: the route answers 503). See docs/qwen.md.
+  TTS_RNG_WAIT_S       — seconds a generation waits for the sampler while a seeded
+                          one holds it before it is answered 503 (default 60; 0
+                          waits for ever)
+  TTS_GENERATION_THREADS — threads that run generations (default 8). Generations
+                          wait for the sampler there, never in the pool every
+                          other to_thread call shares
   ECHO_VERSION / ECHO_REVISION — the image's release and git revision (build
                           args), reported in /health as ``image``
   S3_ENDPOINT_URL      — MinIO/S3 endpoint
@@ -40,6 +46,8 @@ Env vars:
 """
 
 import asyncio
+import contextvars
+import functools
 import gc
 import io
 import json
@@ -53,6 +61,7 @@ import time
 import uuid
 import weakref
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import hashlib
 import random
@@ -94,6 +103,8 @@ KEEP_ALIVE_GPU: float = float(os.getenv("TTS_KEEP_ALIVE_GPU", "120"))
 KEEP_ALIVE_CPU: float = float(os.getenv("TTS_KEEP_ALIVE_CPU", "600"))
 # Fine-tuned checkpoints POST /admin/load may load, one directory each (see _resolve_checkpoint).
 CHECKPOINT_ROOT: str = os.getenv("TTS_CHECKPOINT_ROOT", "").strip()
+RNG_WAIT_S: float = float(os.getenv("TTS_RNG_WAIT_S", "60"))
+GENERATION_THREADS: int = max(1, int(os.getenv("TTS_GENERATION_THREADS", "8")))
 # The image's identity, baked in at build time (release.yml); None for a local build.
 ECHO_VERSION: Optional[str] = os.getenv("ECHO_VERSION", "").strip() or None
 ECHO_REVISION: Optional[str] = os.getenv("ECHO_REVISION", "").strip() or None
@@ -356,13 +367,18 @@ def _slot_fingerprint(files: Optional[list[dict]], slot: str) -> Optional[str]:
 SEED_MAX = 2**32 - 1  # numpy's legacy seed range, and every engine's contract bound
 
 
+class RngBusy(Exception):
+    """A generation waited ``TTS_RNG_WAIT_S`` for the sampler while a seeded one held it: answered 503."""
+
+
 class _RngGate:
     """Who may draw from torch's process-wide RNG while a generation samples.
 
     Unseeded generations share it (they run side by side, as before seeds existed). A seeded one runs alone: it
     waits for those in flight, new ones wait for it, and it seeds at the start, so nothing else draws between its
-    seed and its last sample. Blocking (threading): enter it from the generation's worker thread, never the event
-    loop. Waiting seeded generations go first, so a stream of unseeded ones can't starve them."""
+    seed and its last sample. Blocking (threading): enter it from a generation thread (_GENERATION_POOL), never the
+    event loop or the shared to_thread pool. Waiting seeded generations go first, so a stream of unseeded ones
+    can't starve them. A wait longer than *timeout* raises RngBusy."""
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
@@ -371,9 +387,10 @@ class _RngGate:
         self._waiting = 0
 
     @contextlib.contextmanager
-    def shared(self):
+    def shared(self, timeout: Optional[float] = None):
         with self._cond:
-            self._cond.wait_for(lambda: not self._exclusive and not self._waiting)
+            if not self._cond.wait_for(lambda: not self._exclusive and not self._waiting, timeout):
+                raise RngBusy(f"waited {timeout:g}s for a seeded generation to finish")
             self._shared += 1
         try:
             yield
@@ -383,13 +400,16 @@ class _RngGate:
                 self._cond.notify_all()
 
     @contextlib.contextmanager
-    def exclusive(self):
+    def exclusive(self, timeout: Optional[float] = None):
         with self._cond:
             self._waiting += 1
             try:
-                self._cond.wait_for(lambda: not self._exclusive and not self._shared)
+                entered = self._cond.wait_for(lambda: not self._exclusive and not self._shared, timeout)
             finally:
                 self._waiting -= 1
+            if not entered:
+                self._cond.notify_all()  # unseeded generations held back by this one may go
+                raise RngBusy(f"waited {timeout:g}s for the generations in flight to finish")
             self._exclusive = True
         try:
             yield
@@ -400,6 +420,20 @@ class _RngGate:
 
 
 _rng_gate = _RngGate()
+# Generations run here, not in the default executor: one waiting for the gate holds a thread, and a full default
+# pool would stall every other to_thread call (clone prompts, WAV encoding, S3 uploads).
+_GENERATION_POOL = ThreadPoolExecutor(max_workers=GENERATION_THREADS, thread_name_prefix="tts-gen")
+
+
+def _rng_timeout() -> Optional[float]:
+    return RNG_WAIT_S if RNG_WAIT_S > 0 else None
+
+
+async def _in_generation_thread(fn, *args):
+    """``fn(*args)`` on a generation thread (as asyncio.to_thread, context included, but not the shared pool)."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(_GENERATION_POOL, functools.partial(ctx.run, fn, *args))
 
 
 def _seed_rngs(seed: int) -> None:
@@ -419,10 +453,10 @@ def _seed_rngs(seed: int) -> None:
 def _sampling(seed: Optional[int]):
     """Around one generation (in its worker thread): seeded and alone, or unseeded and shared. See _RngGate."""
     if seed is None:
-        with _rng_gate.shared():
+        with _rng_gate.shared(_rng_timeout()):
             yield
         return
-    with _rng_gate.exclusive():
+    with _rng_gate.exclusive(_rng_timeout()):
         _seed_rngs(seed)
         yield
 
@@ -475,13 +509,14 @@ class TTSModelManager:
         self._idle = asyncio.Event()
         self._idle.set()
         # The checkpoint /admin/load selected, as (name, directory, slot), or None for the stock models. It replaces
-        # the model of its slot (base or custom_voice); the other slot loads stock per TTS_LOAD_MODELS. Only
-        # /admin/load and /admin/unload change it; an idle unload keeps it, so the next load reads the same weights.
+        # the model of its slot (base or custom_voice); the other slot loads stock per TTS_LOAD_MODELS. /admin/load
+        # and /admin/unload change it, and so does a load of it that fails (stock is selected again, so a broken
+        # checkpoint isn't retried by every request); an idle unload keeps it, so the next load reads the same weights.
         self._checkpoint: Optional[tuple[str, Path, str]] = None
         # [{name, sha256, bytes}] of the files the last load of the selected weights read; None until one has.
         # Computed with them: the fingerprint of all of them, and per loaded slot {checkpoint (its name if that slot
         # was loaded from it, else None), fingerprint}. Evicting to the CPU and promoting again moves the same
-        # weights, so it keeps all of this; only a load (re)sets it.
+        # weights, so it keeps all of this; a load (re)sets it, and a failed move (which frees the models) clears it.
         self._weight_files: Optional[list[dict]] = None
         self._weights_fingerprint: Optional[str] = None
         self._slots: Optional[dict[str, dict]] = None
@@ -615,7 +650,16 @@ class TTSModelManager:
             self._free_models()
             self._state = TTSState.ERROR
             self._error = str(exc)
-            logger.error("tts_load_failed", error=str(exc))
+            if self._checkpoint is not None:
+                # From /admin/load or a lazy reload after an idle unload: select stock, so the next request loads it
+                # rather than retrying the broken directory. /health and every response then name stock.
+                logger.error(
+                    "tts_checkpoint_dropped", checkpoint=self._checkpoint[0], reason="load failed", error=str(exc)
+                )
+                self._error = f"checkpoint {self._checkpoint[0]}: {exc}"
+                self._checkpoint = None
+                self._set_weights(None)
+            logger.error("tts_load_failed", error=self._error)
             raise
         self._state = TTSState.GPU
         self._error = None
@@ -646,6 +690,7 @@ class TTSModelManager:
                 # true any more, and no idle timer is armed. Drop the models so
                 # nothing stays resident; the next request loads them afresh.
                 self._free_models()
+                self._set_weights(None)  # nothing is loaded: /health must not report a fingerprint
                 self._state = TTSState.ERROR
                 self._error = str(exc)
                 logger.error("tts_move_failed", target=device, error=str(exc))
@@ -795,7 +840,7 @@ class TTSModelManager:
 
         It waits for a load or move in progress, frees the old models, then loads the new ones as a shielded task
         (a cancelled caller can't strand it half-way). A load that fails frees whatever it loaded and leaves the
-        stock models selected (the state says ``error``; the next request loads stock), and raises."""
+        stock models selected (_run_load; the state says ``error``; the next request loads stock), and raises."""
         async with self._lock:
             if self._in_use:
                 logger.info("tts_load_refused_busy", in_use=self._in_use)
@@ -807,16 +852,7 @@ class TTSModelManager:
             self._checkpoint = checkpoint
             self._set_weights(None)
             self._state = TTSState.LOADING
-
-            async def load() -> None:
-                try:
-                    await self._run_load()
-                except BaseException:
-                    self._checkpoint = None
-                    self._set_weights(None)
-                    raise
-
-            self._load_task = asyncio.create_task(load())
+            self._load_task = asyncio.create_task(self._run_load())
             self._load_task.add_done_callback(lambda t: t.cancelled() or t.exception())
             await self._await_load()
             self._last_used = time.time()
@@ -1112,9 +1148,9 @@ async def _generate_audio_leased(req: SynthesiseRequest, identity: Optional[dict
 
 
 async def _render(render, text: str, request_id: str):
-    """Run ``render(text)`` in a thread: ``(float32 samples, sample_rate)`` or a JSONResponse."""
+    """Run ``render(text)`` on a generation thread: ``(float32 samples, sample_rate)`` or a JSONResponse."""
     try:
-        audio_arrays, sample_rate = await asyncio.to_thread(render, text)
+        audio_arrays, sample_rate = await _in_generation_thread(render, text)
     except Exception as exc:
         return _generation_error(exc, request_id)
     return _to_pcm(audio_arrays, sample_rate, request_id, text)
@@ -1122,6 +1158,11 @@ async def _render(render, text: str, request_id: str):
 
 def _generation_error(exc: Exception, request_id: str) -> JSONResponse:
     """The client's answer to a failed generation (or clone-prompt load)."""
+    if isinstance(exc, RngBusy):
+        logger.warning("tts_rng_busy", request_id=request_id, reason=str(exc))
+        return JSONResponse(
+            status_code=503, content={"error": f"busy: {exc}", "request_id": request_id}, headers={"Retry-After": "5"}
+        )
     if isinstance(exc, RuntimeError):
         err_str = str(exc).lower()
         if "out of memory" in err_str or "cuda" in err_str:
@@ -1417,7 +1458,7 @@ class _SentenceStream:
                 if self._stop:
                     return
                 # Sentence i (from 0) is index i - 1: _seeded reseeds it with seed + index.
-                self._inflight = asyncio.ensure_future(asyncio.to_thread(self._render, text, i - 1))
+                self._inflight = asyncio.ensure_future(_in_generation_thread(self._render, text, i - 1))
                 try:
                     # Shielded: a cancelled response leaves the render to finish,
                     # and close() releases the lease when it does.

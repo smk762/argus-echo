@@ -96,7 +96,9 @@ disconnects, XTTS stops at the next chunk and Qwen starts no further sentence (t
 
 Busy, loading and out-of-memory answers are `503`, with `Retry-After` where the engine knows a good wait. XTTS
 answers a model it cannot move onto the GPU with `503`, the reason in `error` and `Retry-After:
-$XTTS_OOM_RETRY_AFTER_S`, unless `XTTS_CPU_FALLBACK` (the default) runs the request on the CPU instead.
+$XTTS_OOM_RETRY_AFTER_S`, unless `XTTS_CPU_FALLBACK` (the default) runs the request on the CPU instead. For that
+long after a promotion runs out of memory XTTS doesn't try another: requests run on the CPU (or get the `503`)
+without moving the weights. `POST /admin/wake` still tries at once.
 
 ### Reproducibility
 
@@ -105,8 +107,11 @@ RNG and `torch.manual_seed` (the CPU generator and every CUDA device's). Every e
 process-wide RNG, so no other generation may draw from it in between. Miso generates one request at a time anyway
 (its GPU lock). XTTS and Qwen let unseeded requests generate side by side, as before; a seeded generation waits
 for those, runs alone, and holds new ones back until it ends. A seeded XTTS stream therefore blocks every other
-XTTS generation for as long as it runs, including while a slow client holds it back (up to the 300 s stall
-timeout).
+XTTS generation for as long as it runs. Generations wait on their own threads (`XTTS_GENERATION_THREADS`,
+`TTS_GENERATION_THREADS`, default 8), never in the pool the engine's other work shares, and a wait longer than
+`XTTS_RNG_WAIT_S` / `TTS_RNG_WAIT_S` (default 60 s; `0` waits for ever) is a `503` with `Retry-After: 5`. A
+seeded XTTS stream waits before its `200`, so that `503` comes instead of an empty stream, and one whose client
+takes nothing for `XTTS_RNG_WAIT_S` ends early, so a stalled client can't hold the others back for longer.
 
 Same seed means same audio only when everything else is the same too:
 
@@ -207,7 +212,9 @@ Two blocks identify what is running, so a client (argus-proof's run manifest) ca
   stay as they were, with nothing hashed again. A full idle unload keeps the selection and its last hashes; the
   next request's lazy reload hashes the same files again (from a cache keyed by path, size and mtime, so unchanged
   files aren't read) and comes out with the same fingerprint, or a different one if a file changed on disk.
-  `/admin/load` replaces them, and `/admin/unload` clears them (stock is selected; the next load hashes it).
+  `/admin/load` replaces them, and `/admin/unload` clears them (stock is selected; the next load hashes it). A
+  failed load clears them, and so does a failed Qwen move between devices, which frees the models: nothing is
+  loaded, so nothing is reported.
 
 Each engine loads its model on first use and leaves the GPU after an idle period (`MISO_KEEP_ALIVE_GPU`,
 `XTTS_KEEP_ALIVE_GPU`, `TTS_KEEP_ALIVE_GPU`). The admin routes move it on demand:
@@ -287,9 +294,12 @@ a disconnecting client cannot cancel half-way. Synthesis that arrives meanwhile 
 XTTS loads onto the CPU (the next request promotes it, as after any load); Qwen loads straight onto `TTS_DEVICE`.
 
 The checkpoint stays selected until the next `/admin/load` or `/admin/unload`: the idle eviction and unload keep
-it, so the next request reloads the same weights. `/admin/unload` (iris sends it too, to free memory) returns to
-stock. Clones are conditioning computed by whichever weights were loaded when they were made; a clone made on the
-stock weights still works with a checkpoint, but to compare checkpoints fairly clone the reference under each.
+it, so the next request reloads the same weights. If that reload fails (the directory was removed or a file in it
+is unreadable), the request that triggered it fails, the checkpoint is dropped and stock is selected, as after a
+failed `/admin/load`: the next request loads stock, and responses and `/health` say `checkpoint: null`.
+`/admin/unload` (iris sends it too, to free memory) returns to stock. Clones are conditioning computed by whichever
+weights were loaded when they were made; a clone made on the stock weights still works with a checkpoint, but to
+compare checkpoints fairly clone the reference under each.
 
 ## Security
 
@@ -382,8 +392,11 @@ it says nothing about the transcript. No segments or word times: use `/transcrib
 
 The audio gets the same caps as a `/transcribe` upload before anything is decoded: the request body is capped at the
 base64 size of `STT_MAX_UPLOAD_MB`, the base64 length is checked before decoding, and the decoded bytes, the
-download, the format and the duration (`STT_MAX_SECONDS`) are checked as on `/transcribe`. WAV and FLAC go through
-argus-cortex's `open_audio`. Anything else is decoded by the ffmpeg CLI (in the image): the bytes go in on a pipe,
+download, the format and the duration (`STT_MAX_SECONDS`) are checked as on `/transcribe`. At most
+`STT_MAX_DECODES` requests (default 2) fetch and decode at once; the rest wait up to `STT_QUEUE_TIMEOUT_S`, then get
+`503`. WAV and FLAC go through argus-cortex's `open_audio`; one it refuses (a sample rate outside the ones it
+takes, such as 12 kHz) goes to ffmpeg as well, unless `STT_INPUT_FORMATS=none`. Anything else is decoded by the
+ffmpeg CLI (in the image): the bytes go in on a pipe,
 `-protocol_whitelist pipe` stops anything inside them (a playlist, a reference) from opening a file or the network,
 `-format_whitelist` allows only the demuxers in `STT_INPUT_FORMATS` (plain audio containers by default: WAV, MP3,
 Ogg/Opus, FLAC, WebM/Matroska, MP4/M4A, AAC, AIFF, CAF, AMR, AU; no playlists), and output stops just past
@@ -416,7 +429,7 @@ reason; the reason is logged, never the resolved address.
 | `413` | Body, download, decoded bytes or duration over its cap |
 | `422` | Both fields, a body that isn't the JSON object above, or an unknown `language` |
 | `502` | `audio_url` could not be downloaded |
-| `503` | As `/transcribe`, with `Retry-After` |
+| `503` | As `/transcribe`, or every decode slot busy for `STT_QUEUE_TIMEOUT_S`; with `Retry-After` |
 
 Errors are `{"error": "..."}` as on every echo route; composer's were FastAPI's `{"detail": "..."}`.
 

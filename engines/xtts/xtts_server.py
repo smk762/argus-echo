@@ -45,7 +45,14 @@ Env vars:
   XTTS_STREAM_CHUNK_SIZE — GPT tokens per streamed audio chunk (default 20)
   XTTS_CPU_FALLBACK    — "1" (default): when the model can't be moved onto the GPU
                          (CUDA OOM), synthesise on the CPU copy instead; "0": 503
-  XTTS_OOM_RETRY_AFTER_S — Retry-After on that 503 (default 30)
+  XTTS_OOM_RETRY_AFTER_S — Retry-After on that 503 (default 30). A promotion that ran out of memory is not
+                         tried again for this long: requests run on the CPU (or get the 503) without
+                         moving the weights, and only /admin/wake retries sooner
+  XTTS_RNG_WAIT_S      — seconds a generation waits for the sampler while a seeded one holds it before it is
+                         answered 503 (default 60; 0 waits for ever). A seeded stream whose client takes
+                         nothing for this long is ended, so it can't hold the sampler longer
+  XTTS_GENERATION_THREADS — threads that run generations (default 8). Generations wait for the sampler
+                         there, never in the pool every other to_thread call shares
   XTTS_CHECKPOINT_ROOT — directory of fine-tuned checkpoints POST /admin/load may load
                          (unset: the route answers 503). See docs/xtts.md.
   ECHO_VERSION / ECHO_REVISION — the image's release and git revision (build args),
@@ -61,6 +68,8 @@ Env vars:
 """
 
 import asyncio
+import contextvars
+import functools
 import gc
 import io
 import json
@@ -73,6 +82,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
 import hashlib
 import random
@@ -85,7 +95,7 @@ from urllib.parse import quote, urlsplit
 import structlog
 from argus_cortex.auth import bearer
 from argus_cortex.fs import PathRefused, safe_join
-from starlette.requests import HTTPConnection
+from starlette.requests import HTTPConnection, Request
 from fastapi import Depends, FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -104,6 +114,8 @@ TEMPERATURE: float = float(os.getenv("XTTS_TEMPERATURE", "0.7"))
 STREAM_CHUNK_SIZE: int = int(os.getenv("XTTS_STREAM_CHUNK_SIZE", "20"))
 CPU_FALLBACK: bool = os.getenv("XTTS_CPU_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
 OOM_RETRY_AFTER_S: int = int(os.getenv("XTTS_OOM_RETRY_AFTER_S", "30"))
+RNG_WAIT_S: float = float(os.getenv("XTTS_RNG_WAIT_S", "60"))
+GENERATION_THREADS: int = max(1, int(os.getenv("XTTS_GENERATION_THREADS", "8")))
 # Fine-tuned checkpoints POST /admin/load may load, one directory each (see _resolve_checkpoint).
 CHECKPOINT_ROOT: str = os.getenv("XTTS_CHECKPOINT_ROOT", "").strip()
 # The image's identity, baked in at build time (release.yml); None for a local build.
@@ -310,13 +322,19 @@ def _fingerprint(files: Optional[list[dict]]) -> Optional[str]:
 SEED_MAX = 2**32 - 1  # numpy's legacy seed range, and every engine's contract bound
 
 
+class RngBusy(Exception):
+    """A generation waited ``XTTS_RNG_WAIT_S`` for the sampler while a seeded one held it: answered 503."""
+
+
 class _RngGate:
     """Who may draw from torch's process-wide RNG while a generation samples.
 
     Unseeded generations share it (they run side by side, as before seeds existed). A seeded one runs alone: it
     waits for those in flight, new ones wait for it, and it seeds at the start, so nothing else draws between its
-    seed and its last sample. Blocking (threading): enter it from the generation's worker thread, never the event
-    loop. Waiting seeded generations go first, so a stream of unseeded ones can't starve them."""
+    seed and its last sample. Blocking (threading): enter it from a generation thread (_GENERATION_POOL), never the
+    event loop or the shared to_thread pool. Waiting seeded generations go first, so a stream of unseeded ones
+    can't starve them. A wait longer than *timeout* raises RngBusy. Entering and leaving needn't happen on the same
+    thread (a stream enters before its response starts and its producer thread leaves)."""
 
     def __init__(self) -> None:
         self._cond = threading.Condition()
@@ -324,36 +342,59 @@ class _RngGate:
         self._exclusive = False
         self._waiting = 0
 
-    @contextlib.contextmanager
-    def shared(self):
+    def enter_shared(self, timeout: Optional[float] = None) -> None:
         with self._cond:
-            self._cond.wait_for(lambda: not self._exclusive and not self._waiting)
+            if not self._cond.wait_for(lambda: not self._exclusive and not self._waiting, timeout):
+                raise RngBusy(f"waited {timeout:g}s for a seeded generation to finish")
             self._shared += 1
-        try:
-            yield
-        finally:
-            with self._cond:
-                self._shared -= 1
-                self._cond.notify_all()
 
-    @contextlib.contextmanager
-    def exclusive(self):
+    def leave_shared(self) -> None:
+        with self._cond:
+            self._shared -= 1
+            self._cond.notify_all()
+
+    def enter_exclusive(self, timeout: Optional[float] = None) -> None:
         with self._cond:
             self._waiting += 1
             try:
-                self._cond.wait_for(lambda: not self._exclusive and not self._shared)
+                entered = self._cond.wait_for(lambda: not self._exclusive and not self._shared, timeout)
             finally:
                 self._waiting -= 1
+            if not entered:
+                self._cond.notify_all()  # unseeded generations held back by this one may go
+                raise RngBusy(f"waited {timeout:g}s for the generations in flight to finish")
             self._exclusive = True
+
+    def leave_exclusive(self) -> None:
+        with self._cond:
+            self._exclusive = False
+            self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def shared(self, timeout: Optional[float] = None):
+        self.enter_shared(timeout)
         try:
             yield
         finally:
-            with self._cond:
-                self._exclusive = False
-                self._cond.notify_all()
+            self.leave_shared()
+
+    @contextlib.contextmanager
+    def exclusive(self, timeout: Optional[float] = None):
+        self.enter_exclusive(timeout)
+        try:
+            yield
+        finally:
+            self.leave_exclusive()
 
 
 _rng_gate = _RngGate()
+# Generations run here, not in the default executor: one waiting for the gate holds a thread, and a full default
+# pool would stall every other to_thread call (latents, clone work, WAV encoding, S3 uploads).
+_GENERATION_POOL = ThreadPoolExecutor(max_workers=GENERATION_THREADS, thread_name_prefix="xtts-gen")
+
+
+def _rng_timeout() -> Optional[float]:
+    return RNG_WAIT_S if RNG_WAIT_S > 0 else None
 
 
 def _seed_rngs(seed: int) -> None:
@@ -369,16 +410,59 @@ def _seed_rngs(seed: int) -> None:
     torch.manual_seed(seed)
 
 
+def _enter_sampling(seed: Optional[int]):
+    """Enter the gate for one generation (in a generation thread): seeded and alone, or unseeded and shared.
+    Returns the call that leaves it. RngBusy after ``XTTS_RNG_WAIT_S``. See _RngGate."""
+    if seed is None:
+        _rng_gate.enter_shared(_rng_timeout())
+        return _rng_gate.leave_shared
+    _rng_gate.enter_exclusive(_rng_timeout())
+    try:
+        _seed_rngs(seed)
+    except BaseException:
+        _rng_gate.leave_exclusive()
+        raise
+    return _rng_gate.leave_exclusive
+
+
 @contextlib.contextmanager
 def _sampling(seed: Optional[int]):
-    """Around one generation (in its worker thread): seeded and alone, or unseeded and shared. See _RngGate."""
-    if seed is None:
-        with _rng_gate.shared():
-            yield
-        return
-    with _rng_gate.exclusive():
-        _seed_rngs(seed)
+    """Around one generation (in its generation thread). See _enter_sampling."""
+    leave = _enter_sampling(seed)
+    try:
         yield
+    finally:
+        leave()
+
+
+async def _in_generation_thread(fn, *args):
+    """``fn(*args)`` on a generation thread (as asyncio.to_thread, context included, but not the shared pool)."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(_GENERATION_POOL, functools.partial(ctx.run, fn, *args))
+
+
+async def _enter_sampling_async(seed: Optional[int]):
+    """_enter_sampling from the event loop, waiting on a generation thread. A caller cancelled while it waits
+    leaves the gate as soon as the wait ends, so a gate entered for nobody is never held."""
+    fut = asyncio.get_running_loop().run_in_executor(_GENERATION_POOL, _enter_sampling, seed)
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+
+        def _leave(f) -> None:
+            if not f.cancelled() and f.exception() is None:
+                f.result()()
+
+        fut.add_done_callback(_leave)
+        raise
+
+
+def _rng_busy_response(exc: RngBusy) -> JSONResponse:
+    logger.warning("xtts_rng_busy", reason=str(exc))
+    return JSONResponse(
+        status_code=503, content={"error": f"busy: {exc}"}, headers={"Retry-After": "5"}
+    )
 
 
 class XTTSModelManager:
@@ -400,9 +484,14 @@ class XTTSModelManager:
         # gone, timeout) can't strand the state in LOADING or naming the old device.
         self._transition: Optional[asyncio.Task] = None
         # The weights a load reads: None for the stock model, else (name, directory) of a checkpoint that
-        # /admin/load selected. Only /admin/load and /admin/unload change it; an idle unload keeps it, so the next
-        # load reads the same weights.
+        # /admin/load selected. /admin/load and /admin/unload change it, and so does a load of it that fails (the
+        # stock weights are selected again, so a broken checkpoint isn't retried by every request); an idle unload
+        # keeps it, so the next load reads the same weights.
         self._checkpoint: Optional[tuple[str, Path]] = None
+        # After a promotion runs out of memory, no request tries another until this (time.monotonic()) passes: each
+        # would move ~2 GB toward the GPU and back under _lock. /admin/wake (ensure_gpu) still tries.
+        self._gpu_refused_until: float = 0.0
+        self._gpu_refused_reason: str = ""
         # [{name, sha256, bytes}] of the files the last load of the selected weights read; None until one has.
         # Their fingerprint (_fingerprint), computed with them. Evicting to the CPU and promoting again moves the same
         # weights, so it keeps both; only a load (re)sets them.
@@ -528,11 +617,21 @@ class XTTSModelManager:
             raise
 
     async def _do_load(self) -> None:
+        """Load the selected weights to the CPU. A checkpoint that fails to load (from /admin/load, or a lazy reload
+        after an idle unload) is dropped: the stock weights are selected, so the next request loads them rather than
+        retrying the broken directory. /health and every response then name stock (checkpoint null)."""
         try:
             await asyncio.to_thread(self._load_to_cpu)
         except BaseException as exc:
             self._state = TTSState.ERROR
             self._error = str(exc) or type(exc).__name__
+            if self._checkpoint is not None:
+                logger.error(
+                    "xtts_checkpoint_dropped", checkpoint=self._checkpoint[0], reason="load failed", error=self._error
+                )
+                self._error = f"checkpoint {self._checkpoint[0]}: {self._error}"
+                self._checkpoint = None
+                self._set_weight_files(None)
             logger.error("xtts_load_failed", error=self._error)
             raise
         self._state = TTSState.CPU
@@ -566,9 +665,10 @@ class XTTSModelManager:
             with contextlib.suppress(Exception):  # only waiting for the orphaned task; its own handler records any failure
                 await asyncio.shield(task)
 
-    async def _ensure_gpu_locked(self) -> None:
+    async def _ensure_gpu_locked(self, retry_now: bool = False) -> None:
         """Promote to GPU (loading first if needed). Caller holds ``_lock``.
-        Raises unless the model is then resident, so a lease never gets None."""
+        Raises unless the model is then resident, so a lease never gets None. Within ``XTTS_OOM_RETRY_AFTER_S`` of
+        a promotion that ran out of memory it raises GpuUnavailable without trying, unless *retry_now*."""
         await self._await_transition()
         if self._state == TTSState.GPU and self._model is not None:
             return
@@ -579,8 +679,16 @@ class XTTSModelManager:
 
         if self._state == TTSState.CPU:
             if DEVICE.startswith("cuda"):
+                if not retry_now and time.monotonic() < self._gpu_refused_until:
+                    raise GpuUnavailable(f"{self._gpu_refused_reason} (not retried for {OOM_RETRY_AFTER_S}s)")
                 logger.info("xtts_promoting_to_gpu", device=DEVICE)
-                await self._run_transition(self._do_move(DEVICE, TTSState.GPU))
+                try:
+                    await self._run_transition(self._do_move(DEVICE, TTSState.GPU))
+                except GpuUnavailable as exc:
+                    self._gpu_refused_until = time.monotonic() + OOM_RETRY_AFTER_S
+                    self._gpu_refused_reason = str(exc)
+                    raise
+                self._gpu_refused_until = 0.0
                 logger.info("xtts_on_gpu")
             else:
                 self._state = TTSState.GPU  # CPU-only: treat as ready
@@ -623,7 +731,7 @@ class XTTSModelManager:
                     logger.info("xtts_gpu_deferred_cpu_work_in_flight", active=self._active)
                     await self._ensure_loaded_locked()
                 else:
-                    await self._ensure_gpu_locked()
+                    await self._ensure_gpu_locked(retry_now=True)  # an explicit wake tries even in the cooldown
             except BaseException:
                 self._arm_evict_if_unleased()
                 raise
@@ -747,7 +855,7 @@ class XTTSModelManager:
 
         It waits for a load or move in progress, frees the old model, then loads the new one as a shielded
         transition, so a cancelled caller can't strand it half-way. A load that fails leaves nothing loaded and the
-        stock weights selected (the state says ``error``; the next request loads stock), and raises."""
+        stock weights selected (_do_load; the state says ``error``; the next request loads stock), and raises."""
         async with self._lock:
             if self._active > 0:
                 logger.info("xtts_load_refused_busy", active=self._active)
@@ -758,16 +866,7 @@ class XTTSModelManager:
             self._checkpoint = checkpoint
             self._set_weight_files(None)
             self._state = TTSState.LOADING
-
-            async def load() -> None:
-                try:
-                    await self._do_load()
-                except BaseException:
-                    self._checkpoint = None
-                    self._set_weight_files(None)
-                    raise
-
-            await self._run_transition(load())
+            await self._run_transition(self._do_load())
             self._last_used = time.time()
             if self._active == 0:
                 self._arm_evict()
@@ -1159,7 +1258,9 @@ async def synthesise(req: SynthesiseRequest):
 
         t_gen0 = time.monotonic()
         try:
-            wav = await asyncio.to_thread(_run_inference, req.text, language, gpt, spk, speed, req.seed)
+            wav = await _in_generation_thread(_run_inference, req.text, language, gpt, spk, speed, req.seed)
+        except RngBusy as exc:
+            return _rng_busy_response(exc)
         except RuntimeError as exc:
             refused = _gpu_error_response(exc, "xtts_gpu_oom")
             if refused is not None:
@@ -1216,7 +1317,7 @@ async def synthesise(req: SynthesiseRequest):
 
 
 @app.post("/synthesise/stream")
-async def synthesise_stream(req: SynthesiseRequest):
+async def synthesise_stream(req: SynthesiseRequest, request: Request = None):
     """Stream raw 24 kHz mono float32 PCM as it is generated (XTTS
     inference_stream). The client concatenates chunks; the trailing
     `X-Sample-Rate`/`X-Audio-Format` headers describe the byte layout."""
@@ -1232,6 +1333,7 @@ async def synthesise_stream(req: SynthesiseRequest):
     # handed to the producer thread, which releases it when it is done.
     ran_on = await _mgr.acquire(req.device)
     handed_off = False
+    leave_gate = None
     try:
         identity = _mgr.identity()  # the weights this lease holds; /admin/load is 409 until the stream ends
         # Resolve (and validate) the voice up front so a bad clone id is a 422,
@@ -1243,6 +1345,23 @@ async def synthesise_stream(req: SynthesiseRequest):
             return JSONResponse(status_code=422, content={"error": str(exc)})
         device = next(_mgr.model.parameters()).device
         gpt, spk = _device_tensor(gpt, device), _device_tensor(spk, device)
+
+        # inference_stream samples lazily, chunk by chunk: a seeded stream keeps the sampler to itself until its last
+        # chunk (see _RngGate). Entered here, on a generation thread, before the 200: a wait past XTTS_RNG_WAIT_S is
+        # a 503, not an empty stream. The producer thread leaves it.
+        try:
+            leave_gate = await _enter_sampling_async(req.seed)
+        except RngBusy as exc:
+            return _rng_busy_response(exc)
+        if request is not None and await request.is_disconnected():
+            # Gone while it waited: don't take the sampler (and the GPU) for nobody.
+            logger.info("xtts_stream_client_gone_before_start")
+            return Response(status_code=499)
+        # A seeded stream holds the sampler: a client that takes nothing for XTTS_RNG_WAIT_S ends it, so it can't
+        # keep every other generation waiting for the full stall timeout.
+        stall_timeout = _STREAM_STALL_TIMEOUT_S
+        if req.seed is not None and _rng_timeout() is not None:
+            stall_timeout = min(stall_timeout, RNG_WAIT_S)
 
         # Chunks travel on an asyncio.Queue (filled via call_soon_threadsafe), so
         # the consumer awaits without holding an executor thread; ``slots`` bounds
@@ -1260,7 +1379,7 @@ async def synthesise_stream(req: SynthesiseRequest):
                 return False
 
         def _put(item: bytes) -> bool:
-            deadline = time.monotonic() + _STREAM_STALL_TIMEOUT_S
+            deadline = time.monotonic() + stall_timeout
             while not stop.is_set():
                 if slots.acquire(timeout=_STREAM_PUT_POLL_S):
                     return _deliver(item)
@@ -1281,24 +1400,23 @@ async def synthesise_stream(req: SynthesiseRequest):
 
             stream = None
             try:
-                # inference_stream samples lazily, chunk by chunk: a seeded stream keeps the RNG to itself until
-                # its last chunk, including while a slow client holds it back (see _RngGate).
-                with _sampling(req.seed):
-                    stream = _mgr.model.inference_stream(
-                        req.text,
-                        language,
-                        gpt,
-                        spk,
-                        temperature=TEMPERATURE,
-                        speed=speed,
-                        stream_chunk_size=STREAM_CHUNK_SIZE,
-                        enable_text_splitting=True,
-                    )
-                    for chunk in stream:
-                        if isinstance(chunk, torch.Tensor):
-                            chunk = chunk.detach().cpu().to(torch.float32).numpy()
-                        if not _put(chunk.tobytes()):
-                            break  # client went away: stop generating
+                if stop.is_set():
+                    return  # the client left before generation started
+                stream = _mgr.model.inference_stream(
+                    req.text,
+                    language,
+                    gpt,
+                    spk,
+                    temperature=TEMPERATURE,
+                    speed=speed,
+                    stream_chunk_size=STREAM_CHUNK_SIZE,
+                    enable_text_splitting=True,
+                )
+                for chunk in stream:
+                    if isinstance(chunk, torch.Tensor):
+                        chunk = chunk.detach().cpu().to(torch.float32).numpy()
+                    if not _put(chunk.tobytes()):
+                        break  # client went away: stop generating
             except Exception as exc:  # surface as stream termination
                 logger.error("xtts_stream_failed", error=str(exc), exc_info=True)
                 if isinstance(exc, RuntimeError) and not _is_oom(exc) and "cuda" in str(exc).lower():
@@ -1309,6 +1427,7 @@ async def synthesise_stream(req: SynthesiseRequest):
                 if close is not None:
                     with contextlib.suppress(Exception):  # closing an abandoned stream generator is best-effort
                         close()
+                leave_gate()
                 # The end-of-stream sentinel bypasses ``slots``: it is always
                 # delivered, so a consumer can never wait forever.
                 _deliver(None)
@@ -1321,6 +1440,8 @@ async def synthesise_stream(req: SynthesiseRequest):
         handed_off = True
     finally:
         if not handed_off:
+            if leave_gate is not None:
+                leave_gate()
             _mgr.release()
 
     async def event_stream():

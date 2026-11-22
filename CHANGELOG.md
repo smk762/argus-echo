@@ -59,6 +59,25 @@
   (`XTTS_CPU_FALLBACK=1`, default) or answers `503` with the reason and `Retry-After` (`XTTS_OOM_RETRY_AFTER_S`,
   default 30). It used to surface as a bare 500, because the promotion runs inside the lease, outside the
   handler's error handling. A preload that hits the same leaves the model on the CPU instead of failing startup.
+  After a promotion runs out of memory, XTTS tries no other for `XTTS_OOM_RETRY_AFTER_S`, so a full GPU no longer
+  costs every request a ~2 GB move toward it and back under the manager's lock. `/admin/wake` still tries at once.
+- XTTS `/analyze-clips` and `/clone-voice` answer a GPU with no room with the same `503`, reason and
+  `Retry-After` as the other routes, not the old `503 GPU OOM` (#35).
+- XTTS, Qwen: a request waiting while a seeded generation holds the sampler waits on a generation thread
+  (`XTTS_GENERATION_THREADS`, `TTS_GENERATION_THREADS`, default 8), not in the pool the rest of the engine's
+  work shares, and gives up with `503` after `XTTS_RNG_WAIT_S` / `TTS_RNG_WAIT_S` (default 60 s). Many waiting
+  requests used to fill that pool and stall clone, latent and upload work for everyone. A seeded XTTS stream waits
+  before its `200`, generates nothing if its client left while it waited, and ends after `XTTS_RNG_WAIT_S` with no
+  reads instead of holding the sampler for the full 300 s stall timeout.
+- XTTS, Qwen: a checkpoint that fails to reload after an idle unload is dropped and stock is selected, as a failed
+  `/admin/load` already did. Every request used to keep retrying the broken directory until an admin stepped in.
+- Qwen: a GPU/CPU move that fails (and frees the models) clears `/health`'s `weights`, which kept reporting a
+  fingerprint for weights no longer loaded.
+- Whisper `/transcriptions`: at most `STT_MAX_DECODES` (default 2) requests fetch and decode at once; the rest
+  queue for `STT_QUEUE_TIMEOUT_S`, then `503`. Nothing used to bound the downloads, base64 bodies and ffmpeg
+  processes in flight. A WAV or FLAC that `open_audio` refuses (a sample rate it doesn't take) is decoded by ffmpeg
+  instead of answering `400`. A test now triggers each argus-cortex fetch-failure message that sorts a failed
+  `audio_url` into `502`/`413`/`400`, so a reworded message fails CI.
 
 ## [0.1.0] - 2026-11-22
 
