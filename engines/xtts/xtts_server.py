@@ -2167,7 +2167,7 @@ def _prompt_from_safetensors(data: bytes) -> dict:
 
     metadata = _safetensors_metadata(data)
     engine = metadata.get("engine")
-    if engine is not None and engine != "xtts":
+    if engine is not None and engine.strip().lower() != "xtts":
         raise ValueError(f"prompt.safetensors is a {engine[:32]!r} clone, not an XTTS one")
     try:
         arrays = load(data)
