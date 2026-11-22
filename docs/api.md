@@ -42,7 +42,7 @@ XTTS on `8141`, Qwen on `8142` and Whisper (speech to text) on `8144`.
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `text` | string | required | |
-| `voice_clone_id` | string | `null` | A stored clone. Wins over `speaker` |
+| `voice_clone_id` | string | `null` | A stored clone. Wins over `speaker` and, on Qwen, `voice_description`: a request with both is spoken by the clone on the `base` slot (`model: base`, `X-Echo-Model: base`) |
 | `speaker` | string | `null` | A built-in speaker from `GET /speakers` |
 | `language` | string | `"en"` | ISO code. Miso: English only; any other language is `422` (`en-US`, `en_GB` are accepted). XTTS: 17 languages. Qwen: 10 (`en`, `zh`, `ja`, `ko`, `de`, `fr`, `ru`, `pt`, `es`, `it`) |
 | `voice_description` | string | `null` | Qwen only: describe the voice, and a built-in speaker (`speaker`, else `QWEN_DEFAULT_SPEAKER`, else the first listed) is steered by it as an instruction. Needs the 1.7b CustomVoice model: on 0.6b it is `422`, since that model ignores instructions. Ignored elsewhere |

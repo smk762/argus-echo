@@ -473,6 +473,24 @@ class FingerprintTests(CheckpointTestCase):
         self.assertEqual(r.headers["x-echo-checkpoint"], "")  # base is stock here
         self.assertEqual(r.headers["x-echo-weights"], models["base"]["fingerprint"])
 
+    def test_a_clone_wins_over_a_voice_description(self):
+        """A request with both is spoken by the clone on Base, on both routes (argus-proof's speech grids refuse a
+        clone spoken by another slot). Holds on 0.6B too: the description is never looked at."""
+        models = self.load(None).json()["weights"]["models"]
+        body = {
+            "text": "hello there",
+            "voice_clone_id": "voice_clones/x/prompt.pt",
+            "voice_description": "a calm voice",
+        }
+        with mock.patch.object(tts_server, "_get_clone_prompt", lambda clone_id: ["prompt"]):
+            r = self.client.post("/synthesise/stream", json=body)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.headers["x-echo-model"], "base")
+            self.assertEqual(r.headers["x-echo-weights"], models["base"]["fingerprint"])
+            out = self._synth(**{k: v for k, v in body.items() if k != "text"})
+        self.assertEqual((out["model"], out["weights_fingerprint"]), ("base", models["base"]["fingerprint"]))
+        self.assertEqual([c[0] for c in self.calls], ["clone", "clone"])
+
     def test_a_load_during_a_stream_is_refused_so_its_headers_stay_true(self):
         _write_model(self.root / "voice")
         _write_model(self.root / "other", weights=b"other")
