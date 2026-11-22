@@ -241,8 +241,9 @@ custom_voice/model.safetensors:9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848c
 and is `b955ea711653a31092cf4acad596e71ac31cb8f85c6feabe209f32ada86fecfb`. The `base` fingerprint (one line) is
 `8763f2a5235402fc83d026fd46b563e7fa6c7b0c9d12a3cad770d4856148eebc`, and all three files together (the top-level
 `weights.fingerprint`) give `e205d97735019470b091f339590c5f050f068b0f7817439400ed4337db73c89c`. For XTTS, the files
-`config.json` and `model.pth` with the first two sha256 values above give
-`311b8ed7abed4ae45274fedccda241ff6d0a129db13ea34b25b9fe0431de2649`. The engines' tests and the package's assert
+`config.json` with sha256 `b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910` and `model.pth` with
+`9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c` (the hashes above of `custom_voice/config.json`
+and `custom_voice/model.safetensors`) give `311b8ed7abed4ae45274fedccda241ff6d0a129db13ea34b25b9fe0431de2649`. The engines' tests and the package's assert
 these digests with the code's own function, so these docs and the code can't drift apart unnoticed.
 
 ### Fine-tuned checkpoints
