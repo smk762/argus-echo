@@ -35,19 +35,19 @@ residents:
     warm_path: /admin/wake
     admin_auth: true
 
-  # Qwen3-TTS 1.7b, CustomVoice only (QWEN_LOAD_MODELS=custom_voice): measured on dragon's RTX 4060 (8 GB), CUDA
-  # context included: 4.8 GB of device memory loaded, and a generation stays inside it (torch: 4.0 GB allocated,
-  # 4.5 GB reserved); 4.4 GB just after /admin/wake. /admin/evict and /admin/unload leave only the CUDA context
-  # (~150 MB).
-  # What this figure covers. Compose's default is 0.6b with `both` (Base too, for cloning): two 0.6B models, fewer
-  # weights than one 1.7B, so expected inside 4800 but NOT MEASURED (#6). 1.7b with `both` loads two 1.7B models,
-  # roughly twice this: raise vram_mb (about 9000) in the deployment's copy before running it, or iris will place
-  # other tenants in memory Qwen uses. So does a checkpoint loaded with /admin/load into a slot QWEN_LOAD_MODELS
-  # leaves out (a base checkpoint on a custom_voice deployment loads both models).
+  # Qwen3-TTS 0.6b with Base and CustomVoice (QWEN_LOAD_MODELS=both, compose's default, needed for cloning):
+  # measured on dragon's RTX 4060 (8 GB) with echo 0.3.0, per process (NVML), CUDA context included: 4366 MiB after
+  # /admin/wake, 4548 MiB peak speaking a built-in speaker, 5178 MiB peak speaking an ICL clone (11 s reference) on
+  # /synthesise and /synthesise/stream (torch keeps that cached until evicted); 178 MiB after /admin/evict, 144 MiB
+  # after /admin/unload (#6). vram_mb is that peak plus headroom, as for Miso and Whisper.
+  # Other configurations need their own figure in the deployment's copy: 1.7b CustomVoice only measured 4.8 GB
+  # (#27); 1.7b with `both` is unmeasured, roughly twice that (about 9000), and doesn't fit beside other tenants
+  # on an 8 GB card. A checkpoint loaded with /admin/load into a slot QWEN_LOAD_MODELS leaves out loads that model
+  # too.
   - name: qwen
     adapter: argus-http
     container: argus-echo-qwen
-    vram_mb: 4800
+    vram_mb: 5500
     health_path: /health
     unload_path: /admin/unload
     evict_path: /admin/evict
