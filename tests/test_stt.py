@@ -71,7 +71,7 @@ def test_options_default_to_detection_and_refuse_unknown_fields() -> None:
 
 
 def test_transcriptions_takes_exactly_one_source_and_answers_composers_shape() -> None:
-    # kimini-api sends all three keys, nulls included, and composer ignored anything else.
+    # A caller may send all three keys, nulls included; anything else is ignored, as composer did.
     req = TranscriptionsRequest.model_validate({"audio_url": "https://cdn.example/a.mp3", "audio_base64": None, "x": 1})
     assert req.language is None
     for body in ({}, {"audio_url": None, "audio_base64": ""}, {"audio_url": "https://a/b", "audio_base64": "AAAA"}):

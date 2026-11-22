@@ -14,3 +14,4 @@ src/argus_echo/_version.py
 cache/
 data/
 checkpoints/
+.env.bak*

@@ -7,6 +7,13 @@
   running 1.7b builds it locally under its own tag while `ECHO_TAG` keeps pulling the published images for the
   other engines.
 
+### Fixed
+- Whisper decodes an MP4/M4A/MOV whose index (`moov`) comes after the audio, the default for ffmpeg and most
+  recorders without faststart. Read from a pipe, the demuxer couldn't seek back to it, so anything past its
+  read-ahead (a 2-minute AAC clip, say) was a `400` on `/transcribe` and `/transcriptions`. Those formats are now
+  read from a private temporary file (0700 directory, deleted afterwards) with `-protocol_whitelist file` and
+  `-enable_drefs 0`; everything else still goes through the pipe.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added
