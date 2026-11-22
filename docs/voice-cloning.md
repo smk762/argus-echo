@@ -9,7 +9,7 @@ and consent in depth; this page is what each engine does with what you send.
 | Strategy | Averages a speaker embedding across clips | One-shot: conditions on one reference | One-shot (Base model) |
 | Ideal input | 3–8 clips of 3–10 s, 6–60 s in total | **One** clean, expressive 6–15 s clip | One clean clip |
 | More clips help? | Yes, up to the conditioning window | No: the best-scoring clip is used | Takes one clip |
-| Transcript (`reference_text`) | Optional | **Needed**: a wrong or missing one degrades the clone. Without one, Miso transcribes the clip if `MISO_WHISPER_URL` is set | Recommended |
+| Transcript (`reference_text`) | Optional | **Needed**: a wrong or missing one degrades the clone. Without one, Miso transcribes the clips if `MISO_STT_URL` is set | Recommended |
 | Strength | Robust, noise-averaged timbre | Expressive prosody and emotion | Voice design and delivery instructions on the built-in speakers |
 
 ## Recording, for every engine

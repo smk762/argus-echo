@@ -32,6 +32,7 @@ These apply to `/synthesise` and `/synthesise/stream`. `/admin/wake` can also re
 | Status | Body `error` | Meaning | Retry? |
 | --- | --- | --- | --- |
 | 422 | `text is required` | Empty or whitespace `text` | No |
+| 422 | `Miso supports English only (language 'en'); got '…'` | `language` is not `en` or a region of it (`en-US`, `en_GB`). Body adds `supported_languages: ["en"]`. Checked before the model loads | No |
 | 422 | various | Bad `voice_clone_id` (`Voice clone not found: …`), non-integer `speaker`, bad `context`, or reference + text too long for the prompt. (A non-finite `temperature` fails schema validation instead: FastAPI's `{"detail": [...]}` 422) | No |
 | 503 | `Model still loading` | Another request is loading the model | Yes |
 | 503 | `Model load failed: …` | Loading failed (non-OOM). `/health` shows `model_state: "error"` | After fixing the cause |
@@ -59,7 +60,7 @@ Request (`application/json`):
 | `temperature` | number | `null` | Clamped to 0.1–1.5. Order of precedence: request, then the clone's `meta.json`, then `MISO_TEMPERATURE` |
 | `topk` | integer | `null` | Clamped to 1–200. Same precedence, falling back to `MISO_TOPK` |
 | `context` | array | `null` | Previous utterances for continuity, oldest first. See [Context](#context) |
-| `language` | string | `"en"` | Accepted for compatibility; Miso supports English only |
+| `language` | string | `"en"` | `en`, or a region of it (`en-US`, `en_GB`). Anything else is `422`: Miso speaks English only |
 | `voice_description`, `instruction`, `emotion`, `speed` | — | — | Accepted for XTTS compatibility and ignored |
 
 Response `200`:
@@ -192,8 +193,9 @@ Request: `multipart/form-data`:
 | --- | --- | --- |
 | `audio` | yes, one or more | Reference clips. Each is converted to mono 24 kHz, high-passed, VAD-trimmed (when `MISO_PREPROCESS=1`) and loudness-normalised, then all are joined and capped at `MISO_REF_MAX_SECONDS` |
 | `companion_id` | yes | Storage id. Used as given in `voice_clones/<companion_id>/`; cloning the same id again replaces the clone but keeps any `temperature`/`topk` in its `meta.json` |
-| `reference_text` | no | Transcript of the reference audio. Strongly recommended. If empty and `MISO_WHISPER_URL` is set, the stored reference (the joined, trimmed clips) is transcribed |
+| `reference_text` | no | Transcript of the reference audio. Strongly recommended. If empty and `MISO_STT_URL` is set, each stored clip (trimmed, and cut at the cap) is sent to that engine's `POST /transcribe` and the texts are joined in clip order. A clip the cap cuts to under 0.5 s is not transcribed |
 | `voice_name` | no | Display name; defaults to `companion_id` |
+| `language` | no | Language of the clips, passed to the STT engine (region dropped: `en-US` → `en`). Default `en` |
 
 Response `200`: the clone's metadata, plus `duration` and a per-clip
 preprocessing report:
@@ -206,6 +208,8 @@ preprocessing report:
   "num_clips": 2,
   "total_seconds": 11.3,
   "has_transcript": true,
+  "reference_text_source": "stt",
+  "reference_text_stt": {"language": "en"},
   "engine": "miso",
   "created_at": 1763000000.0,
   "duration": 11.3,
@@ -213,9 +217,18 @@ preprocessing report:
 }
 ```
 
+`reference_text_source` is `"request"` (the caller sent `reference_text`), `"stt"`
+(machine-made by the `MISO_STT_URL` engine) or `null` (no transcript). With `"stt"`,
+`reference_text_stt` records the language asked for, plus the STT `engine` and `model`
+when its answer names them.
+
 Status: `422` with no clips, more than `MISO_MAX_CLIPS` (10), no usable audio after
 preprocessing, or under 2 s of speech (6 s or more is recommended); `503` while
-the model is loading. `413` when a clip is over `MISO_MAX_CLIP_MB` (50 MB), or the whole body is over
+the model is loading. When the transcript comes from `MISO_STT_URL` and that fails, the
+clone is refused and nothing is stored: `503` (STT busy, loading or unreachable;
+`Retry-After` passed on, else 5), `504` (no answer within `MISO_STT_TIMEOUT_S` for a
+clip) or `502` (any other STT error, an answer without `text`, or an empty transcript
+for every clip). Send `reference_text` to clone without the STT engine. `413` when a clip is over `MISO_MAX_CLIP_MB` (50 MB), or the whole body is over
 `MISO_MAX_CLIPS` × `MISO_MAX_CLIP_MB` + 1 MB; the body check runs before anything is
 written to disk.
 

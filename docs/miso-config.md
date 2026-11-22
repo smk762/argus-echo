@@ -84,7 +84,8 @@ on for the full 30 s.
 | `MISO_MAX_ARCHIVE_MB` | `64` | Largest zip `/clones/import` accepts; a larger one is `413` |
 | `MISO_MAX_CLIPS` | `10` | Most clips one `/clone-voice` or `/analyze-clips` request takes; more is `422`. The whole upload body is capped at `MISO_MAX_CLIPS` × `MISO_MAX_CLIP_MB` (or `MISO_MAX_ARCHIVE_MB` for `/clones/import`) plus 1 MB, and is refused with `413` before it is written to disk |
 | `MISO_PREPROCESS` | `1` | `1` trims silence and non-speech from each clip with VAD. `0` skips the trim; the high-pass, length cap and loudness normalisation always run |
-| `MISO_WHISPER_URL` | empty | Speech-to-text service used to transcribe the reference when `reference_text` is empty. Without it such clones have no transcript and clone quality drops |
+| `MISO_STT_URL` | empty | Echo's speech-to-text engine (the whisper engine, e.g. `http://whisper:8031`). `/clone-voice` with an empty `reference_text` sends each clip to its `POST /transcribe`; a failure refuses the clone (`502`/`503`/`504`). Empty: such clones have no transcript and clone quality drops. Env only, never a request field. `MISO_WHISPER_URL`, the old name, is read when this is unset |
+| `MISO_STT_TIMEOUT_S` | `60` | Timeout for each clip's transcription request |
 | `MISO_ANALYZE_THRESHOLD` | `60` | `/analyze-clips` score at or above which a clip is `recommended` |
 
 ## Admin

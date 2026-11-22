@@ -62,6 +62,10 @@ services:
       MISO_PUBLIC_URL: ${MISO_PUBLIC_URL:-http://localhost:${MISO_PORT:-8140}}
       MISO_KEEP_ALIVE_GPU: ${MISO_KEEP_ALIVE_GPU:-300}
       MISO_KEEP_ALIVE_CPU: ${MISO_KEEP_ALIVE_CPU:-0}
+      # Speech-to-text engine that transcribes /clone-voice clips sent without reference_text
+      # (e.g. http://whisper:8031 with the whisper profile). Empty: such clones have no transcript.
+      MISO_STT_URL: ${MISO_STT_URL:-}
+      MISO_STT_TIMEOUT_S: ${MISO_STT_TIMEOUT_S:-60}
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       # Mimi's streaming decoder under CUDA graphs cuts every streamed utterance short.

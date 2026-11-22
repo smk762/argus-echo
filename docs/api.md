@@ -43,14 +43,15 @@ XTTS on `8141`, Qwen on `8142` and Whisper (speech to text) on `8144`.
 | `text` | string | required | |
 | `voice_clone_id` | string | `null` | A stored clone. Wins over `speaker` |
 | `speaker` | string | `null` | A built-in speaker from `GET /speakers` |
-| `language` | string | `"en"` | ISO code. Miso: English only. XTTS: 17 languages. Qwen: 10 (`en`, `zh`, `ja`, `ko`, `de`, `fr`, `ru`, `pt`, `es`, `it`) |
+| `language` | string | `"en"` | ISO code. Miso: English only; any other language is `422` (`en-US`, `en_GB` are accepted). XTTS: 17 languages. Qwen: 10 (`en`, `zh`, `ja`, `ko`, `de`, `fr`, `ru`, `pt`, `es`, `it`) |
 | `voice_description` | string | `null` | Qwen only: describe a voice to design. Ignored elsewhere |
 | `instruction` | string | `null` | Qwen only: delivery instruction for a built-in speaker. Ignored elsewhere |
 | `emotion` | string | `"neutral"` | Qwen only. Ignored elsewhere |
 | `speed` | number | `null` | XTTS only: speaking-rate multiplier passed to inference (`1.0` when unset or not positive). Miso and Qwen accept it and ignore it |
 | `temperature`, `topk`, `context` | | | Miso only; see [miso-api.md](miso-api.md) |
 
-An engine ignores fields it has no use for instead of refusing them, so one request body works on all three.
+An engine ignores fields it has no use for instead of refusing them, so one request body works on all three. The
+exception is a `language` the engine cannot speak: Miso refuses it rather than mispronounce it.
 
 `/synthesise` stores a WAV and returns `{"audio_url", "duration", "duration_seconds", "format"}`.
 
@@ -83,7 +84,8 @@ Built-in speakers (`GET /speakers` → `{"speakers": [{"id", "name", "language",
 On XTTS and Qwen, `GET /speakers` loads the model if it is not loaded.
 
 `POST /clone-voice` is `multipart/form-data` with one or more `audio` files, `reference_text` (the transcript;
-Miso needs it) and `companion_id` (`^[A-Za-z0-9_-]{1,64}$`). A clone is stored at
+Miso needs it) and `companion_id` (`^[A-Za-z0-9_-]{1,64}$`). Miso fills an empty `reference_text` from the
+speech-to-text engine when `MISO_STT_URL` names one (see [miso-api.md](miso-api.md#post-clone-voice)). A clone is stored at
 `voice_clones/<companion_id>/prompt.pt` with a `meta.json`, and used by passing its id as `voice_clone_id`.
 **Clones are engine-specific**: each engine's `prompt.pt` is its own format, which is why each engine gets its
 own bucket. Download archives differ too: Miso's holds `prompt.safetensors` + `meta.json` and its import refuses

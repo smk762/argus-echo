@@ -3,6 +3,11 @@
 ## [Unreleased]
 
 ### Added
+- Miso `/clone-voice` fills an empty `reference_text` from the STT engine named by `MISO_STT_URL` (#13): each
+  stored clip goes to `POST /transcribe` (with the new `language` form field) within `MISO_STT_TIMEOUT_S`
+  (default 60), and `meta.json` records `reference_text_source` (`request`, `stt` or null) and
+  `reference_text_stt`. An STT failure refuses the clone (502/503/504) instead of storing it without a transcript.
+  `MISO_WHISPER_URL` is read as the old name.
 - Speech to text (#4): the `whisper` engine (faster-whisper, Whisper large-v3-turbo, weights pinned by commit) on
   port 8144 with `POST /transcribe` and a VAD-endpointed `WS /transcribe/stream`, its Compose profile, image and
   `gpu-tenant.yaml` resident (3000 MB). The `stt` contract is `argus_echo.contract.stt`; docs/api.md and
@@ -20,6 +25,8 @@
 - `gpu-tenant.yaml` for argus-iris; docs for the shared contract, each engine, and voice cloning.
 
 ### Changed
+- Miso's `/synthesise` and `/synthesise/stream` answer `422` for a `language` other than `en` (or a region of it,
+  `en-US`, `en_GB`) instead of mispronouncing it (#6).
 - Miso clone archives (`GET /clones/{id}/download`, `POST /clones/import`) carry the prompt as
   `prompt.safetensors` (tensors, with speaker/sample_rate/ref_text in its metadata header) instead of a pickled
   `prompt.pt`. Import never unpickles an upload: `torch.load(weights_only=True)` on the unauthenticated import

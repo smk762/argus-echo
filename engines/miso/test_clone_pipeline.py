@@ -1,5 +1,6 @@
 """Clone building and import: VAD spans, the auto-transcript, clip counts,
-speech metrics, the prompt-length check and malformed archives."""
+speech metrics, the prompt-length check and malformed archives. The STT engine
+(MISO_STT_URL) is stubbed with httpx.MockTransport."""
 
 import contextlib
 import io
@@ -11,6 +12,7 @@ import unittest
 import zipfile
 from unittest import mock
 
+import httpx
 import numpy as np
 import soundfile as sf
 import torch
@@ -121,47 +123,170 @@ class CloneVoiceTest(_LocalStorageCase):
         super().setUp()
         self.client = TestClient(srv.app)
 
-    def test_transcript_and_clip_count_follow_the_stored_reference(self):
-        good = torch.full((3 * SR,), 0.25)
-        transcribed = []
+    def _post(self, files=None, **data):
+        files = files or [
+            ("audio", ("a.wav", b"clip-a", "audio/wav")),
+            ("audio", ("b.wav", b"clip-b", "audio/wav")),
+        ]
+        return self.client.post("/clone-voice", files=files, data={"companion_id": "alice", **data})
+
+    def _stt(self, handler):
+        """Point MISO_STT_URL at a stubbed STT engine; records each request it gets."""
+        seen = []
+
+        def record(request: httpx.Request) -> httpx.Response:
+            seen.append(request)
+            return handler(request, len(seen) - 1)
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(srv, "STT_URL", "http://stt:8000"))
+        stack.enter_context(mock.patch.object(srv, "_STT_TRANSPORT", httpx.MockTransport(record)))
+        self.addCleanup(stack.close)
+        return seen
+
+    def _preprocess(self, *clips):
+        """Each upload's bytes name the tensor its preprocessing returns; b"broken" fails."""
 
         def preprocess(path):
             with open(path, "rb") as f:
-                if f.read() == b"broken":
-                    raise RuntimeError("cannot decode")
-            return good, {"applied": [], "warnings": []}
+                raw = f.read()
+            if raw == b"broken":
+                raise RuntimeError("cannot decode")
+            return clips[int(raw.decode().rsplit("-", 1)[1])], {"applied": [], "warnings": []}
 
-        def transcribe(wav_bytes):
-            transcribed.append(wav_bytes)
-            return "what the reference says"
+        patcher = mock.patch.object(srv, "_preprocess_reference", preprocess)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
-        with mock.patch.object(srv, "_preprocess_reference", preprocess), mock.patch.object(
-            srv, "_transcribe_reference", transcribe
-        ), mock.patch.object(srv, "WHISPER_URL", "http://whisper"):
-            r = self.client.post(
-                "/clone-voice",
-                files=[
-                    ("audio", ("bad.wav", b"broken", "audio/wav")),
-                    ("audio", ("a.wav", b"clip-a", "audio/wav")),
-                    ("audio", ("b.wav", b"clip-b", "audio/wav")),
-                ],
-                data={"companion_id": "alice"},
-            )
+    def test_transcript_and_clip_count_follow_the_stored_reference(self):
+        self._preprocess(torch.full((3 * SR,), 0.25), torch.full((3 * SR,), -0.5))
+        texts = ["first clip says this.", "second clip says that."]
+        seen = self._stt(lambda req, i: httpx.Response(200, json={"text": f" {texts[i]} ", "language": "en"}))
+        r = self._post(
+            files=[
+                ("audio", ("bad.wav", b"broken", "audio/wav")),
+                ("audio", ("a.wav", b"clip-0", "audio/wav")),
+                ("audio", ("b.wav", b"clip-1", "audio/wav")),
+            ],
+            language="en-GB",
+        )
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
         self.assertEqual(body["num_clips"], 2)  # bad.wav is not in the clone
         self.assertTrue(body["has_transcript"])
+        self.assertEqual(body["reference_text_source"], "stt")
+        self.assertEqual(body["reference_text_stt"], {"language": "en"})
 
-        # The transcriber heard the stored reference: both good clips, never the dropped upload.
-        self.assertEqual(len(transcribed), 1)
-        heard, rate = sf.read(io.BytesIO(transcribed[0]), dtype="float32")
-        self.assertEqual(rate, SR)
-        self.assertEqual(len(heard), 6 * SR)
-        np.testing.assert_allclose(heard, 0.25, atol=1e-3)
+        # One request per stored clip, in clip order, never the dropped upload.
+        self.assertEqual(len(seen), 2)
+        for req, level in zip(seen, (0.25, -0.5)):
+            self.assertEqual(str(req.url), "http://stt:8000/transcribe")
+            form = req.read()
+            self.assertIn(b'name="language"\r\n\r\nen\r\n', form)
+            self.assertIn(b'name="audio"; filename="clip', form)
+            wav = form[form.index(b"RIFF") :]
+            heard, rate = sf.read(io.BytesIO(wav[: wav.rindex(b"\r\n--")]), dtype="float32")
+            self.assertEqual(rate, SR)
+            self.assertEqual(len(heard), 3 * SR)
+            np.testing.assert_allclose(heard, level, atol=1e-3)
+
         stored = torch.load(io.BytesIO(self.storage.get("voice_clones/alice/prompt.pt")), weights_only=True)
-        self.assertEqual(stored["ref_audio"].shape[-1], len(heard))
-        self.assertEqual(stored["ref_text"], "what the reference says")
-        self.assertEqual(json.loads(self.storage.get("voice_clones/alice/meta.json"))["num_clips"], 2)
+        self.assertEqual(stored["ref_audio"].shape[-1], 6 * SR)
+        self.assertEqual(stored["ref_text"], "first clip says this. second clip says that.")
+        meta = json.loads(self.storage.get("voice_clones/alice/meta.json"))
+        self.assertEqual(meta["num_clips"], 2)
+        self.assertEqual(meta["reference_text_source"], "stt")
+
+    def test_stt_engine_and_model_are_recorded_when_returned(self):
+        self._preprocess(torch.full((3 * SR,), 0.25))
+        self._stt(lambda req, i: httpx.Response(200, json={"text": "hi", "engine": "whisper", "model": "large-v3"}))
+        r = self._post(files=[("audio", ("a.wav", b"clip-0", "audio/wav"))])
+        self.assertEqual(r.status_code, 200, r.text)
+        meta = json.loads(self.storage.get("voice_clones/alice/meta.json"))
+        self.assertEqual(meta["reference_text_stt"], {"language": "en", "engine": "whisper", "model": "large-v3"})
+
+    def test_only_the_audio_kept_under_the_cap_is_transcribed(self):
+        self._preprocess(torch.full((3 * SR,), 0.25), torch.full((3 * SR,), 0.25), torch.full((3 * SR,), 0.25))
+        seen = self._stt(lambda req, i: httpx.Response(200, json={"text": f"clip {i}"}))
+        # 3 + 3 + 3 s capped at 6.2 s: the third clip keeps 0.2 s, too little to transcribe.
+        with mock.patch.object(srv, "REF_MAX_SECONDS", 6.2):
+            r = self._post(
+                files=[("audio", (f"{i}.wav", f"clip-{i}".encode(), "audio/wav")) for i in range(3)],
+            )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(seen), 2)
+        stored = torch.load(io.BytesIO(self.storage.get("voice_clones/alice/prompt.pt")), weights_only=True)
+        self.assertEqual(stored["ref_text"], "clip 0 clip 1")
+
+    def test_caller_transcript_skips_the_stt_engine(self):
+        self._preprocess(torch.full((3 * SR,), 0.25))
+        seen = self._stt(lambda req, i: httpx.Response(500))
+        r = self._post(files=[("audio", ("a.wav", b"clip-0", "audio/wav"))], reference_text="my own words")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(seen, [])
+        self.assertEqual(r.json()["reference_text_source"], "request")
+        self.assertNotIn("reference_text_stt", r.json())
+
+    def test_without_stt_url_the_clone_has_no_transcript(self):
+        self._preprocess(torch.full((3 * SR,), 0.25))
+        with mock.patch.object(srv, "STT_URL", ""):
+            r = self._post(files=[("audio", ("a.wav", b"clip-0", "audio/wav"))])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(r.json()["has_transcript"])
+        self.assertIsNone(r.json()["reference_text_source"])
+
+    def test_stt_failures_refuse_the_clone(self):
+        def timeout(req, i):
+            raise httpx.ReadTimeout("slow", request=req)
+
+        def refused(req, i):
+            raise httpx.ConnectError("connection refused", request=req)
+
+        cases = {
+            "busy": (lambda req, i: httpx.Response(503, json={"error": "busy"}, headers={"Retry-After": "7"}), 503, "7"),
+            "unreachable": (refused, 503, "5"),
+            "timeout": (timeout, 504, None),
+            "server error": (lambda req, i: httpx.Response(500, text="boom"), 502, None),
+            "bad language": (lambda req, i: httpx.Response(422, json={"error": "Unknown language"}), 502, None),
+            "not json": (lambda req, i: httpx.Response(200, text="<html>"), 502, None),
+            "no text": (lambda req, i: httpx.Response(200, json={"segments": []}), 502, None),
+            "all empty": (lambda req, i: httpx.Response(200, json={"text": "  "}), 502, None),
+            "second clip fails": (
+                lambda req, i: httpx.Response(200, json={"text": "ok"}) if i == 0 else httpx.Response(500),
+                502,
+                None,
+            ),
+        }
+        self._preprocess(torch.full((3 * SR,), 0.25), torch.full((3 * SR,), 0.25))
+        for name, (handler, status, retry_after) in cases.items():
+            with self.subTest(name):
+                stack = contextlib.ExitStack()
+                with stack:
+                    stack.enter_context(mock.patch.object(srv, "STT_URL", "http://stt:8000"))
+                    stack.enter_context(
+                        mock.patch.object(
+                            srv, "_STT_TRANSPORT", httpx.MockTransport(_counting(handler))
+                        )
+                    )
+                    r = self._post(
+                        files=[("audio", (f"{i}.wav", f"clip-{i}".encode(), "audio/wav")) for i in range(2)],
+                        companion_id=f"x-{name.replace(' ', '-')}",
+                    )
+                self.assertEqual(r.status_code, status, r.text)
+                self.assertIn("Speech-to-text", r.json()["error"])
+                self.assertEqual(r.headers.get("Retry-After"), retry_after)
+        # A refused clone stores nothing.
+        self.assertEqual(self.storage.list_keys("voice_clones/"), [])
+
+
+def _counting(handler):
+    calls = []
+
+    def wrapped(request):
+        calls.append(request)
+        return handler(request, len(calls) - 1)
+
+    return wrapped
 
 
 class ImportCloneTest(_LocalStorageCase):

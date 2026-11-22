@@ -736,6 +736,7 @@ source = { editable = "." }
 dependencies = [
     { name = "argus-cortex", extra = ["server"] },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'" },
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "moshi" },
     { name = "safetensors" },
@@ -753,6 +754,7 @@ dependencies = [
 requires-dist = [
     { name = "argus-cortex", extras = ["server"], specifier = ">=0.8,<0.9" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'", specifier = "==0.49.2" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.34,<1.0" },
     { name = "moshi", specifier = "==0.2.13" },
     { name = "safetensors", specifier = ">=0.5.3" },
