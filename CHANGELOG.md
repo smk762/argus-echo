@@ -20,5 +20,10 @@
 - `gpu-tenant.yaml` for argus-iris; docs for the shared contract, each engine, and voice cloning.
 
 ### Changed
+- Miso clone archives (`GET /clones/{id}/download`, `POST /clones/import`) carry the prompt as
+  `prompt.safetensors` (tensors, with speaker/sample_rate/ref_text in its metadata header) instead of a pickled
+  `prompt.pt`. Import never unpickles an upload: `torch.load(weights_only=True)` on the unauthenticated import
+  route was remote code execution on Miso's torch 2.4 (CVE-2025-32434). An archive holding only `prompt.pt` is
+  refused with `422`; re-export it from a current engine. Stored clones keep loading and download as safetensors.
 - Every engine's `/admin/*` uses argus-cortex's `bearer`: closed (503) while `ARGUS_ADMIN_TOKEN` is unset, unless
   `ARGUS_ADMIN_INSECURE=1`. Miso was open when unset in voluptas.

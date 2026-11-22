@@ -86,7 +86,7 @@ class UploadCapTest(unittest.TestCase):
     def test_oversized_meta_in_archive_is_refused(self):
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("prompt.pt", b"")
+            zf.writestr("prompt.safetensors", b"")
             zf.writestr("meta.json", b" " * (srv._MAX_META_BYTES + 1))
         with self.assertRaisesRegex(ValueError, "meta.json is unexpectedly large"):
             srv._import_clone(buf.getvalue(), "", "")

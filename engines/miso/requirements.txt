@@ -8,5 +8,6 @@ moshi==0.2.13
 bitsandbytes==0.49.2; sys_platform == "linux"
 torchtune==0.6.1
 torchao==0.14.1
+safetensors>=0.5.3
 silentcipher @ git+https://github.com/SesameAILabs/silentcipher@d46d7d0893a583d8968ab3a6626e2289faec9152
 argus-cortex[server]>=0.8,<0.9
