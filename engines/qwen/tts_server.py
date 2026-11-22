@@ -38,6 +38,8 @@ Env vars:
 import asyncio
 import gc
 import io
+import json
+import math
 import os
 import re
 import sys
@@ -54,6 +56,7 @@ from typing import AsyncIterator, Optional
 
 import structlog
 from argus_cortex.auth import bearer
+from argus_cortex.limits import BadInput, TooLarge, read_upload
 from starlette.requests import ClientDisconnect, HTTPConnection
 from fastapi import Depends, FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -95,6 +98,13 @@ S3_PUBLIC_URL = os.getenv("S3_PUBLIC_URL", "http://localhost:9000/voice")
 TTS_MAX_NEW_TOKENS = int(os.getenv("TTS_MAX_NEW_TOKENS", "0"))
 TTS_MAX_NEW_TOKENS_CEILING = int(os.getenv("TTS_MAX_NEW_TOKENS_CEILING", "1024"))
 
+# Upload bounds for /clone-voice and /analyze-clips (413 past either), read
+# through argus-cortex's read_upload so an oversized clip costs no more than the cap.
+MAX_CLIPS: int = int(os.getenv("TTS_MAX_CLIPS", "16"))
+CLIP_MAX_BYTES: int = int(os.getenv("TTS_CLIP_MAX_BYTES", str(16 * 1024 * 1024)))
+# /analyze-clips score (0-100) below which a clip is not recommended.
+ANALYZE_SCORE_THRESHOLD: float = float(os.getenv("TTS_ANALYZE_THRESHOLD", "60"))
+
 MODEL_IDS = {
     "1.7b": {
         "base": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
@@ -134,6 +144,22 @@ _LANGUAGE_TO_ISO: dict[str, str] = {
 }
 
 _CLONE_CACHE_MAX = 50
+
+# Names this engine in /health and in every clone's meta.json.
+_ENGINE = "qwen-tts"
+
+# A clone's id is its S3 prefix (voice_clones/<id>/): one plain path segment,
+# the same rule as the Miso and XTTS engines.
+_COMPANION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_COMPANION_ID_ERROR = "companion_id must be 1-64 characters of A-Z, a-z, 0-9, '_' or '-'"
+
+# A Qwen prompt.pt is a few hundred KB (a speaker embedding plus, in ICL mode,
+# the reference's codec tokens); these caps leave ample room.
+_MAX_PROMPT_BYTES = 16 * 1024 * 1024
+_MAX_META_BYTES = 64 * 1024
+_MAX_SPK_EMBEDDING = 8192
+_MAX_REF_CODE_NUMEL = 4_000_000
+_MAX_REF_TEXT_CHARS = 10_000
 
 # ── GPU memory lifecycle ─────────────────────────────────────────────────────
 
@@ -518,13 +544,81 @@ def _upload_to_s3(data: bytes, key: str, content_type: str = "audio/wav") -> str
     return f"{S3_PUBLIC_URL}/{key}"
 
 
+def _prompt_item_cls():
+    """qwen_tts's ``VoiceClonePromptItem``: what ``create_voice_clone_prompt``
+    returns (as a one-item list) and what a stored ``prompt.pt`` pickles."""
+    from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem
+
+    return VoiceClonePromptItem
+
+
+def _load_prompt(data) -> list:
+    """Deserialize and validate a stored Qwen clone (``prompt.pt``).
+
+    Clone blobs come from S3 or an uploaded archive, so they're untrusted.
+    ``weights_only=True`` restricts unpickling to tensors, plain containers and
+    the one class allowed here, ``VoiceClonePromptItem`` (a dataclass of tensors,
+    bools and a string), so nothing can run code. Without that allowance a
+    ``prompt.pt`` written by ``/clone-voice`` does not load at all under
+    ``weights_only``. Returns ``[VoiceClonePromptItem]`` rebuilt from the
+    validated fields; raises ``ValueError``."""
+    import torch
+
+    cls = _prompt_item_cls()
+    buf = data if hasattr(data, "read") else io.BytesIO(data)
+    try:
+        safe_globals = getattr(torch.serialization, "safe_globals", None)
+        if safe_globals is not None:
+            with safe_globals([cls]):
+                loaded = torch.load(buf, map_location="cpu", weights_only=True)
+        else:  # torch < 2.5
+            torch.serialization.add_safe_globals([cls])
+            loaded = torch.load(buf, map_location="cpu", weights_only=True)
+    except Exception as exc:
+        raise ValueError("prompt.pt is not a Qwen clone (it does not load as one)") from exc
+    return _validate_prompt(loaded, cls)
+
+
+def _validate_prompt(loaded, cls) -> list:
+    """``loaded`` must be one ``VoiceClonePromptItem`` in a list, as
+    ``create_voice_clone_prompt`` makes for one reference clip. Another engine's
+    ``prompt.pt`` (a dict of tensors) fails here."""
+    import torch
+
+    if not (isinstance(loaded, list) and len(loaded) == 1 and isinstance(loaded[0], cls)):
+        raise ValueError("prompt.pt must hold one Qwen VoiceClonePromptItem (is it another engine's clone?)")
+    item = loaded[0]
+
+    spk = item.ref_spk_embedding
+    if not (torch.is_tensor(spk) and spk.is_floating_point() and spk.dim() == 1
+            and 0 < spk.numel() <= _MAX_SPK_EMBEDDING):
+        raise ValueError("prompt.pt's ref_spk_embedding must be a 1-D float tensor")
+    xvec, icl = item.x_vector_only_mode, item.icl_mode
+    if not (isinstance(xvec, bool) and isinstance(icl, bool) and xvec != icl):
+        raise ValueError("prompt.pt must set exactly one of x_vector_only_mode and icl_mode")
+    text = item.ref_text
+    if text is not None and not (isinstance(text, str) and len(text) <= _MAX_REF_TEXT_CHARS):
+        raise ValueError("prompt.pt's ref_text must be a string")
+
+    code = None  # x-vector mode uses only the embedding, as create_voice_clone_prompt stores it
+    if icl:
+        code = item.ref_code
+        if not (torch.is_tensor(code) and not code.is_floating_point() and not code.is_complex()
+                and code.dtype != torch.bool and code.dim() in (1, 2) and 0 < code.numel() <= _MAX_REF_CODE_NUMEL):
+            raise ValueError("an ICL prompt.pt needs its ref_code as an integer tensor")
+        if not text:
+            raise ValueError("an ICL prompt.pt needs its ref_text")
+        code = code.detach().cpu()
+    return [cls(ref_code=code, ref_spk_embedding=spk.detach().cpu(), x_vector_only_mode=xvec, icl_mode=icl,
+                ref_text=text)]
+
+
 def _get_clone_prompt(clone_id: str):
     with _clone_cache_lock:
         if clone_id in _clone_cache:
             _clone_cache.move_to_end(clone_id)
             return _clone_cache[clone_id]
 
-    import torch
     from botocore.exceptions import ClientError
 
     client = _get_s3_client()
@@ -536,7 +630,11 @@ def _get_clone_prompt(clone_id: str):
         logger.error("clone_prompt_s3_error", clone_id=clone_id, error_code=error_code)
         raise ValueError(f"Voice clone prompt not found: {clone_id}") from exc
     buf.seek(0)
-    prompt = torch.load(buf, map_location="cpu", weights_only=True)
+    try:
+        prompt = _load_prompt(buf)
+    except ValueError as exc:
+        logger.error("clone_prompt_invalid", clone_id=clone_id, error=str(exc))
+        raise ValueError(f"Voice clone is not a valid Qwen clone: {clone_id}") from exc
 
     with _clone_cache_lock:
         _clone_cache[clone_id] = prompt
@@ -1041,9 +1139,6 @@ async def synthesise_stream(req: SynthesiseRequest):
 # ── POST /clone-voice ─────────────────────────────────────────────────────────
 
 
-_COMPANION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-
-
 def _clone_key(companion_id: str) -> str:
     """S3 key of a companion's clone prompt; ``companion_id`` must be validated."""
     return f"voice_clones/{companion_id}/prompt.pt"
@@ -1082,22 +1177,27 @@ async def clone_voice(
     reference_text: str = Form(""),
     companion_id: str = Form(...),
     replace: bool = Form(False),
+    voice_name: str = Form(""),
 ):
     """Extract voice clone prompt from reference audio and store in S3.
 
     ``companion_id`` must match ``^[A-Za-z0-9_-]{1,64}$`` (422 otherwise). An
     existing clone is only overwritten when ``replace`` is true (409 otherwise).
+    The clip is read through argus-cortex's ``read_upload``: over
+    ``TTS_CLIP_MAX_BYTES`` is a 413. Writes ``prompt.pt`` and a ``meta.json``.
     This sidecar has no caller identity; ownership is enforced by the gateway.
     """
     if not _COMPANION_ID_RE.fullmatch(companion_id):
-        return JSONResponse(
-            status_code=422,
-            content={"error": "companion_id must be 1-64 characters of A-Z, a-z, 0-9, '_' or '-'"},
-        )
+        return JSONResponse(status_code=422, content={"error": _COMPANION_ID_ERROR})
     s3_key = _clone_key(companion_id)
 
     if _mgr.state == TTSState.LOADING:
         return JSONResponse(status_code=503, content={"error": "Models still loading"})
+
+    try:
+        audio_bytes = await read_upload(audio, CLIP_MAX_BYTES, what=audio.filename or "audio clip")
+    except (TooLarge, BadInput) as exc:
+        return _upload_refused(exc)
 
     lock = _clone_lock(companion_id)
     async with lock:
@@ -1108,17 +1208,23 @@ async def clone_voice(
             )
 
         async with _mgr.use():
-            return await _clone_voice_leased(audio, reference_text, companion_id, s3_key)
+            return await _clone_voice_leased(audio_bytes, reference_text, companion_id, s3_key, voice_name=voice_name)
 
 
-async def _clone_voice_leased(audio: UploadFile, reference_text: str, companion_id: str, s3_key: str):
+def _upload_refused(exc: ValueError) -> JSONResponse:
+    """413 for an upload over its cap, 400 for a malformed one (argus-cortex limits)."""
+    return JSONResponse(status_code=413 if isinstance(exc, TooLarge) else 400, content={"error": str(exc)})
+
+
+async def _clone_voice_leased(
+    audio_bytes: bytes, reference_text: str, companion_id: str, s3_key: str, voice_name: str = ""
+):
     """Body of ``clone_voice``; the caller holds a ``_mgr.use()`` lease."""
     if _mgr.base_model is None:
         return JSONResponse(status_code=503, content={"error": "Base model not loaded (TTS_LOAD_MODELS=custom_voice)"})
 
     import soundfile as sf
 
-    audio_bytes = await audio.read()
     tmp_path = await asyncio.to_thread(_write_temp_wav, audio_bytes)
 
     try:
@@ -1153,13 +1259,604 @@ async def _clone_voice_leased(audio: UploadFile, reference_text: str, companion_
 
     await asyncio.to_thread(_upload_to_s3, prompt_bytes, s3_key, "application/octet-stream")
 
+    meta = {
+        "voice_clone_id": s3_key,
+        "companion_id": companion_id,
+        "name": voice_name or companion_id,
+        "num_clips": 1,
+        "total_seconds": round(duration, 2),
+        "has_transcript": bool(reference_text),
+        "engine": _ENGINE,
+        "created_at": time.time(),
+    }
+    await asyncio.to_thread(_put_meta, companion_id, meta)
+
     with _clone_cache_lock:
         _clone_cache[s3_key] = clone_prompt
         if len(_clone_cache) > _CLONE_CACHE_MAX:
             _clone_cache.popitem(last=False)
 
     logger.info("voice_cloned", companion_id=companion_id, duration=duration, s3_key=s3_key)
-    return {"voice_clone_id": s3_key, "companion_id": companion_id, "duration": duration}
+    return {**meta, "duration": duration}
+
+
+def _meta_key(companion_id: str) -> str:
+    return f"voice_clones/{companion_id}/meta.json"
+
+
+def _put_meta(companion_id: str, meta: dict) -> None:
+    _upload_to_s3(json.dumps(meta).encode("utf-8"), _meta_key(companion_id), "application/json")
+
+
+def _default_meta(companion_id: str, created_at: Optional[float] = None) -> dict:
+    """What ``GET /clones`` reports for a clone stored without a ``meta.json``
+    (every clone made before Qwen wrote one)."""
+    return {
+        "voice_clone_id": _clone_key(companion_id),
+        "companion_id": companion_id,
+        "name": companion_id,
+        "num_clips": 1,
+        "total_seconds": None,
+        "engine": _ENGINE,
+        "created_at": created_at,
+    }
+
+
+def _read_meta(client, companion_id: str) -> Optional[dict]:
+    """A clone's ``meta.json`` as a dict, or None if it is missing or unreadable."""
+    from botocore.exceptions import ClientError
+
+    key = _meta_key(companion_id)
+    buf = io.BytesIO()
+    try:
+        client.download_fileobj(S3_BUCKET_NAME, key, buf)
+        if buf.tell() > _MAX_META_BYTES:
+            raise ValueError("meta.json is unexpectedly large")
+        meta = json.loads(buf.getvalue().decode("utf-8"))
+        if not isinstance(meta, dict):
+            raise ValueError("meta.json is not an object")
+    except (ClientError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
+        logger.warning("clone_meta_unreadable", key=key, error=str(exc))
+        return None
+    return meta
+
+
+# ── GET /clones ───────────────────────────────────────────────────────────────
+
+
+def _list_clones() -> list[dict]:
+    """Every stored clone, newest first.
+
+    A clone is a ``voice_clones/<id>/prompt.pt``; its ``meta.json`` supplies the
+    listing entry when there is one. Clones made before Qwen wrote a
+    ``meta.json`` are listed from the prompt alone, with its upload time."""
+    client = _get_s3_client()
+    prompts: dict[str, Optional[float]] = {}
+    with_meta: set[str] = set()
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix="voice_clones/"):
+        for obj in page.get("Contents", []):
+            parts = obj["Key"].split("/")
+            if len(parts) != 3 or not _COMPANION_ID_RE.fullmatch(parts[1]):
+                continue
+            if parts[2] == "prompt.pt":
+                modified = obj.get("LastModified")
+                prompts[parts[1]] = modified.timestamp() if hasattr(modified, "timestamp") else None
+            elif parts[2] == "meta.json":
+                with_meta.add(parts[1])
+
+    clones: list[dict] = []
+    for companion_id, modified in prompts.items():
+        meta = _read_meta(client, companion_id) if companion_id in with_meta else None
+        if meta is None:
+            meta = _default_meta(companion_id, modified)
+        else:
+            meta.setdefault("voice_clone_id", _clone_key(companion_id))
+            meta.setdefault("companion_id", companion_id)
+            meta.setdefault("engine", _ENGINE)
+        clones.append(meta)
+
+    def _created(c: dict) -> float:
+        # One type for the sort key: a string or missing created_at sorts last.
+        value = c.get("created_at")
+        return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
+
+    clones.sort(key=_created, reverse=True)
+    return clones
+
+
+@app.get("/clones")
+async def list_clones():
+    """List stored voice clones (id, name, duration), newest first."""
+    try:
+        clones = await asyncio.to_thread(_list_clones)
+    except Exception as exc:
+        request_id = uuid.uuid4().hex[:12]
+        logger.error("clone_list_error", request_id=request_id, error=str(exc))
+        return JSONResponse(status_code=500, content={"error": "Failed to list clones", "request_id": request_id})
+    return {"clones": clones}
+
+
+# ── GET /clones/{companion_id}/download ───────────────────────────────────────
+
+
+def _build_clone_zip(companion_id: str) -> bytes:
+    """Bundle a clone's ``prompt.pt`` and ``meta.json`` into a zip. A clone stored
+    without a ``meta.json`` gets a generated one, so the archive names its engine."""
+    import zipfile
+
+    from botocore.exceptions import ClientError
+
+    client = _get_s3_client()
+    prompt_buf = io.BytesIO()
+    try:
+        client.download_fileobj(S3_BUCKET_NAME, _clone_key(companion_id), prompt_buf)
+    except ClientError as exc:
+        raise FileNotFoundError(f"Voice clone not found: {companion_id}") from exc
+
+    meta = _read_meta(client, companion_id) or _default_meta(companion_id)
+    meta.setdefault("engine", _ENGINE)
+
+    zip_buf = io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("prompt.pt", prompt_buf.getvalue())
+        zf.writestr("meta.json", json.dumps(meta))
+    return zip_buf.getvalue()
+
+
+@app.get("/clones/{companion_id}/download")
+async def download_clone(companion_id: str):
+    """Download a clone's prompt and metadata as ``<companion_id>.zip``."""
+    if not _COMPANION_ID_RE.fullmatch(companion_id):
+        return JSONResponse(status_code=422, content={"error": _COMPANION_ID_ERROR})
+    try:
+        data = await asyncio.to_thread(_build_clone_zip, companion_id)
+    except FileNotFoundError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    except Exception as exc:
+        request_id = uuid.uuid4().hex[:12]
+        logger.error("clone_download_error", request_id=request_id, companion_id=companion_id, error=str(exc))
+        return JSONResponse(status_code=500, content={"error": "Failed to bundle clone", "request_id": request_id})
+
+    headers = {"Content-Disposition": f'attachment; filename="{companion_id}.zip"'}
+    return Response(content=data, media_type="application/zip", headers=headers)
+
+
+# ── DELETE /clones/{companion_id} ─────────────────────────────────────────────
+
+
+def _delete_clone(companion_id: str) -> int:
+    """Delete every S3 object under ``voice_clones/{companion_id}/``.
+
+    Returns the number of objects removed and evicts the clone's cached prompt.
+    Raises ``FileNotFoundError`` when nothing exists under the prefix, and
+    ``RuntimeError`` when S3 refuses some of the objects.
+    """
+    client = _get_s3_client()
+    prefix = f"voice_clones/{companion_id}/"
+    keys: list[dict] = []
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET_NAME, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            keys.append({"Key": obj["Key"]})
+
+    if not keys:
+        raise FileNotFoundError(f"Voice clone not found: {companion_id}")
+
+    deleted = 0
+    failed: list[str] = []
+    try:
+        for i in range(0, len(keys), 1000):  # S3 delete_objects caps at 1000/call
+            batch = keys[i : i + 1000]
+            # A per-key failure is not an exception: it comes back in "Errors".
+            resp = client.delete_objects(Bucket=S3_BUCKET_NAME, Delete={"Objects": batch}) or {}
+            deleted += len(resp.get("Deleted") or [])
+            failed += [f"{e.get('Key')}: {e.get('Code')}" for e in resp.get("Errors") or []]
+    finally:
+        with _clone_cache_lock:
+            _clone_cache.pop(_clone_key(companion_id), None)
+    if failed:
+        logger.error("clone_delete_partial", companion_id=companion_id, deleted=deleted, failed=failed)
+        raise RuntimeError(f"{len(failed)} of {len(keys)} objects were not deleted ({'; '.join(failed[:5])})")
+    return deleted
+
+
+@app.delete("/clones/{companion_id}")
+async def delete_clone(companion_id: str):
+    """Permanently delete a stored voice clone (``prompt.pt`` + ``meta.json``).
+    A partial delete (some objects refused by S3) is a 500, never ``deleted``."""
+    if not _COMPANION_ID_RE.fullmatch(companion_id):
+        return JSONResponse(status_code=422, content={"error": _COMPANION_ID_ERROR})
+    try:
+        async with _clone_lock(companion_id):
+            objects = await asyncio.to_thread(_delete_clone, companion_id)
+    except FileNotFoundError as exc:
+        return JSONResponse(status_code=404, content={"error": str(exc)})
+    except Exception as exc:
+        request_id = uuid.uuid4().hex[:12]
+        logger.error("clone_delete_error", request_id=request_id, companion_id=companion_id, error=str(exc))
+        return JSONResponse(status_code=500, content={"error": "Failed to delete clone", "request_id": request_id})
+    logger.info("voice_deleted", companion_id=companion_id, objects=objects)
+    return {"status": "deleted", "companion_id": companion_id, "objects": objects}
+
+
+# ── POST /clones/import ───────────────────────────────────────────────────────
+
+
+def _slug_id(value: str) -> str:
+    """A valid companion id (``_COMPANION_ID_RE``) from free text."""
+    s = (value or "").strip().lower()
+    out = "".join(ch if ch.isascii() and ch.isalnum() else "-" for ch in s).strip("-")
+    while "--" in out:
+        out = out.replace("--", "-")
+    return out[:64].strip("-") or f"imported-{int(time.time())}"
+
+
+_MAX_ARCHIVE_ENTRIES = 16
+# The upload itself: a prompt.pt at its cap plus a little for meta.json and zip overhead.
+_MAX_ARCHIVE_BYTES = _MAX_PROMPT_BYTES + 1024 * 1024
+
+
+class CloneExistsError(Exception):
+    """The import's target companion_id already has a clone (and replace was not set)."""
+
+
+def _read_member(z, name: str, limit: int) -> bytes:
+    """Read one archive member, refusing it past ``limit`` bytes by its declared
+    size and by what decompression actually yields (a header can lie)."""
+    if z.getinfo(name).file_size > limit:
+        raise ValueError(f"{name} is unexpectedly large")
+    with z.open(name) as f:
+        data = f.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"{name} is unexpectedly large")
+    return data
+
+
+def _parse_clone_archive(zip_bytes: bytes, companion_override: str, name_override: str) -> tuple[str, list, dict]:
+    """Validate a clone archive: ``(companion_id, prompt items, source meta)``.
+
+    Only a Qwen clone is accepted. A ``meta.json`` that names another engine is
+    refused, and ``prompt.pt`` must load (``weights_only``, tensors and Qwen's
+    ``VoiceClonePromptItem`` only) as one valid prompt item: a Miso or XTTS
+    ``prompt.pt`` is a dict of other tensors and fails that check. Raises ``ValueError``.
+    """
+    import zipfile
+
+    try:
+        z = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"Not a valid zip archive: {exc}") from exc
+
+    names = z.namelist()
+    if len(names) > _MAX_ARCHIVE_ENTRIES:
+        raise ValueError(f"Archive has more than {_MAX_ARCHIVE_ENTRIES} entries")
+
+    src_meta: dict = {}
+    meta_name = next((n for n in names if n.rsplit("/", 1)[-1] == "meta.json"), None)
+    if meta_name:
+        meta_raw = _read_member(z, meta_name, _MAX_META_BYTES)  # oversized: ValueError → 422
+        try:
+            src_meta = json.loads(meta_raw.decode("utf-8"))
+        except ValueError:
+            src_meta = {}
+        if not isinstance(src_meta, dict):
+            src_meta = {}
+    engine = src_meta.get("engine")
+    if isinstance(engine, str) and engine.strip().lower() not in ("", _ENGINE, "qwen"):
+        raise ValueError(f"Archive is a {engine!r} clone; this engine only imports Qwen clones")
+
+    prompt_name = next((n for n in names if n.rsplit("/", 1)[-1] == "prompt.pt"), None)
+    if not prompt_name:
+        raise ValueError("Archive does not contain prompt.pt")
+    items = _load_prompt(_read_member(z, prompt_name, _MAX_PROMPT_BYTES))
+
+    def _text(value) -> str:
+        return value.strip() if isinstance(value, str) else ""
+
+    companion_id = _text(companion_override) or _text(src_meta.get("companion_id"))
+    companion_id = _slug_id(companion_id or _text(name_override) or _text(src_meta.get("name")) or "imported-voice")
+    if not _COMPANION_ID_RE.fullmatch(companion_id):  # _slug_id guarantees it; belt and braces
+        raise ValueError(_COMPANION_ID_ERROR)
+    return companion_id, items, src_meta
+
+
+def _store_imported_clone(companion_id: str, items: list, src_meta: dict, name_override: str, replace: bool) -> dict:
+    """Store a validated import. ``CloneExistsError`` if the id is taken and not ``replace``.
+    The caller holds the id's clone lock."""
+    import torch
+
+    s3_key = _clone_key(companion_id)
+    if not replace and _s3_object_exists(s3_key):
+        raise CloneExistsError(f"Voice clone {companion_id!r} already exists; send replace=true to overwrite")
+
+    # Re-serialised from the validated items, so whatever else the uploaded
+    # pickle held is not what gets stored.
+    buf = io.BytesIO()
+    torch.save(items, buf)
+    _upload_to_s3(buf.getvalue(), s3_key, "application/octet-stream")
+
+    def _number(value, default):
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else default
+
+    src_name = src_meta.get("name")
+    name = (name_override or "").strip() or (src_name.strip()[:200] if isinstance(src_name, str) else "") or companion_id
+    meta = {
+        "voice_clone_id": s3_key,
+        "companion_id": companion_id,
+        "name": name,
+        "num_clips": _number(src_meta.get("num_clips"), 1),
+        "total_seconds": _number(src_meta.get("total_seconds"), 0),
+        "has_transcript": bool(items[0].icl_mode),
+        "engine": _ENGINE,
+        "imported": True,
+        "created_at": time.time(),
+    }
+    _put_meta(companion_id, meta)
+
+    with _clone_cache_lock:
+        _clone_cache[s3_key] = items
+        if len(_clone_cache) > _CLONE_CACHE_MAX:
+            _clone_cache.popitem(last=False)
+
+    logger.info("voice_imported", companion_id=companion_id, s3_key=s3_key)
+    return {**meta, "duration": meta["total_seconds"]}
+
+
+@app.post("/clones/import")
+async def import_clone(
+    archive: UploadFile = File(...),
+    voice_name: str = Form(""),
+    companion_id: str = Form(""),
+    replace: bool = Form(False),
+):
+    """Import a Qwen clone archive (the ``/clones/{id}/download`` zip).
+
+    422 for a bad zip or anything but a valid Qwen ``prompt.pt`` (another
+    engine's clone included); 409 when the target id already has a clone,
+    unless ``replace`` is true; 413 for an archive over ``_MAX_ARCHIVE_BYTES``."""
+    try:
+        data = await read_upload(archive, _MAX_ARCHIVE_BYTES, what="clone archive")
+    except (TooLarge, BadInput) as exc:
+        return _upload_refused(exc)
+    try:
+        target, items, src_meta = await asyncio.to_thread(_parse_clone_archive, data, companion_id, voice_name)
+        async with _clone_lock(target):
+            return await asyncio.to_thread(_store_imported_clone, target, items, src_meta, voice_name, replace)
+    except CloneExistsError as exc:
+        return JSONResponse(status_code=409, content={"error": str(exc)})
+    except ValueError as exc:
+        return JSONResponse(status_code=422, content={"error": str(exc)})
+    except Exception as exc:
+        request_id = uuid.uuid4().hex[:12]
+        logger.error("clone_import_error", request_id=request_id, error=str(exc))
+        return JSONResponse(status_code=500, content={"error": "Failed to import voice", "request_id": request_id})
+
+
+# ── POST /analyze-clips ───────────────────────────────────────────────────────
+# Scores candidate reference clips so a client can pick the one to clone from
+# (Qwen's /clone-voice takes one clip). The quality half is engine-independent:
+# clipping, usable speech length and SNR from an energy gate (numpy, no VAD
+# model). The consistency half compares Qwen's own speaker embeddings (the
+# x-vector create_voice_clone_prompt computes), so a clip of another voice, room
+# or microphone stands out.
+
+# Speech this long or longer counts fully towards a clip's anchor rank. Reported
+# as ``gpt_cond_len`` for clients written against the XTTS response.
+_ANALYZE_REF_SECONDS = 15.0
+# Only this much of each clip goes to the speaker encoder.
+_ANALYZE_EMBED_SECONDS = 30.0
+_FRAME_S = 0.03
+
+
+def _clamp01(x: float) -> float:
+    return max(0.0, min(1.0, x))
+
+
+def _decode_clip(data: bytes):
+    """``(mono float32 samples, sample_rate)`` of an uploaded clip (anything libsndfile reads)."""
+    import numpy as np
+    import soundfile as sf
+
+    wav, sr = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+    return np.ascontiguousarray(wav.mean(axis=1), dtype=np.float32), int(sr)
+
+
+def _quick_clip_metrics(wav, sr: int) -> dict:
+    """Clipping, peak, usable speech seconds and SNR of one clip.
+
+    Speech is found with an energy gate on 30 ms frames: a frame is speech when
+    it is 10 dB over the clip's noise floor (its 10th-percentile frame) and
+    within 35 dB of its loud frames (95th percentile). SNR compares the speech
+    frames with the frames near the floor, when there is 0.2 s of those. A clip
+    with no clear floor (no pauses) counts as all speech, with no SNR."""
+    import numpy as np
+
+    m: dict = {"flags": []}
+    n = int(wav.shape[0])
+    mag = np.abs(wav)
+    m["raw_seconds"] = round(n / sr, 2) if sr else 0.0
+    m["peak"] = round(float(mag.max()) if n else 0.0, 3)
+    m["clip_ratio"] = round(float((mag > 0.99).mean()) if n else 0.0, 4)
+    m["speech_seconds"] = 0.0
+    m["snr_db"] = None
+    m["noise_floor_dbfs"] = None
+
+    frame = max(1, int(sr * _FRAME_S))
+    if n < frame:
+        m["flags"].append("vad_no_speech")
+        return m
+    frames = wav[: (n // frame) * frame].astype(np.float64).reshape(-1, frame)
+    power = np.mean(frames**2, axis=1)
+    db = 10.0 * np.log10(power + 1e-12)
+    floor_db, loud_db = float(np.percentile(db, 10)), float(np.percentile(db, 95))
+
+    if loud_db < -55.0:  # nothing above a whisper of noise
+        m["flags"].append("vad_no_speech")
+        return m
+    if loud_db - floor_db < 10.0:  # no pauses to measure a floor from
+        m["speech_seconds"] = m["raw_seconds"]
+        return m
+
+    speech = db > max(floor_db + 10.0, loud_db - 35.0)
+    noise = db <= floor_db + 3.0
+    m["speech_seconds"] = round(float(speech.sum()) * frame / sr, 2)
+    noise_power = float(power[noise].mean()) if noise.sum() * frame >= 0.2 * sr else None
+    if noise_power is not None:
+        m["noise_floor_dbfs"] = round(10.0 * math.log10(noise_power + 1e-12), 1)
+        m["snr_db"] = round(10.0 * math.log10((float(power[speech].mean()) + 1e-12) / (noise_power + 1e-12)), 1)
+    return m
+
+
+def _unit_vector(embedding):
+    """A speaker embedding (torch tensor or array) as a unit-length float64 numpy vector."""
+    import numpy as np
+
+    if hasattr(embedding, "detach"):
+        embedding = embedding.detach().float().cpu().numpy()
+    v = np.asarray(embedding, dtype=np.float64).reshape(-1)
+    return v / (np.linalg.norm(v) + 1e-9)
+
+
+def _score_clips(items: list[dict]) -> None:
+    """Score each clip (0–100), set ``recommended``, flags and the ``_anchor`` sort key.
+
+    The same scoring as the XTTS engine. A clip that couldn't be read scores 0, is
+    never recommended and sorts last. A clip without a speaker embedding has no
+    consistency evidence, so it gets none (0) rather than a neutral half."""
+    for item in items:
+        if any(f.startswith("unreadable") for f in item["flags"]):
+            item["consistency"] = None
+            item["score"] = 0
+            item["_anchor"] = -1.0
+            item["recommended"] = False
+            item["flags"] = sorted(set(item["flags"]))
+            continue
+        snr = item.get("snr_db")
+        q_snr = _clamp01((snr - 10.0) / 25.0) if snr is not None else 0.7
+        speech = item.get("speech_seconds") or 0.0
+        q_dur = _clamp01(speech / 6.0)
+        q_clip = 1.0 - _clamp01((item.get("clip_ratio") or 0.0) / 0.02)
+        quality = 0.4 * q_snr + 0.35 * q_dur + 0.25 * q_clip
+
+        cons = item.get("consistency")
+        cons_norm = _clamp01((cons - 0.5) / 0.45) if cons is not None else 0.0
+
+        score = round((0.65 * quality + 0.35 * cons_norm) * 100)
+        item["score"] = score
+        item["_anchor"] = 0.45 * quality + 0.3 * cons_norm + 0.25 * _clamp01(speech / _ANALYZE_REF_SECONDS)
+
+        if (item.get("clip_ratio") or 0.0) > 0.01:
+            item["flags"].append("clipping")
+        if snr is not None and snr < 15:
+            item["flags"].append("noisy")
+        if speech and speech < 3.0:  # /clone-voice refuses under 3 s
+            item["flags"].append("very_short")
+        if cons_norm < 0.3:
+            item["flags"].append("outlier")
+        item["recommended"] = score >= ANALYZE_SCORE_THRESHOLD
+        item["flags"] = sorted(set(item["flags"]))
+
+
+def _analyze_clips(blobs: list[bytes], names: list[str], base) -> dict:
+    """Score each candidate clip and rank them, best first. Blocking; the
+    caller holds a model lease (the speaker embeddings run on the Base model)."""
+    import numpy as np
+
+    items: list[dict] = []
+    embeddings: list = []
+    for data, name in zip(blobs, names):
+        item: dict = {"name": name, "flags": []}
+        try:
+            wav, sr = _decode_clip(data)
+            item.update(_quick_clip_metrics(wav, sr))
+        except Exception as exc:
+            item["flags"].append(f"unreadable:{str(exc)[:200]}")
+            items.append(item)
+            embeddings.append(None)
+            continue
+
+        emb = None
+        if item["speech_seconds"] > 0:
+            try:
+                prompt = base.create_voice_clone_prompt(
+                    (wav[: int(_ANALYZE_EMBED_SECONDS * sr)], sr), x_vector_only_mode=True
+                )
+                emb = _unit_vector(prompt[0].ref_spk_embedding)
+            except RuntimeError as exc:
+                err = str(exc).lower()
+                if "out of memory" in err or "cuda" in err:
+                    raise  # the route answers 503
+                item["flags"].append(f"embed_failed:{str(exc)[:200]}")
+            except Exception as exc:
+                item["flags"].append(f"embed_failed:{str(exc)[:200]}")
+        embeddings.append(emb)
+        items.append(item)
+
+    # Consistency: cosine similarity of each embedding to the centroid.
+    valid = [e for e in embeddings if e is not None]
+    centroid = None
+    if valid:
+        centroid = np.mean(valid, axis=0)
+        centroid = centroid / (np.linalg.norm(centroid) + 1e-9)
+    for item, emb in zip(items, embeddings):
+        item["consistency"] = (
+            round(float(np.dot(emb, centroid)), 3) if (emb is not None and centroid is not None) else None
+        )
+
+    _score_clips(items)
+
+    order = sorted(range(len(items)), key=lambda i: items[i]["_anchor"], reverse=True)
+    for rank, idx in enumerate(order):
+        items[idx]["rank"] = rank
+    for item in items:
+        item.pop("_anchor", None)
+
+    return {
+        "clips": items,
+        "order": order,
+        "threshold": ANALYZE_SCORE_THRESHOLD,
+        "gpt_cond_len": _ANALYZE_REF_SECONDS,
+        "engine": _ENGINE,
+    }
+
+
+@app.post("/analyze-clips")
+async def analyze_clips(audio: list[UploadFile] = File(...)):
+    """Score candidate reference clips and rank them, best first (no clone made).
+
+    At most ``TTS_MAX_CLIPS`` clips of ``TTS_CLIP_MAX_BYTES`` each (413), read
+    through argus-cortex's ``read_upload``. Needs the Base model (503 without it)."""
+    if _mgr.state == TTSState.LOADING:
+        return JSONResponse(status_code=503, content={"error": "Models still loading"})
+
+    clips = audio if isinstance(audio, list) else [audio]
+    if not clips:
+        return JSONResponse(status_code=422, content={"error": "No clips provided"})
+    if len(clips) > MAX_CLIPS:
+        return JSONResponse(status_code=413, content={"error": f"At most {MAX_CLIPS} clips per request"})
+
+    blobs: list[bytes] = []
+    for i, clip in enumerate(clips):
+        try:
+            blobs.append(await read_upload(clip, CLIP_MAX_BYTES, what=clip.filename or f"clip {i + 1}"))
+        except (TooLarge, BadInput) as exc:
+            return _upload_refused(exc)
+    names = [clip.filename or f"clip-{i + 1}" for i, clip in enumerate(clips)]
+
+    async with _mgr.use():
+        base = _mgr.base_model
+        if base is None:
+            return JSONResponse(status_code=503, content={"error": "Base model not loaded (TTS_LOAD_MODELS=custom_voice)"})
+        try:
+            return await asyncio.to_thread(_analyze_clips, blobs, names, base)
+        except RuntimeError as exc:
+            err = str(exc).lower()
+            if "out of memory" in err or "cuda" in err:
+                gpu_info = _gpu_memory_info()
+                logger.error("tts_analyze_gpu_oom", error=str(exc), gpu=gpu_info)
+                return JSONResponse(status_code=503, content={"error": "GPU OOM", "gpu": gpu_info})
+            raise
 
 
 # ── GET /speakers ─────────────────────────────────────────────────────────────
@@ -1205,7 +1902,7 @@ async def health():
     gpu_info = _resident_gpu()
     return {
         "status": "ok",
-        "engine": "qwen-tts",
+        "engine": _ENGINE,
         "model": MODEL_SIZE,
         "model_size": MODEL_SIZE,
         "device": DEVICE,

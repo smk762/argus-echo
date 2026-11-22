@@ -368,7 +368,7 @@ class CloneVoiceTests(unittest.TestCase):
         leased.assert_not_called()
 
     def test_new_or_replace_proceeds(self):
-        async def fake_leased(audio, reference_text, companion_id, s3_key):
+        async def fake_leased(audio, reference_text, companion_id, s3_key, voice_name=""):
             return {"voice_clone_id": s3_key}
 
         tts_server._mgr._state = TTSState.GPU
@@ -393,7 +393,7 @@ class CloneVoiceTests(unittest.TestCase):
         def exists(key):
             return key in stored
 
-        async def fake_leased(audio, reference_text, companion_id, s3_key):
+        async def fake_leased(audio, reference_text, companion_id, s3_key, voice_name=""):
             await asyncio.sleep(0.05)  # "compute latents"
             stored.add(s3_key)
             return {"voice_clone_id": s3_key}
