@@ -9,7 +9,12 @@ running engine against the capabilities its `/health` names.
 Per-engine detail: [Miso](miso-api.md) (the most complete reference; most of it holds for every engine),
 [XTTS-v2](xtts.md), [Qwen3-TTS](qwen.md).
 
-## Routes
+## Text to speech
+
+The `tts` contract, served by **Miso**, **XTTS-v2** and **Qwen3-TTS** (each advertises `capabilities: ["tts"]`).
+Its Python statement is [src/argus_echo/contract/tts.py](../src/argus_echo/contract/tts.py).
+
+### Routes
 
 | Method | Path | Miso | XTTS-v2 | Qwen3-TTS |
 | --- | --- | --- | --- | --- |
@@ -29,7 +34,7 @@ Per-engine detail: [Miso](miso-api.md) (the most complete reference; most of it 
 Every engine listens on `8031` inside its container. [compose.yaml](../compose.yaml) publishes Miso on `8140`,
 XTTS on `8141`, Qwen on `8142` and Whisper (speech to text) on `8144`.
 
-## Synthesis
+### Synthesis
 
 `POST /synthesise` and `POST /synthesise/stream` take the same JSON body:
 
@@ -66,7 +71,7 @@ disconnects, XTTS stops at the next chunk and Qwen starts no further sentence (t
 
 Busy, loading and out-of-memory answers are `503`, with `Retry-After` where the engine knows a good wait.
 
-## Voices
+### Voices
 
 Built-in speakers (`GET /speakers` → `{"speakers": [{"id", "name", "language", "languages"}]}`):
 
@@ -89,8 +94,9 @@ own bucket. `POST /clones/import` answers `409` when the target id already has a
 ## Health and lifecycle
 
 `GET /health` is argus-cortex's `ResidentHealth`, which argus-iris reads: top-level `model_state` (`unloaded`,
-`loading`, `cpu`, `gpu`, `error`), `busy`, `idle_s`, and a `gpu` memory block, plus `engine`, `model` and
-`device`. It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
+`loading`, `cpu`, `gpu`, `error`), `busy`, `idle_s`, and a `gpu` memory block, plus `engine`, `model`,
+`device` and `capabilities` (the contracts the engine serves: `["tts"]` or `["stt"]`; `argus-echo check` runs
+only those suites, and treats an engine that names none as `tts`). It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
 `"status": "gpu_error"` after a CUDA error that is not an out-of-memory: such an error breaks the process's GPU
 context, so the worker needs a restart. (An out-of-memory is a `503 GPU OOM` on the request and can be retried.)
 
@@ -119,7 +125,9 @@ Each engine loads its model on first use and leaves the GPU after an idle period
 The `stt` contract, served by the **whisper** engine (published on `8144`). Its Python statement is
 [src/argus_echo/contract/stt.py](../src/argus_echo/contract/stt.py). An engine names what it serves in
 `GET /health` as `capabilities` (`["stt"]` here); an engine that names nothing is a TTS engine, and
-`argus-echo check` runs only the matching checks. Model choice and settings: [whisper.md](whisper.md).
+`argus-echo check` runs only the matching checks. Model choice and settings: [whisper.md](whisper.md). A Wyoming
+client (Home Assistant) reaches it through the `wyoming-whisper` bridge, which posts each utterance to
+`/transcribe` ([voice-cloning.md#home-assistant](voice-cloning.md#home-assistant)).
 
 | Method | Path | Notes |
 | --- | --- | --- |

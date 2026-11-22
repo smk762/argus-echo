@@ -77,3 +77,9 @@ use the first index in `order`). The response has the XTTS shape (`clips`, `orde
 Storage is S3 only: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` (compose:
 `QWEN_S3_BUCKET`, default `voice-qwen`) and `S3_PUBLIC_URL` (compose: `QWEN_S3_PUBLIC_URL`). The bucket must exist.
 `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` have no default: the server refuses to start without both.
+
+## Home Assistant
+
+`--profile wyoming-qwen` puts Qwen behind the Wyoming TTS bridge on `10242`. Qwen renders the whole clip before
+sending any of it, so the first audio arrives only when the utterance is done. Details:
+[voice-cloning.md#home-assistant](voice-cloning.md#home-assistant).

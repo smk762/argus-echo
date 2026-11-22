@@ -1807,6 +1807,7 @@ async def health():
     body = {
         "status": "ok",
         "engine": "xtts-v2",
+        "capabilities": ["tts"],  # the echo contracts this engine serves (docs/api.md)
         "model": XTTS_MODEL,
         "device": DEVICE,
         "model_state": _mgr.state.value,

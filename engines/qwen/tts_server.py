@@ -1903,6 +1903,7 @@ async def health():
     return {
         "status": "ok",
         "engine": _ENGINE,
+        "capabilities": ["tts"],  # the echo contracts this engine serves (docs/api.md)
         "model": MODEL_SIZE,
         "model_size": MODEL_SIZE,
         "device": DEVICE,

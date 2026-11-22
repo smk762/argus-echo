@@ -76,3 +76,9 @@ and transcriptions run one at a time, so the footprint stays at the working set 
 | `STT_VAD_THRESHOLD` | `0.5` | Silero speech probability |
 
 compose maps `WHISPER_*` onto these (see `.env.example`).
+
+## Home Assistant
+
+`--profile wyoming-whisper` runs a Wyoming ASR bridge on `10243` that forwards each utterance to `POST /transcribe`,
+so Home Assistant's voice pipeline can use this engine for speech to text. Settings and behaviour:
+[voice-cloning.md#home-assistant](voice-cloning.md#home-assistant).
