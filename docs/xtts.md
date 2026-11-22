@@ -30,6 +30,8 @@ non-commercial use only. The image bakes them in and accepts that licence at bui
 | `XTTS_MAX_CLIPS` | `16` | Most clips per `/clone-voice` or `/analyze-clips`; more is `413` |
 | `XTTS_CLIP_MAX_BYTES` | `16777216` | Largest clip (16 MiB); larger is `413` |
 | `XTTS_ANALYZE_THRESHOLD` | `60` | `/analyze-clips` score below which a clip is left out by default |
+| `XTTS_CHECKPOINT_ROOT` | empty | Directory of fine-tuned checkpoints `POST /admin/load` may load; empty, the route answers `503`. Compose sets `/checkpoints` and mounts the host's `XTTS_CHECKPOINT_ROOT` (default `./checkpoints/xtts`) there read-only. See [below](#fine-tuned-checkpoints) |
+| `ECHO_VERSION`, `ECHO_REVISION` | empty | The release and git commit, set at image build time (build args); `/health` reports them as `image` |
 | `ARGUS_ADMIN_TOKEN`, `ARGUS_ADMIN_INSECURE` | empty | See [api.md#security](api.md#security) |
 
 Reference-clip preprocessing, applied to each clip before the latents are computed:
@@ -70,3 +72,25 @@ unloads the model while a lease is held.
 
 `/synthesise` returns `device` and `/synthesise/stream` sends `X-XTTS-Device`, each `cpu` or `XTTS_DEVICE`, so a
 client can tell a CPU run (several times slower) from a GPU one. `/health`'s `model_state` says the same.
+
+## Fine-tuned checkpoints
+
+`POST /admin/load {"checkpoint": "<name>"}` replaces the stock XTTS-v2 weights with a fine-tune from
+`XTTS_CHECKPOINT_ROOT/<name>`; `/admin/unload` goes back to stock. Statuses, what happens to requests meanwhile,
+and how long a checkpoint stays selected: [api.md](api.md#fine-tuned-checkpoints).
+
+A checkpoint directory holds what `Xtts.load_checkpoint` reads:
+
+| File | Required | What |
+| --- | --- | --- |
+| `config.json` | yes | The fine-tune's `XttsConfig` (its `"model"` must be `"xtts"`) |
+| `model.pth` | yes | The weights. Coqui's GPT trainer writes `best_model.pth` / `checkpoint_<step>.pth`: copy or symlink the one you want to `model.pth` (a symlink must stay inside the root). Its `xtts.`-prefixed keys and trainer-only modules are handled by the loader |
+| `vocab.json` | yes | The tokenizer, copied from the base model the fine-tune started from (the trainer's `tokenizer_file` would point at a path on the training machine) |
+| `speakers_xtts.pth` | no | Built-in speakers. Without it the checkpoint has none, so a request needs a `voice_clone_id` |
+
+Other files (training logs, other `checkpoint_*.pth`) are ignored and not hashed. The root is mounted read-only, so
+a legacy `model.pth` that pickles its `XttsConfig` object (coqui rewrites such a file in place on load) fails: load it once somewhere writable first.
+
+`/health` `weights.files` lists the sha256 of `config.json`, `model.pth`, `vocab.json` and `speakers_xtts.pth` (when
+present) as the load read them. The stock model is hashed the same way on its first load (about 1.8 GB, a few
+seconds once per process).

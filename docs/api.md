@@ -29,6 +29,7 @@ Its Python statement is [src/argus_echo/contract/tts.py](../src/argus_echo/contr
 | GET | `/speakers` | yes | yes | yes |
 | GET | `/health` | yes | yes | yes |
 | POST | `/admin/{evict,unload,wake}` | yes | yes | yes |
+| POST | `/admin/load` | no | yes | yes |
 | GET | `/media/{key}` | local backend only | no | no |
 
 Every engine listens on `8031` inside its container. [compose.yaml](../compose.yaml) publishes Miso on `8140`,
@@ -49,13 +50,14 @@ XTTS on `8141`, Qwen on `8142` and Whisper (speech to text) on `8144`.
 | `emotion` | string | `"neutral"` | Qwen only. Ignored elsewhere |
 | `speed` | number | `null` | XTTS only: speaking-rate multiplier passed to inference (`1.0` when unset or not positive). Miso and Qwen accept it and ignore it |
 | `device` | `"cpu"` | `null` | XTTS only: run without promoting the model to the GPU (a client sends it when argus-iris refuses its GPU lease); any other value is `422`. A model already on the GPU runs there. Miso and Qwen accept it and ignore it. See [xtts.md](xtts.md#gpu-memory-and-cpu-fallback) |
+| `seed` | integer | `null` | Every engine: seeds python's, numpy's and torch's (CPU and every CUDA device) RNGs for this request, `0` to `4294967295` (anything else is `422`). What it makes reproducible differs by engine and route: see [Reproducibility](#reproducibility) |
 | `temperature`, `topk`, `context` | | | Miso only; see [miso-api.md](miso-api.md) |
 
 An engine ignores fields it has no use for instead of refusing them, so one request body works on all three. The
 exception is a `language` the engine cannot speak: Miso refuses it rather than mispronounce it.
 
-`/synthesise` stores a WAV and returns `{"audio_url", "duration", "duration_seconds", "format"}`. XTTS adds
-`device`: where it ran (`cpu` or its `XTTS_DEVICE`).
+`/synthesise` stores a WAV and returns `{"audio_url", "duration", "duration_seconds", "format", "seed"}` (`seed`
+echoes the request's, or `null`). XTTS adds `device`: where it ran (`cpu` or its `XTTS_DEVICE`).
 
 `/synthesise/stream` answers `200` with `Content-Type: application/octet-stream` and the PCM layout in headers:
 
@@ -78,12 +80,51 @@ Busy, loading and out-of-memory answers are `503`, with `Retry-After` where the 
 answers a model it cannot move onto the GPU with `503`, the reason in `error` and `Retry-After:
 $XTTS_OOM_RETRY_AFTER_S`, unless `XTTS_CPU_FALLBACK` (the default) runs the request on the CPU instead.
 
+### Reproducibility
+
+`seed` is applied at the start of each generation, in the thread that generates: python's `random`, numpy's global
+RNG and `torch.manual_seed` (the CPU generator and every CUDA device's). Every engine samples from torch's
+process-wide RNG, so no other generation may draw from it in between. Miso generates one request at a time anyway
+(its GPU lock). XTTS and Qwen let unseeded requests generate side by side, as before; a seeded generation waits
+for those, runs alone, and holds new ones back until it ends. A seeded XTTS stream therefore blocks every other
+XTTS generation for as long as it runs, including while a slow client holds it back (up to the 300 s stall
+timeout).
+
+Same seed means same audio only when everything else is the same too:
+
+- the text, `language`, voice (`voice_clone_id` or `speaker`; Qwen's `voice_description`, `instruction`,
+  `emotion`; Miso's `temperature`, `topk`, `context`) and XTTS's `speed`;
+- the weights: compare `/health` `weights` (file hashes), since `/admin/load` can change them;
+- the engine's sampling settings (`XTTS_TEMPERATURE`, `XTTS_STREAM_CHUNK_SIZE`, `TTS_MAX_NEW_TOKENS`, ...);
+- the device: a CPU run and a GPU run draw different random numbers and compute in different precision. **XTTS can
+  run a request on the CPU** (`device: "cpu"`, or the CPU fallback when the GPU has no room), so check `device` in
+  the response (`X-XTTS-Device` on a stream) and compare only runs on the same one. Qwen and Miso always generate
+  on their configured device;
+- the image (torch, CUDA and driver versions) and the GPU model: `/health` `image` names the release.
+
+With all of that fixed, the table says what to expect. None of it has been measured on a GPU yet (the tests fake
+the model): verify a claim you rely on by hashing the audio of two runs.
+
+| Engine | `/synthesise`, same seed twice | `/synthesise/stream`, same seed twice | Stream vs `/synthesise` |
+| --- | --- | --- | --- |
+| Miso | Expected identical | Expected identical | Different audio: the stream decodes incrementally and is not watermarked; `/synthesise` decodes once and watermarks |
+| XTTS-v2 | Expected identical (one seed; the text's sentences sample in order) | Expected identical if `XTTS_STREAM_CHUNK_SIZE` is the same: tokens sample in the same order, under one seed, for the whole stream | Different audio: `inference_stream` decodes chunk by chunk with a cross-fade and takes latents from the sampler, while `inference` runs a second GPT pass and decodes once |
+| Qwen3-TTS | Expected identical (one seed, one generation over the whole text) | Expected identical: sentence *i* (from 0) is generated alone with seed + *i* | Different audio for more than one sentence (each sentence is generated alone); the first sentence equals `/synthesise` of that sentence alone with the same seed |
+
+**Why "expected", not "guaranteed".** The engines run without `torch.use_deterministic_algorithms(True)` (some
+kernels have no deterministic version, and the rest cost speed), and PyTorch only promises run-to-run identical
+results on CUDA under that setting. In practice the forward-pass kernels these models use (cuBLAS matmuls, SDPA
+attention, cuDNN convolutions with `cudnn.benchmark` off) give the same bits on the same GPU for the same shapes,
+but nothing enforces it, and one flipped bit in a logit can change a sampled token, after which the rest of the
+audio differs completely, not slightly. A stream the client abandons ends early: what it sent matches the start of
+a full one.
+
 ### Voices
 
 Built-in speakers (`GET /speakers` → `{"speakers": [{"id", "name", "language", "languages"}]}`):
 
 - **Miso** has no real built-in voices: `0` and `1` are conversation turns, and without a clone the voice is
-  different every time. Clone a voice for anything you keep.
+  different every time (unless the request sends a `seed`). Clone a voice for anything you keep.
 - **XTTS-v2** has its studio speakers (`Claribel Dervla`, …).
 - **Qwen3-TTS** has the CustomVoice model's speakers, and can design a voice from `voice_description`.
 
@@ -110,20 +151,64 @@ only those suites, and treats an engine that names none as `tts`). It answers `5
 `"status": "gpu_error"` after a CUDA error that is not an out-of-memory: such an error breaks the process's GPU
 context, so the worker needs a restart. (An out-of-memory is a `503 GPU OOM` on the request and can be retried.)
 
+Two blocks identify what is running, so a client (argus-proof's run manifest) can pin it:
+
+- `image` (Miso, XTTS, Qwen): `{"version", "revision"}`, the release (`0.2.0`) and git commit the image was built
+  from, baked in as build args (`ECHO_VERSION`, `ECHO_REVISION`) by the release workflow. Both are `null` for an
+  image built without them (a local `docker compose build`). The image **digest** is not there: it only exists
+  once the image is built, and a running container cannot read it (nor the OCI labels the release sets). Take it
+  from whoever deployed the container (`docker inspect`, compose, iris), or record the tag.
+- `weights` (XTTS, Qwen): `{"checkpoint", "files"}`. `checkpoint` is the name loaded with `POST /admin/load`, or
+  `null` for the stock weights. `files` lists `{"name", "sha256", "bytes"}` for every file the last load of those
+  weights read: hashed once, in the load's worker thread, never per request (an unchanged file is not even
+  re-read on a later reload). It is `null` until those weights have been loaded. Stock weights are hashed too, so
+  either can be pinned. Qwen prefixes each name with its model slot (`base/model.safetensors`,
+  `custom_voice/speech_tokenizer/model.safetensors`, ...).
+
 Each engine loads its model on first use and leaves the GPU after an idle period (`MISO_KEEP_ALIVE_GPU`,
 `XTTS_KEEP_ALIVE_GPU`, `TTS_KEEP_ALIVE_GPU`). The admin routes move it on demand:
 
 | Route | Effect |
 | --- | --- |
 | `POST /admin/evict` | GPU to CPU RAM (stays warm) |
-| `POST /admin/unload` | Free GPU and RAM |
+| `POST /admin/unload` | Free GPU and RAM. On XTTS and Qwen it also drops a loaded checkpoint: the next load is stock |
 | `POST /admin/wake` | Load onto the GPU now |
+| `POST /admin/load` | XTTS and Qwen: replace the loaded weights with a fine-tuned checkpoint (below) |
 
 **What stays on the GPU.** Evicting or unloading moves every weight off the GPU and returns torch's allocator cache
 to the driver, so `gpu.reserved_mb` falls to about 0. What remains is the process's CUDA context, a few hundred MB
 (about 320 MB on an RTX 3090 for XTTS or Qwen) that torch can neither see nor free: only ending the process returns
 it. `gpu.cuda_context` (XTTS, Qwen) says whether the process holds one. iris measures what each process holds on its
 own, and its `restart_residual_mb` rule restarts a resident that is unloaded but still holds that much.
+
+### Fine-tuned checkpoints
+
+`POST /admin/load {"checkpoint": "<name>"}` (XTTS and Qwen; Miso has no such route) loads a fine-tuned checkpoint
+in place of the stock weights, so iris or argus-proof can swap checkpoints between runs without restarting the
+container. It needs the admin bearer like every `/admin/*` route. `<name>` is a directory under the engine's
+checkpoint root (`XTTS_CHECKPOINT_ROOT`; `TTS_CHECKPOINT_ROOT` for Qwen, which compose mounts read-only from
+`QWEN_CHECKPOINT_ROOT`), and may be nested (`forge/run-7`). `{"checkpoint": null}` loads the stock weights.
+
+The name is resolved with argus-cortex's `safe_join`, and the directory is checked before anything is unloaded:
+
+| Status | When |
+| --- | --- |
+| `200` | Loaded: `{"status": "loaded", "model_state", "weights", "gpu"}` (Qwen adds `slot`) |
+| `400` | The name escapes the root (`..`, an absolute path, a symlink out of it, a file in it that links out) |
+| `404` | No such directory |
+| `409` | Busy: a request holds the model. Nothing changes; retry when `/health` says `busy: false` |
+| `422` | Not a checkpoint this engine loads (what each needs: [xtts.md](xtts.md#fine-tuned-checkpoints), [qwen.md](qwen.md#fine-tuned-checkpoints)), or no `checkpoint` key |
+| `500` | The load itself failed. Nothing is loaded, `model_state` is `error` and the stock weights are selected, so the next request loads stock |
+| `503` | No checkpoint root is configured, or the admin token is unset |
+
+A load waits for a load or move already in progress, frees the old weights, and loads the new ones as a task that
+a disconnecting client cannot cancel half-way. Synthesis that arrives meanwhile gets `503 Model(s) still loading`.
+XTTS loads onto the CPU (the next request promotes it, as after any load); Qwen loads straight onto `TTS_DEVICE`.
+
+The checkpoint stays selected until the next `/admin/load` or `/admin/unload`: the idle eviction and unload keep
+it, so the next request reloads the same weights. `/admin/unload` (iris sends it too, to free memory) returns to
+stock. Clones are conditioning computed by whichever weights were loaded when they were made; a clone made on the
+stock weights still works with a checkpoint, but to compare checkpoints fairly clone the reference under each.
 
 ## Security
 
