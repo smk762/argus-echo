@@ -161,10 +161,14 @@ def stream_identity(headers: Mapping[str, str]) -> dict[str, str | None]:
 
 class ImageIdentity(BaseModel):
     """``GET /health``'s ``image``: the release and git revision baked into the engine image (``None`` for a local
-    build). A running container can't know its own digest; whoever deployed it can."""
+    build), and ``runtime``: the library versions that shape the output (``python``, ``torch``, ``cuda``, ``cudnn``
+    and the engine's own libraries; ``None`` for one that isn't installed). Two builds of one revision can install
+    different libraries, so reproducibility claims compare ``runtime`` too. A running container can't know its own
+    digest; whoever deployed it can."""
 
     version: str | None = None
     revision: str | None = None
+    runtime: dict[str, str | None] | None = None
 
 
 class StreamFormat(BaseModel):

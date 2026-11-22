@@ -2676,6 +2676,39 @@ async def list_speakers():
 # ── GET /health ───────────────────────────────────────────────────────────────
 
 
+
+# What shapes the audio besides the weights and the code: two builds of one revision can install different
+# libraries (#32), so /health names them. Read once (importlib.metadata, and torch for CUDA and cuDNN).
+RUNTIME_PACKAGES = ("moshi", "transformers", "torchaudio", "numpy")
+
+
+@functools.lru_cache(maxsize=1)
+def _runtime() -> dict:
+    """``/health``'s ``image.runtime``: ``{name: version or None}`` for python, torch, CUDA, cuDNN and
+    RUNTIME_PACKAGES. Blocking the first time (it imports torch): call it in a thread."""
+    import importlib.metadata
+    import platform
+
+    out: dict = {"python": platform.python_version(), "torch": None, "cuda": None, "cudnn": None}
+    torch = None
+    with contextlib.suppress(ImportError):  # no torch installed (the engines' tests): torch, cuda, cudnn stay null
+        import torch
+    if torch is not None:
+        version = getattr(torch, "__version__", None)
+        out["torch"] = str(version) if version else None
+        out["cuda"] = getattr(getattr(torch, "version", None), "cuda", None)
+        cudnn = None
+        with contextlib.suppress(Exception):  # a CPU-only build, or a stand-in torch, has no cuDNN to name
+            cudnn = torch.backends.cudnn.version()
+        out["cudnn"] = str(cudnn) if cudnn else None
+    for name in RUNTIME_PACKAGES:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
+
+
 @app.get("/health")
 async def health():
     if _mgr.state == TTSState.LOADING:
@@ -2700,8 +2733,9 @@ async def health():
         "error": _mgr.error,
         "rss_mb": _rss_mb(),
         "gpu": _gpu_memory_info(),
-        # The release and revision baked in at build time; a container can't see its own image digest.
-        "image": {"version": ECHO_VERSION, "revision": ECHO_REVISION},
+        # The release and revision baked in at build time, and the runtime libraries (_runtime); a container can't
+        # see its own image digest.
+        "image": {"version": ECHO_VERSION, "revision": ECHO_REVISION, "runtime": await asyncio.to_thread(_runtime)},
     }
     if _is_stuck(busy):
         # Held past any possible generation: fail the container healthcheck.

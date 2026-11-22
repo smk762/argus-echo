@@ -37,6 +37,7 @@ it **UNENFORCED** until something checks it. When a rule bites, add a check rath
 | An STT stream holding the model lease while it waits for audio | **UNENFORCED** (by design in `_stream`; needs a test that an idle open stream lets keep-alive evict) |
 | `gpu-tenant.yaml` that iris would refuse | CI `engines` / `gpu-tenant` job |
 | A demote to the CPU that leaves model weights or allocator cache on the GPU (qwen-tts's speech tokenizer, cuBLAS's workspace) | `engines/qwen/tests/test_gpu_residue.py`, `engines/xtts/tests/test_gpu_residue.py` (fakes; the real-GPU figures are in #22's PR) |
+| An XTTS, Qwen or Miso image install that resolves a package version at build time (every pip/uv install takes `-c` an exact-pin file: `constraints.txt`, Miso's `server-constraints.txt` beside `uv.lock`) | `tests/test_repo_rules.py::test_every_image_install_is_pinned_to_exact_versions` |
 | An engine that starts with an S3 configuration it can't use (empty or non-http endpoint, no bucket, no credentials) | `test_gpu_residue.py` `S3EndpointRefusedAtStartupTest` / `test_an_empty_or_unusable_endpoint_is_refused_at_startup` |
 
 ## Layout

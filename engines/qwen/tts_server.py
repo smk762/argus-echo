@@ -2,8 +2,9 @@
 Qwen3-TTS server — FastAPI, port 8031.
 
 argus-echo's Qwen3-TTS engine. Speaks the same HTTP contract as the Miso and
-XTTS engines, and adds voice design: built-in speakers and instruction-based
-delivery (`instruction`, `voice_description`) from the CustomVoice model.
+XTTS engines, and adds built-in speakers steered by instructions (`instruction`,
+`emotion`, `voice_description`) from the CustomVoice model. qwen-tts applies
+instructions only on the 1.7B model; a `voice_description` on 0.6B is a 422.
 
 Loads two model variants:
   - Base: voice cloning from reference audio
@@ -1193,6 +1194,15 @@ def _to_pcm(audio_arrays, sample_rate, request_id: str, text: str):
     return audio, int(sample_rate)
 
 
+def _instruct_ignored(custom) -> bool:
+    """Whether this CustomVoice model drops ``instruct``: qwen-tts does for the 0.6B one (``tts_model_size`` "0b6").
+    Read from the loaded model, so a 1.7B custom_voice checkpoint counts as 1.7B; TTS_MODEL_SIZE otherwise."""
+    size = getattr(getattr(custom, "model", None), "tts_model_size", None)
+    if isinstance(size, str):
+        return size == "0b6"  # what qwen-tts tests (generate_custom_voice), without its substring match
+    return MODEL_SIZE == "0.6b"
+
+
 async def _plan_generation(req: SynthesiseRequest, request_id: str):
     """Validate ``req`` and choose its model, before any audio is rendered.
 
@@ -1202,7 +1212,8 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
     is an error before ``/synthesise/stream`` sends its 200. The caller holds a lease.
 
     Uses the Base model for a ``voice_clone_id`` (voice cloning) and the
-    CustomVoice model otherwise (built-in speaker + instruction).
+    CustomVoice model otherwise (built-in speaker + instruction; a ``voice_description`` steers a speaker the
+    same way, and needs the 1.7B model, as the 0.6B one ignores instructions).
     """
     instruction = req.instruction
     if instruction is None:
@@ -1237,24 +1248,27 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
         return render
 
     if req.voice_description:
+        # A "designed voice" is a built-in CustomVoice speaker steered by the description as its instruction
+        # (#31). qwen-tts's generate_voice_design needs a separate VoiceDesign model (1.7B only), which echo doesn't
+        # load; the Base model refuses it.
         design_instruct = req.voice_description
         if instruction:
             design_instruct = f"{req.voice_description}. {instruction}"
 
-        base = _mgr.base_model
-        if base is not None:
-            def render(text: str):
-                return base.generate_voice_design(
-                    text, instruct=design_instruct, language=language,
-                    max_new_tokens=_max_new_tokens_for(text),
-                )
-
-            render.slot = "base"
-            return render
-
         custom = _mgr.custom_model
         if custom is None:
-            return JSONResponse(status_code=503, content={"error": "No model loaded"})
+            return JSONResponse(
+                status_code=503,
+                content={"error": "voice_description needs the CustomVoice model (TTS_LOAD_MODELS=base)"},
+            )
+        if _instruct_ignored(custom):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": "voice_description needs the 1.7b CustomVoice model: the 0.6b one ignores "
+                    "instructions (TTS_MODEL_SIZE=1.7b, or a 1.7b custom_voice checkpoint)"
+                },
+            )
         fallback_speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER
         if not fallback_speaker:
             try:
@@ -1265,12 +1279,11 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
                 return JSONResponse(
                     status_code=503,
                     content={
-                        "error": "Voice design needs the Base model (TTS_LOAD_MODELS=custom_voice) "
-                        "and the CustomVoice model lists no speaker to fall back to."
+                        "error": "voice_description needs a speaker to steer, and the CustomVoice model lists no speaker"
                     },
                 )
             fallback_speaker = available[0]
-        logger.info("voice_design_fallback_to_speaker", speaker=fallback_speaker)
+        logger.info("voice_design_speaker", speaker=fallback_speaker)
 
         def render(text: str):
             return custom.generate_custom_voice(
@@ -1279,7 +1292,7 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
                 max_new_tokens=_max_new_tokens_for(text),
             )
 
-        render.slot = "custom_voice"  # the voice-design fallback speaks with CustomVoice
+        render.slot = "custom_voice"
         return render
 
     custom = _mgr.custom_model
@@ -1818,9 +1831,128 @@ async def list_clones():
 # ── GET /clones/{companion_id}/download ───────────────────────────────────────
 
 
+# Clone archive format (download and import), as on Miso (#20) and XTTS. The prompt item travels as
+# prompt.safetensors: ref_spk_embedding (float32; its own dtype in the metadata) and, for an ICL clone, ref_code
+# (int64) as tensors, and the item's other fields as strings in the safetensors `__metadata__` header. A
+# safetensors file is a JSON header plus raw tensor bytes, so parsing one never runs code. A legacy prompt.pt (a
+# torch pickle) in an uploaded archive is refused unread: torch.load(weights_only=True) on untrusted bytes is
+# GHSA-63cw-57p8-fm3p on the torch this image installs (cu124 stops at 2.6.0; fixed in 2.10), and an allowlist
+# doesn't change that. Stored clones stay prompt.pt: this server wrote them.
+_ARCHIVE_PROMPT = "prompt.safetensors"
+_LEGACY_ARCHIVE_PROMPT = "prompt.pt"
+_ARCHIVE_FORMAT = "qwen-clone"
+_ARCHIVE_FORMAT_VERSION = "1"
+_ARCHIVE_SPK_DTYPES = ("float32", "float16", "bfloat16")
+
+
+def _to_array(tensor):
+    """``(numpy array, torch dtype name)`` for a prompt tensor: floats as float32 (numpy has no bfloat16), integers
+    as int64."""
+    import torch
+
+    dtype = str(tensor.dtype).removeprefix("torch.")
+    target = torch.float32 if tensor.is_floating_point() else torch.int64
+    return tensor.detach().cpu().to(target).contiguous().numpy(), dtype
+
+
+def _from_array(array, dtype: str):
+    """A validated archive array back as a CPU tensor of torch dtype *dtype*."""
+    import torch
+
+    return torch.from_numpy(array.copy()).to(getattr(torch, dtype))
+
+
+def _prompt_to_safetensors(items: list) -> bytes:
+    """Serialise one validated prompt item as the archive's prompt.safetensors."""
+    from safetensors.numpy import save
+
+    item = items[0]
+    spk, spk_dtype = _to_array(item.ref_spk_embedding)
+    arrays = {"ref_spk_embedding": spk}
+    metadata = {
+        "format": _ARCHIVE_FORMAT,
+        "format_version": _ARCHIVE_FORMAT_VERSION,
+        "engine": _ENGINE,
+        "x_vector_only_mode": "true" if item.x_vector_only_mode else "false",
+        "icl_mode": "true" if item.icl_mode else "false",
+        "ref_spk_embedding_dtype": spk_dtype if spk_dtype in _ARCHIVE_SPK_DTYPES else "float32",
+    }
+    if item.icl_mode and item.ref_code is not None:
+        arrays["ref_code"] = _to_array(item.ref_code)[0]
+    if item.ref_text is not None:
+        metadata["ref_text"] = item.ref_text
+    return save(arrays, metadata=metadata)
+
+
+def _safetensors_metadata(data: bytes) -> dict:
+    """The ``__metadata__`` string map from a safetensors header, read as JSON (no tensors)."""
+    if len(data) < 8:
+        raise ValueError("prompt.safetensors is truncated")
+    header_len = int.from_bytes(data[:8], "little")
+    if header_len > len(data) - 8:
+        raise ValueError("prompt.safetensors has a malformed header")
+    try:
+        header = json.loads(data[8 : 8 + header_len].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"prompt.safetensors has a malformed header: {exc}") from exc
+    if not isinstance(header, dict):
+        raise ValueError("prompt.safetensors has a malformed header")
+    metadata = header.get("__metadata__") or {}
+    if not (isinstance(metadata, dict) and all(isinstance(v, str) for v in metadata.values())):
+        raise ValueError("prompt.safetensors metadata must map names to strings")
+    return metadata
+
+
+def _prompt_from_safetensors(data: bytes) -> list:
+    """Parse an uploaded prompt.safetensors into ``[VoiceClonePromptItem]``, validated as a stored clone is
+    (_validate_prompt). Only safetensors' own parser touches the bytes (into numpy arrays): no pickle, no
+    torch.load. Raises ``ValueError``."""
+    import numpy as np
+    from safetensors.numpy import load
+
+    metadata = _safetensors_metadata(data)
+    engine = metadata.get("engine")
+    if engine is not None and engine.strip().lower() not in (_ENGINE, "qwen"):
+        raise ValueError(f"prompt.safetensors is a {engine[:32]!r} clone, not a Qwen one")
+    try:
+        arrays = load(data)
+    except Exception as exc:
+        raise ValueError(f"Invalid prompt.safetensors: {exc}") from exc
+
+    def _flag(name: str) -> bool:
+        value = metadata.get(name)
+        if value not in ("true", "false"):
+            raise ValueError(f"prompt.safetensors needs {name} as \"true\" or \"false\"")
+        return value == "true"
+
+    spk = arrays.get("ref_spk_embedding")
+    if spk is None:
+        raise ValueError("prompt.safetensors must contain ref_spk_embedding (is it another engine's clone?)")
+    if not (spk.dtype.kind == "f" and np.isfinite(spk).all()):
+        raise ValueError("prompt.safetensors's ref_spk_embedding must be a finite float tensor")
+    spk_dtype = metadata.get("ref_spk_embedding_dtype", "float32")
+    if spk_dtype not in _ARCHIVE_SPK_DTYPES:
+        raise ValueError(f"prompt.safetensors has an unsupported ref_spk_embedding_dtype: {spk_dtype[:32]!r}")
+    xvec, icl = _flag("x_vector_only_mode"), _flag("icl_mode")
+    code = arrays.get("ref_code")
+    if code is not None and code.dtype.kind not in "iu":
+        raise ValueError("an ICL prompt.safetensors needs its ref_code as an integer tensor")
+
+    cls = _prompt_item_cls()
+    item = cls(
+        ref_code=_from_array(code.astype(np.int64), "int64") if code is not None else None,
+        ref_spk_embedding=_from_array(spk.astype(np.float32), spk_dtype),
+        x_vector_only_mode=xvec,
+        icl_mode=icl,
+        ref_text=metadata.get("ref_text"),
+    )
+    return _validate_prompt([item], cls)
+
+
 def _build_clone_zip(companion_id: str) -> bytes:
-    """Bundle a clone's ``prompt.pt`` and ``meta.json`` into a zip. A clone stored
-    without a ``meta.json`` gets a generated one, so the archive names its engine."""
+    """Bundle a stored clone as prompt.safetensors and meta.json. A clone stored without a ``meta.json`` gets a
+    generated one, so the archive names its engine. The stored prompt.pt was written by this server and loads
+    through _load_prompt; old and new clones alike leave as safetensors."""
     import zipfile
 
     from botocore.exceptions import ClientError
@@ -1831,13 +1963,14 @@ def _build_clone_zip(companion_id: str) -> bytes:
         client.download_fileobj(S3_BUCKET_NAME, _clone_key(companion_id), prompt_buf)
     except ClientError as exc:
         raise FileNotFoundError(f"Voice clone not found: {companion_id}") from exc
+    prompt_bytes = _prompt_to_safetensors(_load_prompt(prompt_buf.getvalue()))
 
     meta = _read_meta(client, companion_id) or _default_meta(companion_id)
     meta.setdefault("engine", _ENGINE)
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("prompt.pt", prompt_buf.getvalue())
+        zf.writestr(_ARCHIVE_PROMPT, prompt_bytes)
         zf.writestr("meta.json", json.dumps(meta))
     return zip_buf.getvalue()
 
@@ -1931,7 +2064,7 @@ def _slug_id(value: str) -> str:
 
 
 _MAX_ARCHIVE_ENTRIES = 16
-# The upload itself: a prompt.pt at its cap plus a little for meta.json and zip overhead.
+# The upload itself: a prompt.safetensors at its cap plus a little for meta.json and zip overhead.
 _MAX_ARCHIVE_BYTES = _MAX_PROMPT_BYTES + 1024 * 1024
 
 
@@ -1954,10 +2087,10 @@ def _read_member(z, name: str, limit: int) -> bytes:
 def _parse_clone_archive(zip_bytes: bytes, companion_override: str, name_override: str) -> tuple[str, list, dict]:
     """Validate a clone archive: ``(companion_id, prompt items, source meta)``.
 
-    Only a Qwen clone is accepted. A ``meta.json`` that names another engine is
-    refused, and ``prompt.pt`` must load (``weights_only``, tensors and Qwen's
-    ``VoiceClonePromptItem`` only) as one valid prompt item: a Miso or XTTS
-    ``prompt.pt`` is a dict of other tensors and fails that check. Raises ``ValueError``.
+    Only a Qwen clone is accepted. A ``meta.json`` or prompt metadata that names another engine is refused, and
+    ``prompt.safetensors`` must parse (safetensors only, never a pickle) into one valid prompt item: a Miso or
+    XTTS prompt has other tensors and fails that check. An archive holding only a legacy ``prompt.pt`` is refused
+    unread. Raises ``ValueError``.
     """
     import zipfile
 
@@ -1984,10 +2117,19 @@ def _parse_clone_archive(zip_bytes: bytes, companion_override: str, name_overrid
     if isinstance(engine, str) and engine.strip().lower() not in ("", _ENGINE, "qwen"):
         raise ValueError(f"Archive is a {engine!r} clone; this engine only imports Qwen clones")
 
-    prompt_name = next((n for n in names if n.rsplit("/", 1)[-1] == "prompt.pt"), None)
+    def _member(basename: str):
+        return next((n for n in names if n.rsplit("/", 1)[-1] == basename), None)
+
+    prompt_name = _member(_ARCHIVE_PROMPT)
     if not prompt_name:
-        raise ValueError("Archive does not contain prompt.pt")
-    items = _load_prompt(_read_member(z, prompt_name, _MAX_PROMPT_BYTES))
+        if _member(_LEGACY_ARCHIVE_PROMPT):
+            raise ValueError(
+                "This archive holds a legacy prompt.pt (a pickle), which is no longer imported because "
+                "unpickling an uploaded file can run code. Re-export the clone from a Qwen engine running "
+                "this version: its download now produces prompt.safetensors."
+            )
+        raise ValueError(f"Archive does not contain {_ARCHIVE_PROMPT}")
+    items = _prompt_from_safetensors(_read_member(z, prompt_name, _MAX_PROMPT_BYTES))
 
     def _text(value) -> str:
         return value.strip() if isinstance(value, str) else ""
@@ -2008,8 +2150,7 @@ def _store_imported_clone(companion_id: str, items: list, src_meta: dict, name_o
     if not replace and _s3_object_exists(s3_key):
         raise CloneExistsError(f"Voice clone {companion_id!r} already exists; send replace=true to overwrite")
 
-    # Re-serialised from the validated items, so whatever else the uploaded
-    # pickle held is not what gets stored.
+    # Re-serialised from the validated items, so the stored prompt.pt holds only what validation passed.
     buf = io.BytesIO()
     torch.save(items, buf)
     _upload_to_s3(buf.getvalue(), s3_key, "application/octet-stream")
@@ -2050,8 +2191,8 @@ async def import_clone(
 ):
     """Import a Qwen clone archive (the ``/clones/{id}/download`` zip).
 
-    422 for a bad zip or anything but a valid Qwen ``prompt.pt`` (another
-    engine's clone included); 409 when the target id already has a clone,
+    422 for a bad zip or anything but a valid Qwen ``prompt.safetensors`` (another
+    engine's clone, or a legacy pickled ``prompt.pt``, included); 409 when the target id already has a clone,
     unless ``replace`` is true; 413 for an archive over ``_MAX_ARCHIVE_BYTES``."""
     try:
         data = await read_upload(archive, _MAX_ARCHIVE_BYTES, what="clone archive")
@@ -2354,7 +2495,7 @@ async def health():
         "keep_alive_cpu": KEEP_ALIVE_CPU,
         "gpu": gpu_info,
         "weights": _mgr.weights,
-        "image": _image(),
+        "image": await asyncio.to_thread(_image),
     }
 
 
@@ -2447,9 +2588,42 @@ class LoadRequest(BaseModel):
 
 
 def _image() -> dict:
-    """``/health``'s ``image``: the release and git revision baked in at build time (null for a local build). A
-    container can't see its own image digest; whoever deployed it (compose, iris) knows that."""
-    return {"version": ECHO_VERSION, "revision": ECHO_REVISION}
+    """``/health``'s ``image``: the release and git revision baked in at build time (null for a local build), and the
+    runtime libraries (_runtime). A container can't see its own image digest; whoever deployed it (compose, iris)
+    knows that. Blocking the first time: call it in a thread."""
+    return {"version": ECHO_VERSION, "revision": ECHO_REVISION, "runtime": _runtime()}
+
+
+# What shapes the audio besides the weights and the code: two builds of one revision can install different
+# libraries (#32), so /health names them. Read once (importlib.metadata, and torch for CUDA and cuDNN).
+RUNTIME_PACKAGES = ("qwen-tts", "transformers", "accelerate", "torchaudio", "numpy")
+
+
+@functools.lru_cache(maxsize=1)
+def _runtime() -> dict:
+    """``/health``'s ``image.runtime``: ``{name: version or None}`` for python, torch, CUDA, cuDNN and
+    RUNTIME_PACKAGES. Blocking the first time (it imports torch): call it in a thread."""
+    import importlib.metadata
+    import platform
+
+    out: dict = {"python": platform.python_version(), "torch": None, "cuda": None, "cudnn": None}
+    torch = None
+    with contextlib.suppress(ImportError):  # no torch installed (the engines' tests): torch, cuda, cudnn stay null
+        import torch
+    if torch is not None:
+        version = getattr(torch, "__version__", None)
+        out["torch"] = str(version) if version else None
+        out["cuda"] = getattr(getattr(torch, "version", None), "cuda", None)
+        cudnn = None
+        with contextlib.suppress(Exception):  # a CPU-only build, or a stand-in torch, has no cuDNN to name
+            cudnn = torch.backends.cudnn.version()
+        out["cudnn"] = str(cudnn) if cudnn else None
+    for name in RUNTIME_PACKAGES:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
 
 
 @app.post("/admin/load", dependencies=[Depends(_require_admin)])

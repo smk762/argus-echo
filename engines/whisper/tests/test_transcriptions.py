@@ -1,4 +1,4 @@
-"""POST /transcriptions (agent-composer's JSON route for kimini-api), with the fake model: no weights, no GPU.
+"""POST /transcriptions (from a URL or base64; imported from agent-composer), with the fake model: no weights, no GPU.
 
 Ports voice-stack/tests/test_whisper_audio_url.py from agent-composer: the SSRF policy on audio_url, the download
 and base64 caps, and the generic error bodies, against echo's fetch (argus_cortex.net.afetch) and caps.
@@ -13,6 +13,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from unittest import mock
@@ -96,7 +97,7 @@ class Base64Test(TranscriptionsTest):
         self.assertEqual(self.backend.calls[0]["language"], "en")
         self.assertEqual(r.json()["confidence"], 1.0)
 
-    def test_data_uri_and_kiminis_nulls_are_accepted(self):
+    def test_data_uri_and_explicit_nulls_are_accepted(self):
         r = self.tx(audio_base64="data:audio/wav;base64," + b64(wav()), audio_url=None, language=None)
         self.assertEqual(r.status_code, 200, r.text)
 
@@ -194,6 +195,44 @@ class FfmpegTest(TranscriptionsTest):
         self.assertEqual(kw["input"], self.MP3ISH)
         self.assertEqual(kw["timeout"], stt_server.DECODE_TIMEOUT)
 
+    def test_mp4_goes_through_a_private_temp_file_reading_only_that_file(self):
+        """An MP4/M4A can't be demuxed from a pipe when its index comes last, so it is read from a temp file."""
+        m4a = b"\x00\x00\x00\x20ftypM4A \x00\x00\x02\x00" + b"\x00" * 200
+        seen = {}
+
+        def run(cmd, **kw):
+            path = cmd[cmd.index("-i") + 1].removeprefix("file:")
+            seen.update(cmd=cmd, kw=kw, path=path, data=open(path, "rb").read())
+            seen["file_mode"] = os.stat(path).st_mode & 0o777
+            seen["dir_mode"] = os.stat(os.path.dirname(path)).st_mode & 0o777
+            pcm = np.zeros(8000, dtype="<i2").tobytes()
+            return subprocess.CompletedProcess(cmd, 0, stdout=pcm, stderr=b"")
+
+        with mock.patch.object(stt_server.subprocess, "run", run):
+            r = self.tx(audio_base64=b64(m4a))
+        self.assertEqual(r.status_code, 200, r.text)
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[cmd.index("-protocol_whitelist") + 1], "file")
+        self.assertEqual(cmd[cmd.index("-enable_drefs") + 1], "0")
+        self.assertEqual(cmd[cmd.index("-format_whitelist") + 1], stt_server.INPUT_FORMATS)
+        self.assertTrue(cmd[cmd.index("-i") + 1].startswith("file:/"))
+        self.assertNotIn("input", seen["kw"])  # nothing on stdin
+        self.assertEqual(seen["data"], m4a)
+        self.assertEqual((seen["file_mode"], seen["dir_mode"]), (0o600, 0o700))
+        self.assertFalse(os.path.exists(os.path.dirname(seen["path"])))  # removed afterwards
+
+    def test_the_temp_file_is_removed_when_ffmpeg_fails(self):
+        m4a = b"\x00\x00\x00\x20ftypisom" + b"\x00" * 200
+        paths = []
+
+        def run(cmd, **kw):
+            paths.append(cmd[cmd.index("-i") + 1].removeprefix("file:"))
+            raise subprocess.TimeoutExpired(cmd, 1)
+
+        with mock.patch.object(stt_server.subprocess, "run", run):
+            self.assertEqual(self.tx(audio_base64=b64(m4a)).status_code, 400)
+        self.assertFalse(os.path.exists(os.path.dirname(paths[0])))
+
     def test_wav_never_reaches_ffmpeg(self):
         with mock.patch.object(stt_server.subprocess, "run") as run:
             self.assertEqual(self.tx(audio_base64=b64(wav())).status_code, 200)
@@ -218,6 +257,17 @@ class FfmpegTest(TranscriptionsTest):
         run.assert_not_called()
 
 
+def _late_moov_m4a(seconds: int) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, "late.m4a")
+        subprocess.run(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", f"sine=frequency=220:duration={seconds}",
+             "-c:a", "aac", "-b:a", "128k", out],
+            check=True,
+        )  # fmt: skip
+        return open(out, "rb").read()
+
+
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
 class RealFfmpegTest(TranscriptionsTest):
     def test_mp3_is_decoded(self):
@@ -229,6 +279,17 @@ class RealFfmpegTest(TranscriptionsTest):
         r = self.tx(audio_base64=b64(mp3))
         self.assertEqual(r.status_code, 200, r.text)
         self.assertAlmostEqual(self.backend.calls[0]["n"], 16000, delta=1600)
+
+    def test_an_m4a_with_its_index_at_the_end_is_decoded(self):
+        """ffmpeg's default MP4 muxer (no faststart) writes moov after the audio: 2 minutes of AAC is ~1.9 MB, far
+        past what a pipe lets the demuxer read ahead, so this failed with 400 when MP4 was piped."""
+        m4a = _late_moov_m4a(120)
+        self.assertGreater(m4a.find(b"moov"), len(m4a) // 2)
+        r = self.tx(audio_base64=b64(m4a))
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertAlmostEqual(self.backend.calls[0]["n"], 120 * 16000, delta=16000)
+        r = self.client.post("/transcribe", files={"audio": ("rec.m4a", m4a, "audio/mp4")})
+        self.assertEqual(r.status_code, 200, r.text)
 
     def test_a_playlist_is_refused_and_nothing_is_fetched(self):
         playlist = b"#EXTM3U\n#EXTINF:1,\nhttp://127.0.0.1:9/x.mp3\n#EXTINF:1,\nfile:///etc/passwd\n"

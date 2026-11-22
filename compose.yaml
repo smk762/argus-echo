@@ -120,7 +120,7 @@ services:
       context: ./engines/qwen
       args:
         TTS_MODEL_SIZE: ${QWEN_MODEL_SIZE:-0.6b}
-    image: ghcr.io/smk762/argus-echo-qwen:${ECHO_TAG:-local}
+    image: ghcr.io/smk762/argus-echo-qwen:${QWEN_TAG:-${ECHO_TAG:-local}}
     container_name: argus-echo-qwen
     restart: unless-stopped
     ports:
@@ -169,7 +169,7 @@ services:
       STT_MAX_SECONDS: ${WHISPER_MAX_SECONDS:-600}
       STT_QUEUE_TIMEOUT_S: ${WHISPER_QUEUE_TIMEOUT_S:-30}
       STT_STREAM_MAX_SESSIONS: ${WHISPER_STREAM_MAX_SESSIONS:-4}
-      # POST /transcriptions (agent-composer's route for kimini-api); docs/api.md
+      # POST /transcriptions (from a URL or base64; imported from agent-composer); docs/api.md
       STT_VAD_FILTER: ${WHISPER_VAD_FILTER:-1}
       STT_AUDIO_URL_ALLOWED_HOSTS: ${WHISPER_AUDIO_URL_ALLOWED_HOSTS:-}
       STT_AUDIO_URL_MAX_REDIRECTS: ${WHISPER_AUDIO_URL_MAX_REDIRECTS:-0}

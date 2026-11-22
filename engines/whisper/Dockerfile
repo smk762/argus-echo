@@ -38,6 +38,12 @@ ENV CT2_CUDA_ALLOCATOR=cub_caching CT2_CUDA_CACHING_ALLOCATOR_CONFIG=4,3,12,2097
 
 COPY stt_server.py .
 
+# The release and git revision (release.yml passes both), reported in /health as `image`; empty for a local build.
+ARG ECHO_VERSION=
+ARG ECHO_REVISION=
+ENV ECHO_VERSION=${ECHO_VERSION} \
+    ECHO_REVISION=${ECHO_REVISION}
+
 EXPOSE 8031
 ENV STT_DEVICE=cuda
 

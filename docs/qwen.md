@@ -1,8 +1,9 @@
 # Qwen3-TTS engine
 
 [Qwen3-TTS](https://huggingface.co/Qwen) (12 Hz, 0.6B or 1.7B) loads two models: **Base**, which clones a voice
-from one reference clip, and **CustomVoice**, which has built-in speakers that take a delivery `instruction` and
-can design a voice from a `voice_description`. 10 languages. The 0.6B pair fits an 8 GB card.
+from one reference clip, and **CustomVoice**, which has built-in speakers that a delivery `instruction` or a
+`voice_description` steers (1.7B only: qwen-tts ignores instructions on 0.6B). 10 languages. The 0.6B pair fits an
+8 GB card.
 
 Source: [engines/qwen/tts_server.py](../engines/qwen/tts_server.py). Contract: [api.md](api.md). Published on
 `8142` by `compose.yaml` (`--profile qwen`). The weights are Apache-2.0 and are baked into the image at build
@@ -21,7 +22,12 @@ Differences from the other engines:
   (the clip's codec tokens plus its transcript); without it, only the speaker embedding (x-vector). It refuses
   to overwrite an existing clone unless `replace=true` (`409`), and writes a `meta.json` (`voice_name` sets its
   `name`).
-- `voice_description`, `instruction` and `emotion` are used (CustomVoice); the other engines ignore them.
+- `voice_description`, `instruction` and `emotion` steer a built-in CustomVoice speaker; the other engines ignore
+  them. A `voice_description` is not a new voice: it is the instruction given to a speaker (`speaker`, else
+  `QWEN_DEFAULT_SPEAKER`, else the first one `/speakers` lists), combined with any `instruction` or `emotion`.
+  Only the 1.7B CustomVoice model applies instructions. On 0.6B, qwen-tts drops them: a `voice_description` is a
+  `422` rather than a silently unchanged voice, while `instruction` and `emotion` are accepted and have no effect.
+  True voice design needs qwen-tts's separate VoiceDesign model (1.7B only), which echo doesn't load (#31).
 - `speed` is accepted and ignored.
 - `seed` seeds `/synthesise` once; `/synthesise/stream` seeds sentence *i* (from 0) with `seed + i`, so each
   sentence is reproducible on its own. See [api.md#reproducibility](api.md#reproducibility).
@@ -31,15 +37,21 @@ Differences from the other engines:
 `GET /clones`, `GET /clones/{companion_id}/download`, `DELETE /clones/{companion_id}` and `POST /clones/import`
 behave as on XTTS (see [miso-api.md](miso-api.md#get-clones) for the shapes), with these Qwen specifics:
 
-- A Qwen `prompt.pt` is qwen-tts's `create_voice_clone_prompt` result: a one-item list of
-  `VoiceClonePromptItem` (speaker embedding, and for ICL clones the reference codec tokens and transcript). It
-  is loaded with `torch.load(weights_only=True)` with only that class allowed, so a clone can't run code.
+- A stored Qwen `prompt.pt` is qwen-tts's `create_voice_clone_prompt` result: a one-item list of
+  `VoiceClonePromptItem` (speaker embedding, and for ICL clones the reference codec tokens and transcript). Only
+  this server writes it, and it is loaded with `torch.load(weights_only=True)` with only that class allowed.
+- The download archive carries the item as `prompt.safetensors`: `ref_spk_embedding` (float32) and, for an ICL
+  clone, `ref_code` (int64) as tensors, with `x_vector_only_mode`, `icl_mode`, `ref_text` and the embedding's own
+  dtype (`ref_spk_embedding_dtype`, so a bfloat16 embedding comes back as bfloat16) as safetensors metadata.
+  Parsing it never runs code.
 - `GET /clones` lists every `voice_clones/<id>/prompt.pt`. Clones made before Qwen wrote `meta.json` are listed
   from the prompt alone (`name` = id, `created_at` = upload time), and their download carries a generated
   `meta.json`. Every `meta.json` Qwen writes has `"engine": "qwen-tts"`.
-- `POST /clones/import` accepts only a Qwen clone: `422` if the archive's `meta.json` names another engine, or if
-  its `prompt.pt` is not exactly one valid `VoiceClonePromptItem` (a Miso or XTTS `prompt.pt` is a dict and
-  fails). The prompt is re-serialised from the validated fields. `409` if the id is taken and `replace` is not
+- `POST /clones/import` accepts only a Qwen clone: `422` if the archive's `meta.json` or prompt metadata names
+  another engine, or if its `prompt.safetensors` doesn't make one valid `VoiceClonePromptItem` (a Miso or XTTS
+  prompt has other tensors and fails). An archive with only a pickled `prompt.pt` (a download from before this
+  version) is refused unread, since unpickling an upload can run code: re-export it from a current Qwen engine.
+  The prompt is re-serialised from the validated fields. `409` if the id is taken and `replace` is not
   `true`; `413` over 17 MiB.
 
 ## POST /analyze-clips

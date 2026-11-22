@@ -130,7 +130,10 @@ def _check_identity(report: Report, health: dict) -> None:
         except ValidationError as exc:
             report.add("image", False, f"malformed `image`: {exc.errors()[0]['msg']}")
         else:
-            report.add("image", True, f"version={image.version or 'unset'} revision={image.revision or 'unset'}")
+            detail = f"version={image.version or 'unset'} revision={image.revision or 'unset'}"
+            if image.runtime:
+                detail += "; " + " ".join(f"{k}={v or 'none'}" for k, v in image.runtime.items())
+            report.add("image", True, detail)
     if "weights" in health:
         try:
             weights = Weights.model_validate(health["weights"])

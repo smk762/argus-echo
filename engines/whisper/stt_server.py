@@ -21,7 +21,8 @@ Uploads are read through argus_cortex.limits (read_upload, then open_audio for W
 bytes), so the byte cap, the channel count, the sample rate and the duration are checked before any sample is
 decoded. /transcriptions puts its fetched or base64-decoded bytes through the same caps. On both routes, audio that
 is not WAV or FLAC (a browser's webm/opus recording, mp3, ...) is decoded by the ffmpeg CLI, reading only from a
-pipe and only through a demuxer in STT_INPUT_FORMATS, and stopped at STT_MAX_SECONDS.
+pipe (MP4/M4A: a private temp file; see ffmpeg_decode) and only through a demuxer in STT_INPUT_FORMATS, and stopped
+at STT_MAX_SECONDS.
 
 audio_url (/transcriptions) is fetched with argus_cortex.net.afetch: http(s) only, no credentials in the URL, every
 address the host resolves to must be global (no loopback, private, link-local/metadata, CGNAT, reserved, multicast
@@ -57,16 +58,19 @@ Env vars:
                           wait up to STT_QUEUE_TIMEOUT_S, then 503. Bounds the bytes held and the ffmpeg processes run
   STT_INPUT_FORMATS     — ffmpeg demuxers /transcribe and /transcriptions may decode non-WAV/FLAC audio with (comma
                           list; default plain audio containers, no playlists). "none" accepts WAV/FLAC only
+  ECHO_VERSION / ECHO_REVISION — the image's release and git revision (build args), reported in /health as ``image``
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import gc
 import json
 import os
 import subprocess
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from enum import Enum
@@ -105,6 +109,9 @@ def _env_int(name: str, default: int) -> int:
 # "large-v3-turbo" alias downloads (MIT, like the original), pinned to one commit.
 MODEL_REPO = os.getenv("STT_MODEL", "mobiuslabsgmbh/faster-whisper-large-v3-turbo")
 MODEL_REVISION = os.getenv("STT_MODEL_REVISION", "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf")
+# The image's identity, baked in at build time (release.yml); None for a local build.
+ECHO_VERSION: Optional[str] = os.getenv("ECHO_VERSION", "").strip() or None
+ECHO_REVISION: Optional[str] = os.getenv("ECHO_REVISION", "").strip() or None
 MODEL_PATH = os.getenv("STT_MODEL_PATH", "")
 DEVICE = os.getenv("STT_DEVICE", "cuda")
 COMPUTE_TYPE = os.getenv("STT_COMPUTE_TYPE", "float16" if DEVICE.startswith("cuda") else "int8")
@@ -503,7 +510,8 @@ async def transcribe(
         return _error(503, DECODE_BUSY, retry_after=5)
     try:
         # WAV/FLAC through open_audio; anything else (a browser's webm/opus recording, mp3, ...) through ffmpeg,
-        # reading only from a pipe and only with a demuxer in STT_INPUT_FORMATS, as /transcriptions does.
+        # reading only the audio (a pipe, or a private temp file for MP4) and only with a demuxer in
+        # STT_INPUT_FORMATS, as /transcriptions does.
         samples, rate = await asyncio.to_thread(decode_audio_bytes, data)
     except TooLarge as exc:
         return _error(413, str(exc))
@@ -599,21 +607,43 @@ def _is_wav_or_flac(data: bytes) -> bool:
     return (data[:4] == b"RIFF" and data[8:12] == b"WAVE") or data[:4] == b"fLaC"
 
 
+def _is_iso_bmff(data: bytes) -> bool:
+    """MP4, M4A, MOV, 3GP: an ISO base media file starts with a box whose type, at byte 4, is ``ftyp``; an older
+    QuickTime .mov may start with ``wide``, ``free``, ``skip``, ``mdat`` or ``moov`` instead."""
+    return data[4:8] in (b"ftyp", b"wide", b"free", b"skip", b"mdat", b"moov")
+
+
 def ffmpeg_decode(data: bytes) -> np.ndarray:
     """Any audio ffmpeg can demux with a format in INPUT_FORMATS -> 16 kHz mono float32, at most MAX_SECONDS.
 
     The bytes go in on stdin and the only protocol ffmpeg may open is ``pipe``, so nothing in them (a playlist, a
     reference) can make it read a file or the network. Output stops just past MAX_SECONDS (``-t``), so a long or
-    lying stream costs no more than the cap. TooLarge past the cap, BadInput when ffmpeg can't decode it."""
+    lying stream costs no more than the cap. TooLarge past the cap, BadInput when ffmpeg can't decode it.
+
+    MP4/M4A/MOV (ISO BMFF: ``ftyp`` at byte 4) is the exception. Its index (``moov``) usually comes after the audio
+    (ffmpeg's and most recorders' default without faststart), and the demuxer has to seek back to it, which it
+    can't on a pipe. Those bytes go to a private temporary file (a 0700 directory, removed afterwards) that ffmpeg
+    reads with only the ``file`` protocol and ``-enable_drefs 0`` (an MP4's external data references stay unread:
+    ffmpeg's default, set explicitly). No other path is named to it, and the format whitelist still applies."""
     limit = int(MAX_SECONDS * SAMPLE_RATE)
-    cmd = [
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-        "-protocol_whitelist", "pipe", "-format_whitelist", INPUT_FORMATS,
-        "-i", "pipe:0", "-map", "0:a:0", "-t", f"{MAX_SECONDS + 0.1:.3f}",
+    head = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-format_whitelist", INPUT_FORMATS]
+    tail = [
+        "-map", "0:a:0", "-t", f"{MAX_SECONDS + 0.1:.3f}",
         "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1",
     ]  # fmt: skip
     try:
-        proc = subprocess.run(cmd, input=data, capture_output=True, timeout=DECODE_TIMEOUT, check=False)
+        if _is_iso_bmff(data):
+            with tempfile.TemporaryDirectory(prefix="stt-decode-") as tmp:
+                path = os.path.join(tmp, "input")
+                with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb") as fh:
+                    fh.write(data)
+                cmd = head + ["-protocol_whitelist", "file", "-enable_drefs", "0", "-i", f"file:{path}"] + tail
+                proc = subprocess.run(
+                    cmd, stdin=subprocess.DEVNULL, capture_output=True, timeout=DECODE_TIMEOUT, check=False
+                )
+        else:
+            cmd = head + ["-protocol_whitelist", "pipe", "-i", "pipe:0"] + tail
+            proc = subprocess.run(cmd, input=data, capture_output=True, timeout=DECODE_TIMEOUT, check=False)
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("stt_decode_failed", error=str(exc)[:300])
         raise BadInput("could not decode the audio") from None
@@ -959,6 +989,26 @@ def _gpu_block() -> dict:
     }
 
 
+# What shapes the transcript besides the weights and the code: two builds of one revision can install different
+# libraries (#32), so /health names them. CTranslate2 bundles no CUDA; the pip-installed cuBLAS and cuDNN are listed.
+RUNTIME_PACKAGES = ("faster-whisper", "ctranslate2", "nvidia-cublas-cu12", "nvidia-cudnn-cu12", "numpy")
+
+
+@functools.lru_cache(maxsize=1)
+def _runtime() -> dict:
+    """``/health``'s ``image.runtime``: ``{name: version or None}`` for python and RUNTIME_PACKAGES, read once."""
+    import importlib.metadata
+    import platform
+
+    out: dict = {"python": platform.python_version()}
+    for name in RUNTIME_PACKAGES:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
+
+
 @app.get("/health")
 async def health():
     if mgr.state == State.LOADING:
@@ -978,6 +1028,9 @@ async def health():
         "keep_alive_cpu": KEEP_ALIVE_CPU,
         "streams": _sessions,
         "gpu": _gpu_block(),
+        # The release and revision baked in at build time, and the runtime libraries; a container can't see its own
+        # image digest.
+        "image": {"version": ECHO_VERSION, "revision": ECHO_REVISION, "runtime": _runtime()},
     }
     if mgr.state == State.ERROR:
         body["error"] = mgr.error

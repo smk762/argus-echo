@@ -228,8 +228,23 @@ class HealthTest(EngineTest):
         body = self.client.get("/health").json()
         ResidentHealth.model_validate(body)
         self.assertEqual(body["capabilities"], ["stt"])
+        self.assertEqual(body["engine"], "whisper")  # clients key on it (docs/api.md)
         self.assertEqual(body["model_state"], "unloaded")
         self.assertEqual(FakeBackend.instances, [])  # health loads nothing
+
+    def test_health_reports_the_image_and_runtime_libraries(self):
+        import importlib.metadata
+
+        versions = {"faster-whisper": "1.2.1", "ctranslate2": "4.9.0", "nvidia-cublas-cu12": "12.4.5.8",
+                    "nvidia-cudnn-cu12": "9.1.0.70", "numpy": "2.4.6"}
+        stt_server._runtime.cache_clear()
+        self.addCleanup(stt_server._runtime.cache_clear)
+        with mock.patch.object(importlib.metadata, "version", lambda name: versions[name]), \
+                mock.patch.object(stt_server, "ECHO_VERSION", "0.3.0"), \
+                mock.patch.object(stt_server, "ECHO_REVISION", "abc"):
+            image = self.client.get("/health").json()["image"]
+        self.assertEqual((image["version"], image["revision"]), ("0.3.0", "abc"))
+        self.assertEqual(image["runtime"], {"python": image["runtime"]["python"], **versions})
 
 
 class LifecycleTest(EngineTest):

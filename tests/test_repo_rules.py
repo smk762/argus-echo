@@ -52,3 +52,41 @@ def test_no_two_engines_share_an_s3_bucket() -> None:
     variables = [f["var"] for f in found]
     assert len(set(defaults)) == len(defaults), defaults
     assert len(set(variables)) == len(variables), variables
+
+
+# Engine images whose every pip install must be constrained by an exact-version file (#32), and that file.
+PINNED_IMAGES = {
+    "xtts": ("pip install", "-c /tmp/constraints.txt", "constraints.txt"),
+    "qwen": ("pip install", "-c /tmp/constraints.txt", "constraints.txt"),
+    "miso": ("uv pip install", "-c server-constraints.txt", "server-constraints.txt"),
+}
+
+
+def _install_commands(dockerfile: str, command: str) -> list[str]:
+    """Each RUN instruction's text (continuation lines joined) that runs *command*."""
+    joined = re.sub(r"\s*\\\n\s*", " ", dockerfile)
+    return [line for line in joined.splitlines() if line.lstrip().startswith("RUN") and command in line]
+
+
+def test_every_image_install_is_pinned_to_exact_versions() -> None:
+    # A revision must imply its library stack: an unconstrained install resolves whatever is newest at build time.
+    for engine, (command, flag, constraints) in PINNED_IMAGES.items():
+        dockerfile = (ENGINES / engine / "Dockerfile").read_text()
+        installs = _install_commands(dockerfile, command)
+        assert installs, f"{engine}: no `{command}` found"
+        unpinned = [i for i in installs if flag not in i]
+        assert unpinned == [], f"{engine}: install without {flag}: {unpinned}"
+        pins = [
+            line
+            for line in (ENGINES / engine / constraints).read_text().splitlines()
+            if line.strip() and not line.startswith("#")
+        ]
+        loose = [p for p in pins if not re.fullmatch(r"[A-Za-z0-9._-]+==[A-Za-z0-9.+!-]+", p.strip())]
+        assert pins and loose == [], f"{engine}: {constraints} has entries that aren't exact pins: {loose}"
+
+
+def test_the_install_scan_joins_continuation_lines() -> None:
+    dockerfile = "RUN --mount=type=cache \\\n    pip install -c /tmp/constraints.txt torch \\\n        torchaudio\n"
+    assert _install_commands(dockerfile, "pip install") == [
+        "RUN --mount=type=cache pip install -c /tmp/constraints.txt torch torchaudio"
+    ]

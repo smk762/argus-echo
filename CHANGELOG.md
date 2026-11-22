@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
+### Security
+- XTTS and Qwen clone archives carry `prompt.safetensors`, as Miso's have since #20. `GET /clones/{id}/download`
+  writes it and `POST /clones/import` reads it with safetensors only. An uploaded archive used to reach
+  `torch.load(weights_only=True)` (Qwen: with one class allowed), which on these images' torch 2.6 is
+  GHSA-63cw-57p8-fm3p, code execution through an untrusted checkpoint (fixed in torch 2.10). An archive holding
+  only a pickled `prompt.pt` is now refused unread (`422`): re-download clones from an engine on this version
+  before moving them. Stored clones are unchanged (`prompt.pt`, written by the server). Qwen's archive keeps the
+  speaker embedding's dtype (bfloat16 included) in its metadata (#6).
+
+### Changed
+- The XTTS, Qwen and Miso images pin every package to an exact version (#32), so a revision implies its library
+  stack: `engines/xtts/constraints.txt` and `engines/qwen/constraints.txt` constrain every `pip install`, and
+  `engines/miso/server-constraints.txt` the server packages Miso adds on top of `uv.lock`. The versions are the
+  ones the published 0.1.0 images contain (XTTS: torch 2.6.0, coqui-tts 0.28.0, transformers 4.57.5; Qwen: torch
+  2.6.0, qwen-tts 0.1.1, transformers 4.57.3), which #30's reproducibility measurement ran, so the audio doesn't
+  change. torch is pinned without its `+cu124` label, so the `*_TORCH_INDEX_URL` build args still pick CPU or
+  CUDA. `tests/test_repo_rules.py` fails an unconstrained install.
+- docs/api.md says which clone id `/synthesise` takes (the full `voice_clone_id`,
+  `voice_clones/<companion_id>/prompt.pt`; the bare id is a `422`), that a `voice_clone_id` wins over Qwen's
+  `voice_description` (spoken by `base`), and lists `/health` `engine`'s exact values (`miso`, `xtts-v2`,
+  `qwen-tts`, `whisper`), which each engine's health test now pins.
+
+### Added
+- `/health` `image.runtime` on every engine (#32): the versions of python, torch, CUDA and cuDNN (torch engines)
+  and each engine's libraries (coqui-tts, qwen-tts, moshi, faster-whisper and ctranslate2, transformers, ...),
+  read once from the running process. A revision doesn't fix the stack, so reproducibility claims compare
+  `runtime` too. Whisper's `/health` gains `image` (`version`, `revision`, `runtime`), and its image now takes
+  the release's `ECHO_VERSION`/`ECHO_REVISION` build args. `ImageIdentity.runtime` in the contract;
+  `argus-echo check` prints it.
+- `QWEN_TAG` picks the Qwen image's tag on its own (default `ECHO_TAG`). The published image bakes 0.6b, so a host
+  running 1.7b builds it locally under its own tag while `ECHO_TAG` keeps pulling the published images for the
+  other engines.
+
+### Fixed
+- Qwen: `voice_description` works with the Base model loaded (`TTS_LOAD_MODELS=both`, the default). It used to go
+  to Base's `generate_voice_design`, which qwen-tts refuses on anything but its separate VoiceDesign model, so
+  every designed-voice request failed (#31). A description now steers a built-in CustomVoice speaker as its
+  instruction. qwen-tts ignores instructions on the 0.6B model, so there a `voice_description` is a `422` saying
+  it needs 1.7B, rather than speaking an unchanged voice. The size is read from the loaded model, so a 1.7B
+  custom_voice checkpoint counts. The response's `model` is now always `custom_voice` for it.
+- Whisper decodes an MP4/M4A/MOV whose index (`moov`) comes after the audio, the default for ffmpeg and most
+  recorders without faststart. Read from a pipe, the demuxer couldn't seek back to it, so anything past its
+  read-ahead (a 2-minute AAC clip, say) was a `400` on `/transcribe` and `/transcriptions`. Those formats are now
+  read from a private temporary file (0700 directory, deleted afterwards) with `-protocol_whitelist file` and
+  `-enable_drefs 0`; everything else still goes through the pipe.
+
 ## [0.2.0] - 2026-11-22
 
 ### Added
