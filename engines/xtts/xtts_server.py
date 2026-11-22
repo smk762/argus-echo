@@ -1772,6 +1772,8 @@ async def analyze_clips(audio: list[UploadFile] = File(...)):
         names = [clip.filename or f"clip-{i + 1}" for i, clip in enumerate(clips)]
         async with _mgr.lease():
             result = await asyncio.to_thread(_analyze_clips, raw_paths, names)
+    except GpuUnavailable:
+        raise  # the app's handler: 503 with Retry-After
     except RuntimeError as exc:
         refused = _gpu_error_response(exc, "xtts_analyze_gpu_oom")
         if refused is not None:
@@ -1876,6 +1878,8 @@ async def clone_voice(
                 gpt_cond_latent, speaker_embedding = await asyncio.to_thread(
                     _conditioning_latents, latent_paths
                 )
+        except GpuUnavailable:
+            raise  # the app's handler: 503 with Retry-After
         except RuntimeError as exc:
             refused = _gpu_error_response(exc, "xtts_clone_gpu_oom")
             if refused is not None:
