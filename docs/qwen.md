@@ -33,3 +33,4 @@ Differences from the other engines:
 
 Storage is S3 only: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` (compose:
 `QWEN_S3_BUCKET`, default `voice-qwen`) and `S3_PUBLIC_URL` (compose: `QWEN_S3_PUBLIC_URL`). The bucket must exist.
+`S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` have no default: the server refuses to start without both.
