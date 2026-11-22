@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # TTS-specific packages
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install -c /tmp/constraints.txt qwen-tts soundfile boto3
+    pip install -c /tmp/constraints.txt qwen-tts soundfile boto3 safetensors
 
 # Bake both model variants into the image so first-run is instant.
 ARG TTS_MODEL_SIZE=0.6b

@@ -122,7 +122,8 @@ Same seed means same audio only when everything else is the same too:
   run a request on the CPU** (`device: "cpu"`, or the CPU fallback when the GPU has no room), so check `device` in
   the response (`X-XTTS-Device` on a stream) and compare only runs on the same one. Qwen and Miso always generate
   on their configured device;
-- the image (torch, CUDA and driver versions) and the GPU model: `/health` `image` names the release.
+- the image and the GPU model: compare `/health` `image`, both its release and its `runtime` (torch, CUDA, cuDNN
+  and the engine library versions), not the revision alone. The driver version isn't there; take it from the host.
 
 **Measured.** On 2026-11-22 each case below ran twice with seed 42 and once with seed 43, and the outputs were
 compared byte for byte (SHA-256 of the WAV `/synthesise` stores, or of the PCM `/synthesise/stream` sends). Every
@@ -177,11 +178,12 @@ speech-to-text engine when `MISO_STT_URL` names one (see [miso-api.md](miso-api.
 `voice_clones/<companion_id>/prompt.pt`, not the bare `companion_id`, which is `422 Voice clone not found`. The
 clone-management routes (`/clones/{companion_id}/download`, `DELETE /clones/{companion_id}`) take the bare id.
 **Clones are engine-specific**: each engine's `prompt.pt` is its own format, which is why each engine gets its
-own bucket. Download archives differ too: Miso's holds `prompt.safetensors` + `meta.json` and its import refuses
-an archive with only a pickled `prompt.pt` (an older Miso download; re-export it), while XTTS's and Qwen's hold
-`prompt.pt`. `POST /clones/import` answers `409` when the target id already has a clone, unless the form field
-`replace=true` is sent, and `422` for an archive that is not this engine's format. Qwen checks both the archive's
-`meta.json` `engine` and the `prompt.pt` itself; see [qwen.md](qwen.md#clones). See
+own bucket. Every engine's download archive holds `prompt.safetensors` + `meta.json`, with the engine's own
+tensors inside, and its import refuses an archive with only a pickled `prompt.pt` (a download from an older
+version; re-export it from a current engine), because unpickling an upload can run code. `POST /clones/import`
+answers `409` when the target id already has a clone, unless the form field `replace=true` is sent, and `422` for
+an archive that is not this engine's format. Qwen checks both the archive's `meta.json` `engine` and the prompt
+itself; see [qwen.md](qwen.md#clones). See
 [voice-cloning.md](voice-cloning.md) for what makes a good reference.
 
 ## Health and lifecycle
@@ -196,9 +198,15 @@ context, so the worker needs a restart. (An out-of-memory is a `503 GPU OOM` on 
 
 Two blocks identify what is running, so a client (argus-proof's run manifest) can pin it:
 
-- `image` (Miso, XTTS, Qwen): `{"version", "revision"}`, the release (`0.2.0`) and git commit the image was built
-  from, baked in as build args (`ECHO_VERSION`, `ECHO_REVISION`) by the release workflow. Both are `null` for an
-  image built without them (a local `docker compose build`). The image **digest** is not there: it only exists
+- `image` (every engine): `{"version", "revision", "runtime"}`. `version` and `revision` are the release (`0.2.0`)
+  and git commit the image was built from, baked in as build args (`ECHO_VERSION`, `ECHO_REVISION`) by the release
+  workflow; both are `null` for an image built without them (a local `docker compose build`). `runtime` names the
+  library versions that shape the output, read once from the running process: `python`, and on the torch engines
+  `torch`, `cuda` and `cudnn` (torch's own build), then each engine's libraries: `coqui-tts`, `transformers`,
+  `torchaudio`, `numpy` (XTTS); `qwen-tts`, `transformers`, `accelerate`, `torchaudio`, `numpy` (Qwen); `moshi`,
+  `transformers`, `torchaudio`, `numpy` (Miso); `faster-whisper`, `ctranslate2`, `nvidia-cublas-cu12`,
+  `nvidia-cudnn-cu12`, `numpy` (Whisper). A library that isn't installed is `null`. Two builds of one revision can
+  install different versions, which is why `runtime` is there. The image **digest** is not there: it only exists
   once the image is built, and a running container cannot read it (nor the OCI labels the release sets). Take it
   from whoever deployed the container (`docker inspect`, compose, iris), or record the tag.
 - `weights` (XTTS, Qwen): `{"checkpoint", "fingerprint", "files"}`, plus `models` on Qwen. `checkpoint` is the

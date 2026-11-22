@@ -109,7 +109,7 @@ def mgr(monkeypatch):
     model = _FakeModel()
     moves = []
 
-    async def promote():
+    async def promote(retry_now=False):
         if m._state != xs.TTSState.GPU:
             m._model = model
             m._state = xs.TTSState.GPU
@@ -607,7 +607,7 @@ def _archive(meta=None, meta_raw=None, prompt=None, extra=0) -> bytes:
         prompt = {"gpt_cond_latent": torch.randn(1, 32, 1024), "speaker_embedding": torch.randn(1, 512, 1)}
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("prompt.pt", _saved(prompt))
+        zf.writestr("prompt.safetensors", xs._prompt_to_safetensors(prompt))
         if meta_raw is not None:
             zf.writestr("meta.json", meta_raw)
         elif meta is not None:

@@ -37,15 +37,21 @@ Differences from the other engines:
 `GET /clones`, `GET /clones/{companion_id}/download`, `DELETE /clones/{companion_id}` and `POST /clones/import`
 behave as on XTTS (see [miso-api.md](miso-api.md#get-clones) for the shapes), with these Qwen specifics:
 
-- A Qwen `prompt.pt` is qwen-tts's `create_voice_clone_prompt` result: a one-item list of
-  `VoiceClonePromptItem` (speaker embedding, and for ICL clones the reference codec tokens and transcript). It
-  is loaded with `torch.load(weights_only=True)` with only that class allowed, so a clone can't run code.
+- A stored Qwen `prompt.pt` is qwen-tts's `create_voice_clone_prompt` result: a one-item list of
+  `VoiceClonePromptItem` (speaker embedding, and for ICL clones the reference codec tokens and transcript). Only
+  this server writes it, and it is loaded with `torch.load(weights_only=True)` with only that class allowed.
+- The download archive carries the item as `prompt.safetensors`: `ref_spk_embedding` (float32) and, for an ICL
+  clone, `ref_code` (int64) as tensors, with `x_vector_only_mode`, `icl_mode`, `ref_text` and the embedding's own
+  dtype (`ref_spk_embedding_dtype`, so a bfloat16 embedding comes back as bfloat16) as safetensors metadata.
+  Parsing it never runs code.
 - `GET /clones` lists every `voice_clones/<id>/prompt.pt`. Clones made before Qwen wrote `meta.json` are listed
   from the prompt alone (`name` = id, `created_at` = upload time), and their download carries a generated
   `meta.json`. Every `meta.json` Qwen writes has `"engine": "qwen-tts"`.
-- `POST /clones/import` accepts only a Qwen clone: `422` if the archive's `meta.json` names another engine, or if
-  its `prompt.pt` is not exactly one valid `VoiceClonePromptItem` (a Miso or XTTS `prompt.pt` is a dict and
-  fails). The prompt is re-serialised from the validated fields. `409` if the id is taken and `replace` is not
+- `POST /clones/import` accepts only a Qwen clone: `422` if the archive's `meta.json` or prompt metadata names
+  another engine, or if its `prompt.safetensors` doesn't make one valid `VoiceClonePromptItem` (a Miso or XTTS
+  prompt has other tensors and fails). An archive with only a pickled `prompt.pt` (a download from before this
+  version) is refused unread, since unpickling an upload can run code: re-export it from a current Qwen engine.
+  The prompt is re-serialised from the validated fields. `409` if the id is taken and `replace` is not
   `true`; `413` over 17 MiB.
 
 ## POST /analyze-clips

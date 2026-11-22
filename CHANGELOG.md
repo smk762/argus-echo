@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Security
+- XTTS and Qwen clone archives carry `prompt.safetensors`, as Miso's have since #20. `GET /clones/{id}/download`
+  writes it and `POST /clones/import` reads it with safetensors only. An uploaded archive used to reach
+  `torch.load(weights_only=True)` (Qwen: with one class allowed), which on these images' torch 2.6 is
+  GHSA-63cw-57p8-fm3p, code execution through an untrusted checkpoint (fixed in torch 2.10). An archive holding
+  only a pickled `prompt.pt` is now refused unread (`422`): re-download clones from an engine on this version
+  before moving them. Stored clones are unchanged (`prompt.pt`, written by the server). Qwen's archive keeps the
+  speaker embedding's dtype (bfloat16 included) in its metadata (#6).
+
 ### Changed
 - The XTTS, Qwen and Miso images pin every package to an exact version (#32), so a revision implies its library
   stack: `engines/xtts/constraints.txt` and `engines/qwen/constraints.txt` constrain every `pip install`, and
@@ -12,6 +21,12 @@
   CUDA. `tests/test_repo_rules.py` fails an unconstrained install.
 
 ### Added
+- `/health` `image.runtime` on every engine (#32): the versions of python, torch, CUDA and cuDNN (torch engines)
+  and each engine's libraries (coqui-tts, qwen-tts, moshi, faster-whisper and ctranslate2, transformers, ...),
+  read once from the running process. A revision doesn't fix the stack, so reproducibility claims compare
+  `runtime` too. Whisper's `/health` gains `image` (`version`, `revision`, `runtime`), and its image now takes
+  the release's `ECHO_VERSION`/`ECHO_REVISION` build args. `ImageIdentity.runtime` in the contract;
+  `argus-echo check` prints it.
 - `QWEN_TAG` picks the Qwen image's tag on its own (default `ECHO_TAG`). The published image bakes 0.6b, so a host
   running 1.7b builds it locally under its own tag while `ECHO_TAG` keeps pulling the published images for the
   other engines.

@@ -340,10 +340,28 @@ def test_hashes_are_computed_once_per_load_not_per_request(client, coqui, mgr, m
 
 
 def test_health_reports_the_image_identity(client, monkeypatch):
-    assert client.get("/health").json()["image"] == {"version": None, "revision": None}
+    image = client.get("/health").json()["image"]
+    assert (image["version"], image["revision"]) == (None, None)
     monkeypatch.setattr(xs, "ECHO_VERSION", "0.2.0")
     monkeypatch.setattr(xs, "ECHO_REVISION", "abc123")
-    assert client.get("/health").json()["image"] == {"version": "0.2.0", "revision": "abc123"}
+    image = client.get("/health").json()["image"]
+    assert (image["version"], image["revision"]) == ("0.2.0", "abc123")
+
+
+def test_health_reports_the_runtime_libraries(client, monkeypatch):
+    """#32: the library versions that shape the audio, so a revision isn't mistaken for a fixed stack."""
+    import importlib.metadata
+
+    versions = {"coqui-tts": "0.28.0", "transformers": "4.57.5", "torchaudio": "2.6.0+cu124", "numpy": "2.4.6"}
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: versions[name])
+    xs._runtime.cache_clear()
+    try:
+        runtime = client.get("/health").json()["image"]["runtime"]
+    finally:
+        xs._runtime.cache_clear()
+    assert {k: runtime[k] for k in versions} == versions
+    assert set(runtime) == {"python", "torch", "cuda", "cudnn", *versions}
+    assert runtime["python"].count(".") == 2
 
 
 # ── seed ─────────────────────────────────────────────────────────────────────
