@@ -17,6 +17,7 @@ engines, so a client can switch engines by changing its URL:
   GET  /speakers           — built-in XTTS studio speakers
   GET  /health             — status + GPU memory
   POST /admin/{evict,unload,wake}
+  POST /admin/load         — load a fine-tuned checkpoint from XTTS_CHECKPOINT_ROOT
 
 GPU memory lifecycle (three-state, like the Qwen sidecar / ModernBERT):
   unloaded → cpu → gpu
@@ -45,6 +46,10 @@ Env vars:
   XTTS_CPU_FALLBACK    — "1" (default): when the model can't be moved onto the GPU
                          (CUDA OOM), synthesise on the CPU copy instead; "0": 503
   XTTS_OOM_RETRY_AFTER_S — Retry-After on that 503 (default 30)
+  XTTS_CHECKPOINT_ROOT — directory of fine-tuned checkpoints POST /admin/load may load
+                         (unset: the route answers 503). See docs/xtts.md.
+  ECHO_VERSION / ECHO_REVISION — the image's release and git revision (build args),
+                         reported in /health as ``image``
 
   A synth request may send ``device: "cpu"`` (a client does when argus-iris refuses
   its GPU lease): the model is used where it is (loaded to CPU if it isn't) and is
@@ -69,13 +74,17 @@ import time
 import uuid
 from collections import OrderedDict
 import contextlib
+import hashlib
+import random
 from contextlib import asynccontextmanager
 from enum import Enum
+from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import urlsplit
 
 import structlog
 from argus_cortex.auth import bearer
+from argus_cortex.fs import PathRefused, safe_join
 from starlette.requests import HTTPConnection
 from fastapi import Depends, FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
@@ -95,6 +104,11 @@ TEMPERATURE: float = float(os.getenv("XTTS_TEMPERATURE", "0.7"))
 STREAM_CHUNK_SIZE: int = int(os.getenv("XTTS_STREAM_CHUNK_SIZE", "20"))
 CPU_FALLBACK: bool = os.getenv("XTTS_CPU_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
 OOM_RETRY_AFTER_S: int = int(os.getenv("XTTS_OOM_RETRY_AFTER_S", "30"))
+# Fine-tuned checkpoints POST /admin/load may load, one directory each (see _resolve_checkpoint).
+CHECKPOINT_ROOT: str = os.getenv("XTTS_CHECKPOINT_ROOT", "").strip()
+# The image's identity, baked in at build time (release.yml); None for a local build.
+ECHO_VERSION: Optional[str] = os.getenv("ECHO_VERSION", "").strip() or None
+ECHO_REVISION: Optional[str] = os.getenv("ECHO_REVISION", "").strip() or None
 
 # Reference-clip preprocessing (applied at clone time, before latents).
 PREPROCESS: bool = os.getenv("XTTS_PREPROCESS", "1") == "1"
@@ -200,6 +214,163 @@ def _release_cuda_cache() -> None:
     torch.cuda.empty_cache()
 
 
+# ── Weights: checkpoints and their hashes ────────────────────────────────────
+
+# What a checkpoint directory must hold: what Xtts.load_checkpoint reads. speakers_xtts.pth is optional (without it
+# the model has no built-in speakers, so a request needs a voice_clone_id).
+CHECKPOINT_REQUIRED = ("config.json", "model.pth", "vocab.json")
+CHECKPOINT_OPTIONAL = ("speakers_xtts.pth",)
+
+
+class CheckpointRefused(Exception):
+    """``POST /admin/load`` can't use the named checkpoint; ``status`` is the HTTP answer."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _resolve_checkpoint(name: str) -> Path:
+    """The directory of checkpoint *name* under ``XTTS_CHECKPOINT_ROOT``, checked before anything is unloaded.
+
+    503 when no root is configured, 400 for a name that escapes the root (argus-cortex ``safe_join``: ``..``, an
+    absolute path, a symlink out), 404 when there is no such directory, 422 when it isn't an XTTS checkpoint."""
+    if not CHECKPOINT_ROOT:
+        raise CheckpointRefused(503, "XTTS_CHECKPOINT_ROOT is not set: this engine loads no checkpoints")
+    root = Path(CHECKPOINT_ROOT)
+    if not root.is_dir():
+        raise CheckpointRefused(503, f"XTTS_CHECKPOINT_ROOT ({CHECKPOINT_ROOT}) is not a directory")
+    try:
+        path = safe_join(root, name, label="checkpoint")
+    except PathRefused as exc:
+        raise CheckpointRefused(400, str(exc)) from None
+    if not path.exists():
+        raise CheckpointRefused(404, f"no checkpoint {name!r} under XTTS_CHECKPOINT_ROOT")
+    if not path.is_dir():
+        raise CheckpointRefused(422, f"checkpoint {name!r} is not a directory")
+    base = root.resolve()
+    missing = [f for f in CHECKPOINT_REQUIRED if not (path / f).is_file()]
+    if missing:
+        raise CheckpointRefused(
+            422, f"checkpoint {name!r} is not an XTTS checkpoint: missing {', '.join(missing)}"
+        )
+    for f in CHECKPOINT_REQUIRED + CHECKPOINT_OPTIONAL:
+        if (path / f).exists() and not (path / f).resolve().is_relative_to(base):
+            raise CheckpointRefused(400, f"checkpoint {name!r}: {f} links outside XTTS_CHECKPOINT_ROOT")
+    try:
+        config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CheckpointRefused(422, f"checkpoint {name!r}: config.json is not JSON ({exc})") from None
+    if not isinstance(config, dict) or config.get("model") != "xtts":
+        raise CheckpointRefused(422, f"checkpoint {name!r}: config.json is not an XTTS config (model != \"xtts\")")
+    return path
+
+
+# sha256 by (resolved path, size, mtime): a reload of unchanged files (after an idle unload) is not hashed again.
+_hash_cache: dict[tuple[str, int, int], str] = {}
+_hash_cache_lock = threading.Lock()
+
+
+def _sha256(path: Path) -> str:
+    st = path.stat()
+    key = (str(path.resolve()), st.st_size, st.st_mtime_ns)
+    with _hash_cache_lock:
+        if key in _hash_cache:
+            return _hash_cache[key]
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    value = digest.hexdigest()
+    with _hash_cache_lock:
+        _hash_cache[key] = value
+    return value
+
+
+def _weight_files(paths: dict[str, Path]) -> list[dict]:
+    """``[{name, sha256, bytes}]`` for the files a load read. Blocking: called in the load's worker thread."""
+    return [
+        {"name": name, "sha256": _sha256(path), "bytes": path.stat().st_size}
+        for name, path in sorted(paths.items())
+    ]
+
+
+# ── Seeded generation ────────────────────────────────────────────────────────
+
+SEED_MAX = 2**32 - 1  # numpy's legacy seed range, and every engine's contract bound
+
+
+class _RngGate:
+    """Who may draw from torch's process-wide RNG while a generation samples.
+
+    Unseeded generations share it (they run side by side, as before seeds existed). A seeded one runs alone: it
+    waits for those in flight, new ones wait for it, and it seeds at the start, so nothing else draws between its
+    seed and its last sample. Blocking (threading): enter it from the generation's worker thread, never the event
+    loop. Waiting seeded generations go first, so a stream of unseeded ones can't starve them."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._shared = 0
+        self._exclusive = False
+        self._waiting = 0
+
+    @contextlib.contextmanager
+    def shared(self):
+        with self._cond:
+            self._cond.wait_for(lambda: not self._exclusive and not self._waiting)
+            self._shared += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._shared -= 1
+                self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def exclusive(self):
+        with self._cond:
+            self._waiting += 1
+            try:
+                self._cond.wait_for(lambda: not self._exclusive and not self._shared)
+            finally:
+                self._waiting -= 1
+            self._exclusive = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._exclusive = False
+                self._cond.notify_all()
+
+
+_rng_gate = _RngGate()
+
+
+def _seed_rngs(seed: int) -> None:
+    """Seed every RNG generation can draw from: python's, numpy's and torch's (``manual_seed`` seeds the CPU
+    generator and every CUDA device's)."""
+    random.seed(seed)
+    with contextlib.suppress(ImportError):
+        import numpy as np
+
+        np.random.seed(seed)
+    import torch
+
+    torch.manual_seed(seed)
+
+
+@contextlib.contextmanager
+def _sampling(seed: Optional[int]):
+    """Around one generation (in its worker thread): seeded and alone, or unseeded and shared. See _RngGate."""
+    if seed is None:
+        with _rng_gate.shared():
+            yield
+        return
+    with _rng_gate.exclusive():
+        _seed_rngs(seed)
+        yield
+
+
 class XTTSModelManager:
     """Three-state lifecycle: unloaded → cpu → gpu (mirrors the Qwen sidecar)."""
 
@@ -218,10 +389,24 @@ class XTTSModelManager:
         # state itself, awaited through asyncio.shield: a cancelled caller (client
         # gone, timeout) can't strand the state in LOADING or naming the old device.
         self._transition: Optional[asyncio.Task] = None
+        # The weights a load reads: None for the stock model, else (name, directory) of a checkpoint that
+        # /admin/load selected. Only /admin/load and /admin/unload change it; an idle unload keeps it, so the next
+        # load reads the same weights.
+        self._checkpoint: Optional[tuple[str, Path]] = None
+        # [{name, sha256, bytes}] of the files the last load of the selected weights read; None until one has.
+        self._weight_files: Optional[list[dict]] = None
 
     @property
     def state(self) -> TTSState:
         return self._state
+
+    @property
+    def weights(self) -> dict:
+        """``/health``'s ``weights``: the selected checkpoint (None = stock) and the files its last load hashed."""
+        return {
+            "checkpoint": self._checkpoint[0] if self._checkpoint else None,
+            "files": self._weight_files,
+        }
 
     @property
     def model(self):
@@ -231,12 +416,9 @@ class XTTSModelManager:
     def is_ready(self) -> bool:
         return self._state in (TTSState.CPU, TTSState.GPU)
 
-    def _load_to_cpu(self) -> None:
-        from TTS.tts.configs.xtts_config import XttsConfig
-        from TTS.tts.models.xtts import Xtts
+    def _stock_paths(self) -> tuple[str, Optional[str], str]:
+        """``(checkpoint_dir, checkpoint_path, config_path)`` of the stock model, downloaded if it isn't cached."""
         from TTS.utils.manage import ModelManager
-
-        logger.info("loading_xtts", model=XTTS_MODEL, target="cpu")
 
         # Download (no-op if cached). coqui-tts may return the checkpoint
         # file itself; load_checkpoint rejects a file passed as checkpoint_dir.
@@ -250,6 +432,22 @@ class XTTSModelManager:
             checkpoint_dir = model_path
         if config_path is None:
             config_path = os.path.join(checkpoint_dir, "config.json")
+        return checkpoint_dir, checkpoint_path, os.fspath(config_path)
+
+    def _load_to_cpu(self) -> None:
+        from TTS.tts.configs.xtts_config import XttsConfig
+        from TTS.tts.models.xtts import Xtts
+
+        checkpoint = self._checkpoint
+        self._weight_files = None  # until this load hashes what it read
+        if checkpoint is None:
+            logger.info("loading_xtts", model=XTTS_MODEL, target="cpu")
+            checkpoint_dir, checkpoint_path, config_path = self._stock_paths()
+        else:
+            logger.info("loading_xtts_checkpoint", checkpoint=checkpoint[0], target="cpu")
+            checkpoint_dir = os.fspath(checkpoint[1])
+            checkpoint_path = os.path.join(checkpoint_dir, "model.pth")
+            config_path = os.path.join(checkpoint_dir, "config.json")
 
         config = XttsConfig()
         config.load_json(str(config_path))
@@ -261,9 +459,20 @@ class XTTSModelManager:
             use_deepspeed=USE_DEEPSPEED,
         )
         model.eval()
+        # The files load_checkpoint read, hashed here (the load's worker thread) once per load, never per request.
+        # A hash that fails fails the load: nothing is assigned, so no model runs unreported.
+        read = {
+            "config.json": Path(config_path),
+            "model.pth": Path(checkpoint_path or os.path.join(checkpoint_dir, "model.pth")),
+        }
+        for name in ("vocab.json",) + CHECKPOINT_OPTIONAL:
+            if os.path.isfile(os.path.join(checkpoint_dir, name)):
+                read[name] = Path(checkpoint_dir, name)
+        files = _weight_files(read)
         self._config = config
         self._model = model
-        logger.info("xtts_loaded_cpu")
+        self._weight_files = files
+        logger.info("xtts_loaded_cpu", checkpoint=checkpoint[0] if checkpoint else None, files=len(files))
 
     def _move_to_device(self, device: str) -> None:
         import torch
@@ -476,9 +685,11 @@ class XTTSModelManager:
             self._arm_evict()
         return True
 
-    async def unload(self, force: bool = False) -> bool:
+    async def unload(self, force: bool = False, to_stock: bool = False) -> bool:
         """Drop the model entirely. Skipped (False) while a lease is held,
-        unless ``force`` (app shutdown)."""
+        unless ``force`` (app shutdown). ``to_stock`` (``/admin/unload``) also
+        drops a loaded checkpoint, so the next load reads the stock weights;
+        the idle unload keeps it."""
         async with self._lock:
             if self._active > 0 and not force:
                 logger.info("xtts_unload_deferred", active=self._active)
@@ -486,13 +697,53 @@ class XTTSModelManager:
             # An orphaned load's thread would otherwise assign the model after this frees it.
             await self._await_transition()
             self._cancel_evict()
-            if self._model is not None:
-                del self._model
-                self._model = None
-            self._config = None
-            _release_cuda_cache()
+            self._free_locked()
+            if to_stock and self._checkpoint is not None:
+                logger.info("xtts_checkpoint_dropped", checkpoint=self._checkpoint[0])
+                self._checkpoint = None
+                self._weight_files = None
             self._state = TTSState.UNLOADED
             logger.info("xtts_fully_unloaded")
+            return True
+
+    def _free_locked(self) -> None:
+        """Drop the model and return its memory. Caller holds ``_lock``; does not set the state."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+        self._config = None
+        _release_cuda_cache()
+
+    async def load_weights(self, checkpoint: Optional[tuple[str, Path]]) -> bool:
+        """``/admin/load``: replace whatever is loaded by *checkpoint* (``(name, directory)``; None = stock), loaded
+        to the CPU now and hashed. False while a lease is held (busy): nothing changes.
+
+        It waits for a load or move in progress, frees the old model, then loads the new one as a shielded
+        transition, so a cancelled caller can't strand it half-way. A load that fails leaves nothing loaded and the
+        stock weights selected (the state says ``error``; the next request loads stock), and raises."""
+        async with self._lock:
+            if self._active > 0:
+                logger.info("xtts_load_refused_busy", active=self._active)
+                return False
+            await self._await_transition()
+            self._cancel_evict()
+            self._free_locked()
+            self._checkpoint = checkpoint
+            self._weight_files = None
+            self._state = TTSState.LOADING
+
+            async def load() -> None:
+                try:
+                    await self._do_load()
+                except BaseException:
+                    self._checkpoint = None
+                    self._weight_files = None
+                    raise
+
+            await self._run_transition(load())
+            self._last_used = time.time()
+            if self._active == 0:
+                self._arm_evict()
             return True
 
     def _cancel_evict(self) -> None:
@@ -830,21 +1081,25 @@ class SynthesiseRequest(BaseModel):
     speed: Optional[float] = None
     # "cpu": don't promote to the GPU (a client sends it when argus-iris refuses its GPU lease).
     device: Optional[Literal["cpu"]] = None
+    # Seeds the sampler for this request (python, numpy, torch CPU and CUDA). Same seed, text, voice, device and
+    # weights: the same audio, within the limits docs/api.md states.
+    seed: Optional[int] = Field(default=None, ge=0, le=SEED_MAX)
 
 
 # ── Synthesis helpers ──────────────────────────────────────────────────────────
 
 
-def _run_inference(text: str, language: str, gpt, spk, speed: float):
-    out = _mgr.model.inference(
-        text,
-        language,
-        gpt,
-        spk,
-        temperature=TEMPERATURE,
-        speed=speed,
-        enable_text_splitting=True,
-    )
+def _run_inference(text: str, language: str, gpt, spk, speed: float, seed: Optional[int] = None):
+    with _sampling(seed):
+        out = _mgr.model.inference(
+            text,
+            language,
+            gpt,
+            spk,
+            temperature=TEMPERATURE,
+            speed=speed,
+            enable_text_splitting=True,
+        )
     return out["wav"]
 
 
@@ -876,7 +1131,7 @@ async def synthesise(req: SynthesiseRequest):
 
         t_gen0 = time.monotonic()
         try:
-            wav = await asyncio.to_thread(_run_inference, req.text, language, gpt, spk, speed)
+            wav = await asyncio.to_thread(_run_inference, req.text, language, gpt, spk, speed, req.seed)
         except RuntimeError as exc:
             refused = _gpu_error_response(exc, "xtts_gpu_oom")
             if refused is not None:
@@ -923,6 +1178,7 @@ async def synthesise(req: SynthesiseRequest):
         "duration_seconds": round(duration, 3),
         "format": "wav",
         "device": ran_on,
+        "seed": req.seed,
     }
 
 
@@ -994,21 +1250,24 @@ async def synthesise_stream(req: SynthesiseRequest):
 
             stream = None
             try:
-                stream = _mgr.model.inference_stream(
-                    req.text,
-                    language,
-                    gpt,
-                    spk,
-                    temperature=TEMPERATURE,
-                    speed=speed,
-                    stream_chunk_size=STREAM_CHUNK_SIZE,
-                    enable_text_splitting=True,
-                )
-                for chunk in stream:
-                    if isinstance(chunk, torch.Tensor):
-                        chunk = chunk.detach().cpu().to(torch.float32).numpy()
-                    if not _put(chunk.tobytes()):
-                        break  # client went away: stop generating
+                # inference_stream samples lazily, chunk by chunk: a seeded stream keeps the RNG to itself until
+                # its last chunk, including while a slow client holds it back (see _RngGate).
+                with _sampling(req.seed):
+                    stream = _mgr.model.inference_stream(
+                        req.text,
+                        language,
+                        gpt,
+                        spk,
+                        temperature=TEMPERATURE,
+                        speed=speed,
+                        stream_chunk_size=STREAM_CHUNK_SIZE,
+                        enable_text_splitting=True,
+                    )
+                    for chunk in stream:
+                        if isinstance(chunk, torch.Tensor):
+                            chunk = chunk.detach().cpu().to(torch.float32).numpy()
+                        if not _put(chunk.tobytes()):
+                            break  # client went away: stop generating
             except Exception as exc:  # surface as stream termination
                 logger.error("xtts_stream_failed", error=str(exc), exc_info=True)
                 if isinstance(exc, RuntimeError) and not _is_oom(exc) and "cuda" in str(exc).lower():
@@ -1963,6 +2222,8 @@ async def health():
         "keep_alive_gpu": KEEP_ALIVE_GPU,
         "keep_alive_cpu": KEEP_ALIVE_CPU,
         "gpu": _resident_gpu(),
+        "weights": _mgr.weights,
+        "image": _image(),
     }
     if _gpu_fault is not None:
         # A fatal CUDA error: fail the container healthcheck so the worker is recycled.
@@ -2057,14 +2318,67 @@ async def admin_evict():
 
 @app.post("/admin/unload", dependencies=[Depends(_require_admin)])
 async def admin_unload():
-    """Fully unload the model from memory (GPU + CPU)."""
+    """Fully unload the model from memory (GPU + CPU). A loaded checkpoint is dropped too: the next load is stock."""
     was_loaded = _mgr.state in (TTSState.CPU, TTSState.GPU)
-    if not await _mgr.unload():
+    if not await _mgr.unload(to_stock=True):
         return JSONResponse(
             status_code=409,
             content={"status": "busy", "active": _mgr.active, "model_state": _mgr.state.value},
         )
-    return {"status": "unloaded", "unloaded": was_loaded, "model_state": _mgr.state.value, "gpu": _resident_gpu()}
+    return {
+        "status": "unloaded",
+        "unloaded": was_loaded,
+        "model_state": _mgr.state.value,
+        "gpu": _resident_gpu(),
+        "weights": _mgr.weights,
+    }
+
+
+class LoadRequest(BaseModel):
+    # A directory name under XTTS_CHECKPOINT_ROOT (may be nested: "forge/run-7"); null loads the stock weights.
+    checkpoint: Optional[str] = Field(...)
+
+
+def _image() -> dict:
+    """``/health``'s ``image``: the release and git revision baked in at build time (null for a local build). A
+    container can't see its own image digest; whoever deployed it (compose, iris) knows that."""
+    return {"version": ECHO_VERSION, "revision": ECHO_REVISION}
+
+
+@app.post("/admin/load", dependencies=[Depends(_require_admin)])
+async def admin_load(req: LoadRequest):
+    """Load a fine-tuned checkpoint from ``XTTS_CHECKPOINT_ROOT`` (or the stock weights, for ``null``) onto the CPU,
+    replacing the loaded model, and hash its files. The next request promotes it to the GPU as usual.
+
+    400 a name that escapes the root, 404 no such checkpoint, 422 not an XTTS checkpoint, 409 busy (a request holds
+    the model; nothing changes), 503 no checkpoint root configured, 500 the load failed (nothing is loaded and the
+    stock weights are selected)."""
+    selected = None
+    if req.checkpoint is not None:
+        try:
+            selected = (req.checkpoint, _resolve_checkpoint(req.checkpoint))
+        except CheckpointRefused as exc:
+            logger.warning("xtts_checkpoint_refused", checkpoint=req.checkpoint, status=exc.status, error=str(exc))
+            return JSONResponse(status_code=exc.status, content={"error": str(exc)})
+    try:
+        loaded = await _mgr.load_weights(selected)
+    except Exception as exc:
+        logger.error("xtts_checkpoint_load_failed", checkpoint=req.checkpoint, error=str(exc), exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"loading {req.checkpoint or 'the stock weights'} failed: {exc}",
+                "model_state": _mgr.state.value,
+                "weights": _mgr.weights,
+            },
+        )
+    if not loaded:
+        return JSONResponse(
+            status_code=409,
+            content={"status": "busy", "active": _mgr.active, "model_state": _mgr.state.value},
+        )
+    logger.info("xtts_checkpoint_loaded", checkpoint=req.checkpoint)
+    return {"status": "loaded", "model_state": _mgr.state.value, "weights": _mgr.weights, "gpu": _resident_gpu()}
 
 
 @app.post("/admin/wake", dependencies=[Depends(_require_admin)])

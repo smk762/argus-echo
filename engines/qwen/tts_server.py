@@ -31,6 +31,10 @@ Env vars:
                           to CPU.  -1 = forever, 0 = immediate.  Default 120.
   TTS_KEEP_ALIVE_CPU   — seconds on CPU after GPU eviction before full
                           unload.  -1 = forever, 0 = immediate.  Default 600.
+  TTS_CHECKPOINT_ROOT  — directory of fine-tuned checkpoints POST /admin/load may
+                          load (unset: the route answers 503). See docs/qwen.md.
+  ECHO_VERSION / ECHO_REVISION — the image's release and git revision (build
+                          args), reported in /health as ``image``
   S3_ENDPOINT_URL      — MinIO/S3 endpoint
   S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_BUCKET_NAME / S3_PUBLIC_URL
 """
@@ -50,13 +54,17 @@ import uuid
 import weakref
 from collections import OrderedDict
 import contextlib
+import hashlib
+import random
 from contextlib import asynccontextmanager
 from enum import Enum
+from pathlib import Path
 from typing import AsyncIterator, Optional
 from urllib.parse import urlsplit
 
 import structlog
 from argus_cortex.auth import bearer
+from argus_cortex.fs import PathRefused, safe_join
 from argus_cortex.limits import BadInput, TooLarge, read_upload
 from starlette.requests import ClientDisconnect, HTTPConnection
 from fastapi import Depends, FastAPI, File, Form, UploadFile
@@ -84,6 +92,11 @@ DEFAULT_SPEAKER = os.getenv("TTS_DEFAULT_SPEAKER", "").strip()
 PRELOAD = os.getenv("TTS_PRELOAD", "0") == "1"
 KEEP_ALIVE_GPU: float = float(os.getenv("TTS_KEEP_ALIVE_GPU", "120"))
 KEEP_ALIVE_CPU: float = float(os.getenv("TTS_KEEP_ALIVE_CPU", "600"))
+# Fine-tuned checkpoints POST /admin/load may load, one directory each (see _resolve_checkpoint).
+CHECKPOINT_ROOT: str = os.getenv("TTS_CHECKPOINT_ROOT", "").strip()
+# The image's identity, baked in at build time (release.yml); None for a local build.
+ECHO_VERSION: Optional[str] = os.getenv("ECHO_VERSION", "").strip() or None
+ECHO_REVISION: Optional[str] = os.getenv("ECHO_REVISION", "").strip() or None
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "http://localhost:9000")
 # No default credentials: a deployment that forgot them must not run on MinIO's
 # well-known root account. See _require_s3_credentials().
@@ -206,6 +219,209 @@ def _move_speech_tokenizer(model, target) -> None:
     tokenizer.device = getattr(module, "device", target)
 
 
+# ── Weights: checkpoints and their hashes ────────────────────────────────────
+
+# What a checkpoint directory must hold to load with Qwen3TTSModel.from_pretrained: the model config and weights,
+# generation_config.json and speech_tokenizer/ (its from_pretrained reads both), and the text tokenizer the
+# processor loads. The Qwen3-TTS fine-tuning scripts write such a directory: a copy of the model they started from
+# with the trained weights and config.json written over it.
+CHECKPOINT_REQUIRED = ("config.json", "generation_config.json", "tokenizer_config.json", "speech_tokenizer/config.json")
+CHECKPOINT_WEIGHTS = ("model.safetensors", "model.safetensors.index.json")
+# The model slots a checkpoint can fill, by its config.json ``tts_model_type``.
+CHECKPOINT_SLOTS = ("base", "custom_voice")
+
+
+class CheckpointRefused(Exception):
+    """``POST /admin/load`` can't use the named checkpoint; ``status`` is the HTTP answer."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _model_files(directory: Path) -> dict[str, Path]:
+    """The files a load reads from a model directory: its top level and ``speech_tokenizer/`` (dotfiles skipped),
+    by path relative to it."""
+    files: dict[str, Path] = {}
+    for sub in ("", "speech_tokenizer"):
+        folder = directory / sub if sub else directory
+        if not folder.is_dir():
+            continue
+        for path in sorted(folder.iterdir()):
+            if path.name.startswith(".") or not path.is_file():
+                continue
+            files[f"{sub}/{path.name}" if sub else path.name] = path
+    return files
+
+
+def _resolve_checkpoint(name: str) -> tuple[Path, str]:
+    """``(directory, slot)`` of checkpoint *name* under ``TTS_CHECKPOINT_ROOT``, checked before anything unloads.
+
+    503 when no root is configured, 400 for a name that escapes the root (argus-cortex ``safe_join``: ``..``, an
+    absolute path, a symlink out), 404 when there is no such directory, 422 when it isn't a Qwen3-TTS model
+    directory of a type this engine serves (``base`` or ``custom_voice``)."""
+    if not CHECKPOINT_ROOT:
+        raise CheckpointRefused(503, "TTS_CHECKPOINT_ROOT is not set: this engine loads no checkpoints")
+    root = Path(CHECKPOINT_ROOT)
+    if not root.is_dir():
+        raise CheckpointRefused(503, f"TTS_CHECKPOINT_ROOT ({CHECKPOINT_ROOT}) is not a directory")
+    try:
+        path = safe_join(root, name, label="checkpoint")
+    except PathRefused as exc:
+        raise CheckpointRefused(400, str(exc)) from None
+    if not path.exists():
+        raise CheckpointRefused(404, f"no checkpoint {name!r} under TTS_CHECKPOINT_ROOT")
+    if not path.is_dir():
+        raise CheckpointRefused(422, f"checkpoint {name!r} is not a directory")
+    missing = [f for f in CHECKPOINT_REQUIRED if not (path / f).is_file()]
+    if not any((path / f).is_file() for f in CHECKPOINT_WEIGHTS):
+        missing.append(" or ".join(CHECKPOINT_WEIGHTS))
+    if missing:
+        raise CheckpointRefused(
+            422, f"checkpoint {name!r} is not a Qwen3-TTS model directory: missing {', '.join(missing)}"
+        )
+    base = root.resolve()
+    for rel, file in _model_files(path).items():
+        if not file.resolve().is_relative_to(base):
+            raise CheckpointRefused(400, f"checkpoint {name!r}: {rel} links outside TTS_CHECKPOINT_ROOT")
+    try:
+        config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CheckpointRefused(422, f"checkpoint {name!r}: config.json is not JSON ({exc})") from None
+    if not isinstance(config, dict) or config.get("model_type") != "qwen3_tts":
+        raise CheckpointRefused(422, f"checkpoint {name!r}: config.json is not a Qwen3-TTS config")
+    slot = config.get("tts_model_type")
+    if slot not in CHECKPOINT_SLOTS:
+        raise CheckpointRefused(
+            422, f"checkpoint {name!r}: tts_model_type {slot!r} is not one this engine serves (base, custom_voice)"
+        )
+    return path, slot
+
+
+def _stock_dir(model_id: str) -> Path:
+    """The local snapshot of a stock model (already downloaded by its load)."""
+    from huggingface_hub import snapshot_download
+
+    return Path(snapshot_download(model_id, local_files_only=True))
+
+
+# sha256 by (resolved path, size, mtime): a reload of unchanged files (after an idle unload) is not hashed again.
+_hash_cache: dict[tuple[str, int, int], str] = {}
+_hash_cache_lock = threading.Lock()
+
+
+def _sha256(path: Path) -> str:
+    st = path.stat()
+    key = (str(path.resolve()), st.st_size, st.st_mtime_ns)
+    with _hash_cache_lock:
+        if key in _hash_cache:
+            return _hash_cache[key]
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    value = digest.hexdigest()
+    with _hash_cache_lock:
+        _hash_cache[key] = value
+    return value
+
+
+def _weight_files(paths: dict[str, Path]) -> list[dict]:
+    """``[{name, sha256, bytes}]`` for the files a load read. Blocking: called in the load's worker thread."""
+    return [
+        {"name": name, "sha256": _sha256(path), "bytes": path.stat().st_size}
+        for name, path in sorted(paths.items())
+    ]
+
+
+# ── Seeded generation ────────────────────────────────────────────────────────
+
+SEED_MAX = 2**32 - 1  # numpy's legacy seed range, and every engine's contract bound
+
+
+class _RngGate:
+    """Who may draw from torch's process-wide RNG while a generation samples.
+
+    Unseeded generations share it (they run side by side, as before seeds existed). A seeded one runs alone: it
+    waits for those in flight, new ones wait for it, and it seeds at the start, so nothing else draws between its
+    seed and its last sample. Blocking (threading): enter it from the generation's worker thread, never the event
+    loop. Waiting seeded generations go first, so a stream of unseeded ones can't starve them."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._shared = 0
+        self._exclusive = False
+        self._waiting = 0
+
+    @contextlib.contextmanager
+    def shared(self):
+        with self._cond:
+            self._cond.wait_for(lambda: not self._exclusive and not self._waiting)
+            self._shared += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._shared -= 1
+                self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def exclusive(self):
+        with self._cond:
+            self._waiting += 1
+            try:
+                self._cond.wait_for(lambda: not self._exclusive and not self._shared)
+            finally:
+                self._waiting -= 1
+            self._exclusive = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._exclusive = False
+                self._cond.notify_all()
+
+
+_rng_gate = _RngGate()
+
+
+def _seed_rngs(seed: int) -> None:
+    """Seed every RNG generation can draw from: python's, numpy's and torch's (``manual_seed`` seeds the CPU
+    generator and every CUDA device's)."""
+    random.seed(seed)
+    with contextlib.suppress(ImportError):
+        import numpy as np
+
+        np.random.seed(seed)
+    import torch
+
+    torch.manual_seed(seed)
+
+
+@contextlib.contextmanager
+def _sampling(seed: Optional[int]):
+    """Around one generation (in its worker thread): seeded and alone, or unseeded and shared. See _RngGate."""
+    if seed is None:
+        with _rng_gate.shared():
+            yield
+        return
+    with _rng_gate.exclusive():
+        _seed_rngs(seed)
+        yield
+
+
+def _seeded(render, seed: Optional[int]):
+    """``render(text)`` as ``run(text, index=0)``: each call sampled under the gate, a seeded one from
+    ``seed + index``. ``/synthesise`` renders once (index 0); ``/synthesise/stream`` renders sentence *index* with
+    its own seed, so it reseeds before every sentence and needn't keep the RNG between them."""
+
+    def run(text: str, index: int = 0):
+        with _sampling(None if seed is None else (seed + index) % (SEED_MAX + 1)):
+            return render(text)
+
+    return run
+
+
 class TTSModelManager:
     """Three-state lifecycle: unloaded → gpu → cpu.
 
@@ -241,10 +457,24 @@ class TTSModelManager:
         self._in_use = 0
         self._idle = asyncio.Event()
         self._idle.set()
+        # The checkpoint /admin/load selected, as (name, directory, slot), or None for the stock models. It replaces
+        # the model of its slot (base or custom_voice); the other slot loads stock per TTS_LOAD_MODELS. Only
+        # /admin/load and /admin/unload change it; an idle unload keeps it, so the next load reads the same weights.
+        self._checkpoint: Optional[tuple[str, Path, str]] = None
+        # [{name, sha256, bytes}] of the files the last load of the selected weights read; None until one has.
+        self._weight_files: Optional[list[dict]] = None
 
     @property
     def state(self) -> TTSState:
         return self._state
+
+    @property
+    def weights(self) -> dict:
+        """``/health``'s ``weights``: the selected checkpoint (None = stock) and the files its last load hashed."""
+        return {
+            "checkpoint": self._checkpoint[0] if self._checkpoint else None,
+            "files": self._weight_files,
+        }
 
     @property
     def base_model(self):
@@ -282,15 +512,34 @@ class TTSModelManager:
                     model_id, device_map=device_map, dtype=dtype,
                 )
 
-        if LOAD_MODELS in ("both", "base"):
-            logger.info("loading_qwen3_tts_base", model=ids["base"], target=device_map)
-            self._base_model = _load_one(ids["base"])
+        # Each slot loads the selected checkpoint if it is that slot's, else the stock model if TTS_LOAD_MODELS
+        # asks for it.
+        checkpoint = self._checkpoint
+        self._weight_files = None  # until this load hashes what it read
+        sources: dict[str, tuple[str, Optional[Path]]] = {}  # slot -> (what to load, its directory if local)
+        for slot in CHECKPOINT_SLOTS:
+            if checkpoint is not None and checkpoint[2] == slot:
+                sources[slot] = (os.fspath(checkpoint[1]), checkpoint[1])
+            elif LOAD_MODELS in ("both", slot):
+                sources[slot] = (ids[slot], None)
+
+        if "base" in sources:
+            logger.info("loading_qwen3_tts_base", model=sources["base"][0], target=device_map)
+            self._base_model = _load_one(sources["base"][0])
             logger.info("qwen3_tts_base_loaded", device=device_map)
 
-        if LOAD_MODELS in ("both", "custom_voice"):
-            logger.info("loading_qwen3_tts_custom_voice", model=ids["custom_voice"], target=device_map)
-            self._custom_model = _load_one(ids["custom_voice"])
+        if "custom_voice" in sources:
+            logger.info("loading_qwen3_tts_custom_voice", model=sources["custom_voice"][0], target=device_map)
+            self._custom_model = _load_one(sources["custom_voice"][0])
             logger.info("qwen3_tts_custom_voice_loaded", device=device_map)
+
+        # The files those loads read, hashed here (the load's worker thread) once per load, never per request. A
+        # hash that fails fails the load (_run_load frees the models), so no model runs unreported.
+        read: dict[str, Path] = {}
+        for slot, (source, directory) in sources.items():
+            for rel, path in _model_files(directory or _stock_dir(source)).items():
+                read[f"{slot}/{rel}"] = path
+        self._weight_files = _weight_files(read)
 
     def _move_to_device(self, device: str) -> None:
         import torch
@@ -481,8 +730,10 @@ class TTSModelManager:
         self._state = TTSState.UNLOADED
         logger.info("tts_fully_unloaded")
 
-    async def unload(self) -> None:
-        """Full unload (waits for in-flight generations)."""
+    async def unload(self, to_stock: bool = False) -> None:
+        """Full unload (waits for in-flight generations). ``to_stock``
+        (``/admin/unload``) also drops a loaded checkpoint, so the next load
+        reads the stock models."""
         async with self._lock:
             await self._idle.wait()
             await self._await_load_quietly()
@@ -490,6 +741,45 @@ class TTSModelManager:
                     and self._evict_task is not asyncio.current_task()):
                 self._evict_task.cancel()
             self._unload_locked()
+            if to_stock and self._checkpoint is not None:
+                logger.info("tts_checkpoint_dropped", checkpoint=self._checkpoint[0])
+                self._checkpoint = None
+                self._weight_files = None
+
+    async def load_weights(self, checkpoint: Optional[tuple[str, Path, str]]) -> bool:
+        """``/admin/load``: replace the loaded models by *checkpoint* (``(name, directory, slot)``; None = stock),
+        loaded onto ``TTS_DEVICE`` now and hashed. False while a lease is held (busy): nothing changes.
+
+        It waits for a load or move in progress, frees the old models, then loads the new ones as a shielded task
+        (a cancelled caller can't strand it half-way). A load that fails frees whatever it loaded and leaves the
+        stock models selected (the state says ``error``; the next request loads stock), and raises."""
+        async with self._lock:
+            if self._in_use:
+                logger.info("tts_load_refused_busy", in_use=self._in_use)
+                return False
+            await self._await_load_quietly()
+            if self._evict_task and not self._evict_task.done():
+                self._evict_task.cancel()
+            self._unload_locked()
+            self._checkpoint = checkpoint
+            self._weight_files = None
+            self._state = TTSState.LOADING
+
+            async def load() -> None:
+                try:
+                    await self._run_load()
+                except BaseException:
+                    self._checkpoint = None
+                    self._weight_files = None
+                    raise
+
+            self._load_task = asyncio.create_task(load())
+            self._load_task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            await self._await_load()
+            self._last_used = time.time()
+            if self._in_use == 0:
+                self._arm_evict()
+            return True
 
     async def _await_load_quietly(self) -> None:
         """Let an in-flight load finish before demoting/unloading, so the worker
@@ -733,6 +1023,9 @@ class SynthesiseRequest(BaseModel):
     language: str = Field(default="en")
     speed: Optional[float] = None  # accepted for the shared contract; Qwen ignores it (XTTS applies it)
     device: Optional[str] = None  # XTTS-only ("cpu": no GPU promotion); Qwen ignores it
+    # Seeds the sampler (python, numpy, torch CPU and CUDA). /synthesise seeds once; /synthesise/stream seeds
+    # sentence i (from 0) with seed + i. See docs/api.md for what that does and doesn't make reproducible.
+    seed: Optional[int] = Field(default=None, ge=0, le=SEED_MAX)
 
 
 # ── POST /synthesise ──────────────────────────────────────────────────────────
@@ -767,7 +1060,7 @@ async def _generate_audio_leased(req: SynthesiseRequest):
     render = await _plan_generation(req, request_id)
     if isinstance(render, JSONResponse):
         return render
-    return await _render(render, req.text, request_id)
+    return await _render(_seeded(render, req.seed), req.text, request_id)
 
 
 async def _render(render, text: str, request_id: str):
@@ -979,6 +1272,7 @@ async def synthesise(req: SynthesiseRequest):
         "duration": duration,
         "duration_seconds": round(duration, 3),
         "format": "wav",
+        "seed": req.seed,
     }
 
 
@@ -1065,7 +1359,8 @@ class _SentenceStream:
             for i, text in enumerate(self._rest, start=2):
                 if self._stop:
                     return
-                self._inflight = asyncio.ensure_future(asyncio.to_thread(self._render, text))
+                # Sentence i (from 0) is index i - 1: _seeded reseeds it with seed + index.
+                self._inflight = asyncio.ensure_future(asyncio.to_thread(self._render, text, i - 1))
                 try:
                     # Shielded: a cancelled response leaves the render to finish,
                     # and close() releases the lease when it does.
@@ -1151,6 +1446,7 @@ async def synthesise_stream(req: SynthesiseRequest):
         render = await _plan_generation(req, request_id)
         if isinstance(render, JSONResponse):
             return render
+        render = _seeded(render, req.seed)
         sentences = _split_sentences(req.text)
         first = await _render(render, sentences[0], request_id)
         if isinstance(first, JSONResponse):
@@ -1954,6 +2250,8 @@ async def health():
         "keep_alive_gpu": KEEP_ALIVE_GPU,
         "keep_alive_cpu": KEEP_ALIVE_CPU,
         "gpu": gpu_info,
+        "weights": _mgr.weights,
+        "image": _image(),
     }
 
 
@@ -2028,10 +2326,70 @@ async def admin_evict():
 
 @app.post("/admin/unload", dependencies=[Depends(_require_admin)])
 async def admin_unload():
-    """Fully unload models from memory (GPU + CPU)."""
+    """Fully unload models from memory (GPU + CPU). A loaded checkpoint is dropped too: the next load is stock."""
     was_loaded = _mgr.state in (TTSState.CPU, TTSState.GPU)
-    await _mgr.unload()
-    return {"status": "unloaded", "unloaded": was_loaded, "model_state": _mgr.state.value, "gpu": _resident_gpu()}
+    await _mgr.unload(to_stock=True)
+    return {
+        "status": "unloaded",
+        "unloaded": was_loaded,
+        "model_state": _mgr.state.value,
+        "gpu": _resident_gpu(),
+        "weights": _mgr.weights,
+    }
+
+
+class LoadRequest(BaseModel):
+    # A directory name under TTS_CHECKPOINT_ROOT (may be nested: "forge/run-7"); null loads the stock models.
+    checkpoint: Optional[str] = Field(...)
+
+
+def _image() -> dict:
+    """``/health``'s ``image``: the release and git revision baked in at build time (null for a local build). A
+    container can't see its own image digest; whoever deployed it (compose, iris) knows that."""
+    return {"version": ECHO_VERSION, "revision": ECHO_REVISION}
+
+
+@app.post("/admin/load", dependencies=[Depends(_require_admin)])
+async def admin_load(req: LoadRequest):
+    """Load a fine-tuned checkpoint from ``TTS_CHECKPOINT_ROOT`` into the slot its ``tts_model_type`` names (or the
+    stock models, for ``null``) onto ``TTS_DEVICE``, replacing what is loaded, and hash its files.
+
+    400 a name that escapes the root, 404 no such checkpoint, 422 not a Qwen3-TTS base/custom_voice model
+    directory, 409 busy (a request holds the models; nothing changes), 503 no checkpoint root configured, 500 the
+    load failed (nothing is loaded and the stock models are selected)."""
+    selected = None
+    if req.checkpoint is not None:
+        try:
+            path, slot = _resolve_checkpoint(req.checkpoint)
+        except CheckpointRefused as exc:
+            logger.warning("tts_checkpoint_refused", checkpoint=req.checkpoint, status=exc.status, error=str(exc))
+            return JSONResponse(status_code=exc.status, content={"error": str(exc)})
+        selected = (req.checkpoint, path, slot)
+    try:
+        loaded = await _mgr.load_weights(selected)
+    except Exception as exc:
+        logger.error("tts_checkpoint_load_failed", checkpoint=req.checkpoint, error=str(exc), exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"loading {req.checkpoint or 'the stock models'} failed: {exc}",
+                "model_state": _mgr.state.value,
+                "weights": _mgr.weights,
+            },
+        )
+    if not loaded:
+        return JSONResponse(
+            status_code=409,
+            content={"status": "busy", "active": _mgr._in_use, "model_state": _mgr.state.value},
+        )
+    logger.info("tts_checkpoint_loaded", checkpoint=req.checkpoint, slot=selected[2] if selected else None)
+    return {
+        "status": "loaded",
+        "slot": selected[2] if selected else None,
+        "model_state": _mgr.state.value,
+        "weights": _mgr.weights,
+        "gpu": _resident_gpu(),
+    }
 
 
 @app.post("/admin/wake", dependencies=[Depends(_require_admin)])

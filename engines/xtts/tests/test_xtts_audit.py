@@ -17,6 +17,7 @@ class _Mgr:
     """A manager whose lease reports the GPU and never touches a model."""
 
     state = xs.TTSState.GPU
+    weights = {"checkpoint": None, "files": None}
     active = 0
     _last_used = 0.0
 
