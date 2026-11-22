@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+- `gpu-tenant.yaml` gives Qwen a `vram_mb` (4800): Qwen3-TTS 1.7b with CustomVoice only, measured on an 8 GB
+  RTX 4060 (dragon), CUDA context included. Generating stays inside the loaded footprint; evict and unload leave
+  only the ~150 MB CUDA context (#6). Base and 0.6b are still to measure.
+- Compose passes `QWEN_LOAD_MODELS` (`TTS_LOAD_MODELS`, default `both`) and `QWEN_DEFAULT_SPEAKER`
+  (`TTS_DEFAULT_SPEAKER`) through to the Qwen engine; `custom_voice` roughly halves its VRAM when cloning isn't
+  needed.
+
 ## [0.1.0] - 2026-11-22
 
 ### Added
