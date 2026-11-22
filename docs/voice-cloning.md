@@ -45,17 +45,17 @@ and consent in depth; this page is what each engine does with what you send.
 ## Qwen3-TTS
 
 - `/clone-voice` takes one clip and stores the Base model's prompt.
-- For a voice that doesn't exist, use a CustomVoice speaker with a `voice_description` or an `instruction`
-  instead of cloning. A common route: design a voice on Qwen, then clone the result on Miso for quality.
+- For a voice that doesn't exist, steer a CustomVoice speaker with a `voice_description` or an `instruction` (1.7B
+  model only) instead of cloning. A common route: design a voice on Qwen, then clone the result on Miso for quality.
 
 ## After cloning
 
 - A clone lives at `voice_clones/<companion_id>/` on the engine that made it (`prompt.pt` and `meta.json`), and is
   used by passing `voice_clone_id`. **Clones don't move between engines**: each engine's `prompt.pt` is its own
   format.
-- On Miso and XTTS, `GET /clones/<id>/download` backs a clone up as a zip and `POST /clones/import` restores it to
-  the same engine. Miso's archive carries the prompt as `prompt.safetensors`; it refuses older archives that hold a
-  `prompt.pt` (unpickling an upload can run code), so re-download a clone from a current Miso engine before moving
+- On every engine, `GET /clones/<id>/download` backs a clone up as a zip and `POST /clones/import` restores it to
+  the same engine. The archive carries the prompt as `prompt.safetensors`; import refuses older archives that hold
+  a `prompt.pt` (unpickling an upload can run code), so re-download a clone from a current engine before moving
   it. See [miso-api.md](miso-api.md#get-clonescompanion_iddownload).
 - Clone a real person's voice only with their consent; see [api.md#security](api.md#security).
 

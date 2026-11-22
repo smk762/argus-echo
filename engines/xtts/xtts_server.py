@@ -11,7 +11,7 @@ engines, so a client can switch engines by changing its URL:
   POST /analyze-clips      — score candidate clips, recommend subset + ordering
   POST /clone-voice        — one or more reference clips → conditioning latents in S3
   GET  /clones             — list stored voice clones (from meta.json sidecars)
-  GET  /clones/{id}/download — download a clone's prompt.pt + meta.json as a zip
+  GET  /clones/{id}/download — download a clone's prompt.safetensors + meta.json as a zip
   DELETE /clones/{id}      — permanently delete a stored clone from S3
   POST /clones/import      — import a downloaded voice archive (zip) back into S3
   GET  /speakers           — built-in XTTS studio speakers
@@ -2104,8 +2104,87 @@ async def list_clones():
     return {"clones": clones}
 
 
+# Clone archive format (download and import), as on Miso (#20). The latents travel as prompt.safetensors:
+# gpt_cond_latent and speaker_embedding as tensors, and format/engine strings in the safetensors `__metadata__`
+# header. A safetensors file is a JSON header plus raw tensor bytes, so parsing one never runs code. A legacy
+# prompt.pt (a torch pickle) in an uploaded archive is refused unread: torch.load(weights_only=True) on untrusted
+# bytes is GHSA-63cw-57p8-fm3p on the torch this image installs (cu124 stops at 2.6.0; fixed in 2.10), and
+# unpickler bypasses keep turning up. Stored clones stay prompt.pt: this server wrote them.
+_ARCHIVE_PROMPT = "prompt.safetensors"
+_LEGACY_ARCHIVE_PROMPT = "prompt.pt"
+_ARCHIVE_FORMAT = "xtts-clone"
+_ARCHIVE_FORMAT_VERSION = "1"
+_LATENT_KEYS = ("gpt_cond_latent", "speaker_embedding")
+
+
+def _to_array(tensor):
+    """A latent tensor as a float32 numpy array (the archive's form)."""
+    import torch
+
+    return tensor.detach().cpu().to(torch.float32).contiguous().numpy()
+
+
+def _from_array(array):
+    """A validated archive array back as a CPU tensor."""
+    import torch
+
+    return torch.from_numpy(array.copy())
+
+
+def _prompt_to_safetensors(prompt: dict) -> bytes:
+    """Serialise validated latents as the archive's prompt.safetensors."""
+    from safetensors.numpy import save
+
+    arrays = {k: _to_array(prompt[k]) for k in _LATENT_KEYS}
+    metadata = {"format": _ARCHIVE_FORMAT, "format_version": _ARCHIVE_FORMAT_VERSION, "engine": "xtts"}
+    return save(arrays, metadata=metadata)
+
+
+def _safetensors_metadata(data: bytes) -> dict:
+    """The ``__metadata__`` string map from a safetensors header, read as JSON (no tensors)."""
+    if len(data) < 8:
+        raise ValueError("prompt.safetensors is truncated")
+    header_len = int.from_bytes(data[:8], "little")
+    if header_len > len(data) - 8:
+        raise ValueError("prompt.safetensors has a malformed header")
+    try:
+        header = json.loads(data[8 : 8 + header_len].decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"prompt.safetensors has a malformed header: {exc}") from exc
+    if not isinstance(header, dict):
+        raise ValueError("prompt.safetensors has a malformed header")
+    metadata = header.get("__metadata__") or {}
+    if not (isinstance(metadata, dict) and all(isinstance(v, str) for v in metadata.values())):
+        raise ValueError("prompt.safetensors metadata must map names to strings")
+    return metadata
+
+
+def _prompt_from_safetensors(data: bytes) -> dict:
+    """Parse and validate an uploaded prompt.safetensors into latents. Only safetensors' own parser touches the
+    bytes (into numpy arrays): no pickle, no torch.load. Raises ``ValueError``."""
+    import numpy as np
+    from safetensors.numpy import load
+
+    metadata = _safetensors_metadata(data)
+    engine = metadata.get("engine")
+    if engine is not None and engine != "xtts":
+        raise ValueError(f"prompt.safetensors is a {engine[:32]!r} clone, not an XTTS one")
+    try:
+        arrays = load(data)
+    except Exception as exc:
+        raise ValueError(f"Invalid prompt.safetensors: {exc}") from exc
+    if not all(k in arrays for k in _LATENT_KEYS):
+        raise ValueError("prompt.safetensors must contain gpt_cond_latent and speaker_embedding")
+    for k in _LATENT_KEYS:
+        a = arrays[k]
+        if not (a.dtype.kind == "f" and a.size > 0 and np.isfinite(a).all()):
+            raise ValueError("prompt.safetensors latents must be non-empty, finite float tensors")
+    return {k: _from_array(arrays[k].astype(np.float32)) for k in _LATENT_KEYS}
+
+
 def _build_clone_zip(companion_id: str) -> bytes:
-    """Bundle a clone's prompt.pt (+ meta.json if present) into a zip."""
+    """Bundle a stored clone as prompt.safetensors (+ meta.json if present). The stored prompt.pt was written by
+    this server and loads through _load_prompt; old and new clones alike leave as safetensors."""
     import zipfile
     from botocore.exceptions import ClientError
 
@@ -2118,6 +2197,7 @@ def _build_clone_zip(companion_id: str) -> bytes:
         client.download_fileobj(S3_BUCKET_NAME, prompt_key, prompt_buf)
     except ClientError as exc:
         raise FileNotFoundError(f"Voice clone not found: {companion_id}") from exc
+    prompt_bytes = _prompt_to_safetensors(_load_prompt(prompt_buf.getvalue()))
 
     meta_buf = io.BytesIO()
     have_meta = True
@@ -2128,7 +2208,7 @@ def _build_clone_zip(companion_id: str) -> bytes:
 
     zip_buf = io.BytesIO()
     with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("prompt.pt", prompt_buf.getvalue())
+        zf.writestr(_ARCHIVE_PROMPT, prompt_bytes)
         if have_meta:
             zf.writestr("meta.json", meta_buf.getvalue())
     return zip_buf.getvalue()
@@ -2217,7 +2297,7 @@ def _slug_id(value: str) -> str:
 _MAX_PROMPT_BYTES = 64 * 1024 * 1024
 _MAX_META_BYTES = 64 * 1024
 _MAX_ARCHIVE_ENTRIES = 16
-# The upload itself: a prompt.pt at its cap plus a little for meta.json and zip overhead.
+# The upload itself: a prompt.safetensors at its cap plus a little for meta.json and zip overhead.
 _MAX_ARCHIVE_BYTES = _MAX_PROMPT_BYTES + 1024 * 1024
 
 
@@ -2238,13 +2318,12 @@ def _read_member(z, name: str, limit: int) -> bytes:
 
 
 def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str, replace: bool = False) -> dict:
-    """Validate and store a clone archive (prompt.pt [+ meta.json]).
+    """Validate and store a clone archive (prompt.safetensors [+ meta.json]).
 
-    The uploaded ``prompt.pt`` is untrusted, so it's loaded with
-    ``weights_only=True`` (tensors only — no arbitrary pickle execution) and
-    then re-serialised from the validated tensors, guaranteeing the stored file
-    is clean regardless of what the archive contained. Members are read with
-    size caps, so a compressed bomb can't exhaust memory.
+    The uploaded prompt is parsed by safetensors only and re-serialised from the validated tensors, so the stored
+    prompt.pt is clean whatever the archive contained. An archive holding only a legacy prompt.pt is refused
+    unread: uploaded bytes never reach torch.load or any other unpickler. Members are read with size caps, so a
+    compressed bomb can't exhaust memory.
 
     The target id comes from the override, else the archive's metadata, so an
     existing clone under it is never replaced unless ``replace`` is true
@@ -2262,11 +2341,20 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
     names = z.namelist()
     if len(names) > _MAX_ARCHIVE_ENTRIES:
         raise ValueError(f"Archive has more than {_MAX_ARCHIVE_ENTRIES} entries")
-    prompt_name = next((n for n in names if n.rsplit("/", 1)[-1] == "prompt.pt"), None)
-    if not prompt_name:
-        raise ValueError("Archive does not contain prompt.pt")
+    def _member(basename: str):
+        return next((n for n in names if n.rsplit("/", 1)[-1] == basename), None)
 
-    prompt = _load_prompt(_read_member(z, prompt_name, _MAX_PROMPT_BYTES))
+    prompt_name = _member(_ARCHIVE_PROMPT)
+    if not prompt_name:
+        if _member(_LEGACY_ARCHIVE_PROMPT):
+            raise ValueError(
+                "This archive holds a legacy prompt.pt (a pickle), which is no longer imported because "
+                "unpickling an uploaded file can run code. Re-export the clone from an XTTS engine running "
+                "this version: its download now produces prompt.safetensors."
+            )
+        raise ValueError(f"Archive does not contain {_ARCHIVE_PROMPT}")
+
+    prompt = _prompt_from_safetensors(_read_member(z, prompt_name, _MAX_PROMPT_BYTES))
 
     src_meta: dict = {}
     meta_name = next((n for n in names if n.rsplit("/", 1)[-1] == "meta.json"), None)
@@ -2321,7 +2409,7 @@ async def import_clone(
     companion_id: str = Form(""),
     replace: bool = Form(False),
 ):
-    """Import a previously downloaded voice archive (prompt.pt + meta.json zip).
+    """Import a previously downloaded voice archive (prompt.safetensors + meta.json zip).
 
     409 when the target id already has a clone, unless ``replace`` is true; 413
     for an archive over ``_MAX_ARCHIVE_BYTES``."""

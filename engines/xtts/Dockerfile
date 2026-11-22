@@ -38,7 +38,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # no network/torch.hub fetch is needed at runtime.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install fastapi "uvicorn[standard]" structlog python-multipart \
-        coqui-tts "transformers==4.57.5" boto3 soundfile \
+        coqui-tts "transformers==4.57.5" boto3 soundfile safetensors \
         silero-vad pyloudnorm noisereduce "argus-cortex[server]>=0.8,<0.10"
 
 # Accept the Coqui Public Model License non-interactively so the model can be

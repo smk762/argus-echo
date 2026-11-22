@@ -42,12 +42,12 @@ XTTS on `8141`, Qwen on `8142` and Whisper (speech to text) on `8144`.
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
 | `text` | string | required | |
-| `voice_clone_id` | string | `null` | A stored clone. Wins over `speaker` |
+| `voice_clone_id` | string | `null` | A stored clone. Wins over `speaker` and, on Qwen, `voice_description`: a request with both is spoken by the clone on the `base` slot (`model: base`, `X-Echo-Model: base`) |
 | `speaker` | string | `null` | A built-in speaker from `GET /speakers` |
 | `language` | string | `"en"` | ISO code. Miso: English only; any other language is `422` (`en-US`, `en_GB` are accepted). XTTS: 17 languages. Qwen: 10 (`en`, `zh`, `ja`, `ko`, `de`, `fr`, `ru`, `pt`, `es`, `it`) |
-| `voice_description` | string | `null` | Qwen only: describe a voice to design. Ignored elsewhere |
-| `instruction` | string | `null` | Qwen only: delivery instruction for a built-in speaker. Ignored elsewhere |
-| `emotion` | string | `"neutral"` | Qwen only. Ignored elsewhere |
+| `voice_description` | string | `null` | Qwen only: describe the voice, and a built-in speaker (`speaker`, else `QWEN_DEFAULT_SPEAKER`, else the first listed) is steered by it as an instruction. Needs the 1.7b CustomVoice model: on 0.6b it is `422`, since that model ignores instructions. Ignored elsewhere |
+| `instruction` | string | `null` | Qwen only: delivery instruction for a built-in speaker. Applied by the 1.7b model only; the 0.6b one ignores it. Ignored elsewhere |
+| `emotion` | string | `"neutral"` | Qwen only: a preset `instruction`, with the same 1.7b-only limit. Ignored elsewhere |
 | `speed` | number | `null` | XTTS only: speaking-rate multiplier passed to inference (`1.0` when unset or not positive). Miso and Qwen accept it and ignore it |
 | `device` | `"cpu"` | `null` | XTTS only: run without promoting the model to the GPU (a client sends it when argus-iris refuses its GPU lease); any other value is `422`. A model already on the GPU runs there. Miso and Qwen accept it and ignore it. See [xtts.md](xtts.md#gpu-memory-and-cpu-fallback) |
 | `seed` | integer | `null` | Every engine: seeds python's, numpy's and torch's (CPU and every CUDA device) RNGs for this request, `0` to `4294967295` (anything else is `422`). What it makes reproducible differs by engine and route: see [Reproducibility](#reproducibility) |
@@ -60,8 +60,7 @@ exception is a `language` the engine cannot speak: Miso refuses it rather than m
 echoes the request's, or `null`). XTTS adds `device`: where it ran (`cpu` or its `XTTS_DEVICE`). XTTS and Qwen add
 the weights that generated this utterance: `checkpoint` (the name loaded with `/admin/load`, or `null` for stock)
 and `weights_fingerprint` (see [Weights fingerprint](#weights-fingerprint)). Qwen also adds `model`, the slot that
-spoke it: `base` for a `voice_clone_id` or a `voice_description` rendered by Base, `custom_voice` for a built-in
-`speaker` and for a `voice_description` that falls back to a CustomVoice speaker (no Base loaded); its
+spoke it: `base` for a `voice_clone_id`, `custom_voice` for a built-in `speaker` and a `voice_description`; its
 `checkpoint` and `weights_fingerprint` are that slot's. Miso reports none of these.
 
 `/synthesise/stream` answers `200` with `Content-Type: application/octet-stream` and the PCM layout in headers:
@@ -166,28 +165,34 @@ Built-in speakers (`GET /speakers` → `{"speakers": [{"id", "name", "language",
 - **Miso** has no real built-in voices: `0` and `1` are conversation turns, and without a clone the voice is
   different every time (unless the request sends a `seed`). Clone a voice for anything you keep.
 - **XTTS-v2** has its studio speakers (`Claribel Dervla`, …).
-- **Qwen3-TTS** has the CustomVoice model's speakers, and can design a voice from `voice_description`.
+- **Qwen3-TTS** has the CustomVoice model's speakers, which the 1.7b model steers by an `instruction` or a
+  `voice_description`.
 
 On XTTS and Qwen, `GET /speakers` loads the model if it is not loaded.
 
 `POST /clone-voice` is `multipart/form-data` with one or more `audio` files, `reference_text` (the transcript;
 Miso needs it) and `companion_id` (`^[A-Za-z0-9_-]{1,64}$`). Miso fills an empty `reference_text` from the
 speech-to-text engine when `MISO_STT_URL` names one (see [miso-api.md](miso-api.md#post-clone-voice)). A clone is stored at
-`voice_clones/<companion_id>/prompt.pt` with a `meta.json`, and used by passing its id as `voice_clone_id`.
+`voice_clones/<companion_id>/prompt.pt` with a `meta.json`. To speak with it, send the `voice_clone_id` that
+`/clone-voice` (and `/clones/import`, and each entry of `GET /clones`) returns: that full key,
+`voice_clones/<companion_id>/prompt.pt`, not the bare `companion_id`, which is `422 Voice clone not found`. The
+clone-management routes (`/clones/{companion_id}/download`, `DELETE /clones/{companion_id}`) take the bare id.
 **Clones are engine-specific**: each engine's `prompt.pt` is its own format, which is why each engine gets its
-own bucket. Download archives differ too: Miso's holds `prompt.safetensors` + `meta.json` and its import refuses
-an archive with only a pickled `prompt.pt` (an older Miso download; re-export it), while XTTS's and Qwen's hold
-`prompt.pt`. `POST /clones/import` answers `409` when the target id already has a clone, unless the form field
-`replace=true` is sent, and `422` for an archive that is not this engine's format. Qwen checks both the archive's
-`meta.json` `engine` and the `prompt.pt` itself; see [qwen.md](qwen.md#clones). See
+own bucket. Every engine's download archive holds `prompt.safetensors` + `meta.json`, with the engine's own
+tensors inside, and its import refuses an archive with only a pickled `prompt.pt` (a download from an older
+version; re-export it from a current engine), because unpickling an upload can run code. `POST /clones/import`
+answers `409` when the target id already has a clone, unless the form field `replace=true` is sent, and `422` for
+an archive that is not this engine's format. Qwen checks both the archive's `meta.json` `engine` and the prompt
+itself; see [qwen.md](qwen.md#clones). See
 [voice-cloning.md](voice-cloning.md) for what makes a good reference.
 
 ## Health and lifecycle
 
 `GET /health` is argus-cortex's `ResidentHealth`, which argus-iris reads: top-level `model_state` (`unloaded`,
 `loading`, `cpu`, `gpu`, `error`), `busy`, `idle_s`, and a `gpu` memory block, plus `engine`, `model`,
-`device` and `capabilities` (the contracts the engine serves: `["tts"]` or `["stt"]`; `argus-echo check` runs
-only those suites, and treats an engine that names none as `tts`). It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
+`device` and `capabilities`. `engine` is exactly one of `miso`, `xtts-v2`, `qwen-tts` or `whisper`, and clients
+may key on it. `capabilities` lists the contracts the engine serves (`["tts"]` or `["stt"]`; `argus-echo check`
+runs only those suites, and treats an engine that names none as `tts`). It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
 `"status": "gpu_error"` after a CUDA error that is not an out-of-memory: such an error breaks the process's GPU
 context, so the worker needs a restart. (An out-of-memory is a `503 GPU OOM` on the request and can be retried.)
 

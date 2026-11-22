@@ -17,6 +17,8 @@ class HealthTest(unittest.TestCase):
         body = r.json()
         ResidentHealth.model_validate(body)
         self.assertEqual(body["capabilities"], ["tts"])
+        self.assertEqual(body["engine"], "miso")  # clients key on it (docs/api.md)
+        # image also carries runtime, checked below; a local build has no release identity.
         self.assertEqual((body["image"]["version"], body["image"]["revision"]), (None, None))
 
     def test_health_reports_the_image_identity(self):

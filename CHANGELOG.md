@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Security
+- XTTS and Qwen clone archives carry `prompt.safetensors`, as Miso's have since #20. `GET /clones/{id}/download`
+  writes it and `POST /clones/import` reads it with safetensors only. An uploaded archive used to reach
+  `torch.load(weights_only=True)` (Qwen: with one class allowed), which on these images' torch 2.6 is
+  GHSA-63cw-57p8-fm3p, code execution through an untrusted checkpoint (fixed in torch 2.10). An archive holding
+  only a pickled `prompt.pt` is now refused unread (`422`): re-download clones from an engine on this version
+  before moving them. Stored clones are unchanged (`prompt.pt`, written by the server). Qwen's archive keeps the
+  speaker embedding's dtype (bfloat16 included) in its metadata (#6).
+
 ### Added
 - `/health` `image.runtime` on every engine (#32): the versions of python, torch, CUDA and cuDNN (torch engines)
   and each engine's libraries (coqui-tts, qwen-tts, moshi, faster-whisper and ctranslate2, transformers, ...),
@@ -14,6 +23,12 @@
   other engines.
 
 ### Fixed
+- Qwen: `voice_description` works with the Base model loaded (`TTS_LOAD_MODELS=both`, the default). It used to go
+  to Base's `generate_voice_design`, which qwen-tts refuses on anything but its separate VoiceDesign model, so
+  every designed-voice request failed (#31). A description now steers a built-in CustomVoice speaker as its
+  instruction. qwen-tts ignores instructions on the 0.6B model, so there a `voice_description` is a `422` saying
+  it needs 1.7B, rather than speaking an unchanged voice. The size is read from the loaded model, so a 1.7B
+  custom_voice checkpoint counts. The response's `model` is now always `custom_voice` for it.
 - Whisper decodes an MP4/M4A/MOV whose index (`moov`) comes after the audio, the default for ffmpeg and most
   recorders without faststart. Read from a pipe, the demuxer couldn't seek back to it, so anything past its
   read-ahead (a 2-minute AAC clip, say) was a `400` on `/transcribe` and `/transcriptions`. Those formats are now
