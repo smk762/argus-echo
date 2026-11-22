@@ -202,6 +202,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The engine reports these in /health as `image` (the OCI labels above aren't visible from inside the
+          # container, and nothing inside can know the digest). Engines without the ARGs ignore them.
+          build-args: |
+            ECHO_VERSION=${{ steps.meta.outputs.version }}
+            ECHO_REVISION=${{ needs.release-tag.outputs.sha }}
           # A dispatch rebuilds an unchanged context, so a cached install layer
           # would keep the old argus-cortex.
           no-cache: ${{ github.event_name == 'repository_dispatch' }}
