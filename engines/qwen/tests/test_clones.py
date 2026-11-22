@@ -103,6 +103,15 @@ def saved(obj) -> bytes:
     return buf.getvalue()
 
 
+def _to_array(t: FakeTensor):
+    """tts_server._to_array for a FakeTensor: zeros of its shape, float32 or int64, and its dtype name."""
+    return np.zeros(t.shape, dtype=np.float32 if t.floating else np.int64), t.dtype
+
+
+def _from_array(a: np.ndarray, dtype: str) -> FakeTensor:
+    return FakeTensor(a.shape, floating=a.dtype.kind == "f", dtype=dtype)
+
+
 @contextlib.contextmanager
 def fake_torch():
     torch = sys.modules["torch"]
@@ -114,7 +123,14 @@ def fake_torch():
         ):
             stack.enter_context(mock.patch.object(torch, name, value, create=True))
         stack.enter_context(mock.patch.object(tts_server, "_prompt_item_cls", lambda: FakeItem))
+        stack.enter_context(mock.patch.object(tts_server, "_to_array", _to_array))
+        stack.enter_context(mock.patch.object(tts_server, "_from_array", _from_array))
         yield
+
+
+def packed(items) -> bytes:
+    """An archive's prompt.safetensors for these prompt items (call inside fake_torch)."""
+    return tts_server._prompt_to_safetensors(items)
 
 
 # ── S3 stand-in ───────────────────────────────────────────────────────────────
@@ -167,10 +183,11 @@ class FakeS3:
 
 
 def archive(prompt: Optional[bytes] = None, meta: Optional[dict] = None, extra: Optional[dict] = None) -> bytes:
+    """A clone archive: *prompt* is its prompt.safetensors."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
         if prompt is not None:
-            zf.writestr("prompt.pt", prompt)
+            zf.writestr("prompt.safetensors", prompt)
         if meta is not None:
             zf.writestr("meta.json", json.dumps(meta))
         for name, data in (extra or {}).items():
@@ -304,8 +321,13 @@ class DownloadDeleteTests(_Base):
         self.assertEqual(r.headers["content-type"], "application/zip")
         self.assertIn('filename="alice.zip"', r.headers["content-disposition"])
         zf = zipfile.ZipFile(io.BytesIO(r.content))
-        self.assertEqual(sorted(zf.namelist()), ["meta.json", "prompt.pt"])
-        self.assertEqual(zf.read("prompt.pt"), self.s3.objects["voice_clones/alice/prompt.pt"])
+        self.assertEqual(sorted(zf.namelist()), ["meta.json", "prompt.safetensors"])
+        meta = tts_server._safetensors_metadata(zf.read("prompt.safetensors"))
+        self.assertEqual(
+            meta,
+            {"format": "qwen-clone", "format_version": "1", "engine": "qwen-tts", "x_vector_only_mode": "false",
+             "icl_mode": "true", "ref_spk_embedding_dtype": "float32", "ref_text": "hello there"},
+        )
         self.assertEqual(json.loads(zf.read("meta.json"))["name"], "Alice")
 
     def test_download_of_a_legacy_clone_carries_generated_meta(self):
@@ -365,7 +387,7 @@ class ImportTests(_Base):
         self.assertIs(tts_server._get_clone_prompt(body["voice_clone_id"]), tts_server._clone_cache[body["voice_clone_id"]])
 
     def test_target_id_comes_from_override_then_meta_then_name(self):
-        prompt = saved([xvec_item()])
+        prompt = packed([xvec_item()])
         r = self._import(archive(prompt, {"companion_id": "From Meta"}))
         self.assertEqual(r.json()["companion_id"], "from-meta")
         r = self._import(archive(prompt), voice_name="My Voice!")
@@ -375,7 +397,7 @@ class ImportTests(_Base):
 
     def test_existing_id_is_409_unless_replace(self):
         self.store("alice", [icl_item()])
-        data = archive(saved([xvec_item()]), {"companion_id": "alice"})
+        data = archive(packed([xvec_item()]), {"companion_id": "alice"})
         self.assertEqual(self._import(data).status_code, 409)
         self.assertTrue(tts_server._load_prompt(self.s3.objects["voice_clones/alice/prompt.pt"])[0].icl_mode)
         r = self._import(data, replace="true")
@@ -383,10 +405,16 @@ class ImportTests(_Base):
         self.assertTrue(tts_server._load_prompt(self.s3.objects["voice_clones/alice/prompt.pt"])[0].x_vector_only_mode)
 
     def test_other_engines_archives_are_refused(self):
-        xtts = archive(saved({"gpt_cond_latent": FakeTensor((1, 32, 1024)), "speaker_embedding": FakeTensor((512,))}),
-                       {"companion_id": "x", "name": "X"})  # XTTS writes no engine
-        miso = archive(saved([xvec_item()]), {"companion_id": "m", "engine": "miso"})
-        for data, needle in ((xtts, "VoiceClonePromptItem"), (miso, "miso")):
+        from safetensors.numpy import save
+
+        latents = {
+            "gpt_cond_latent": np.zeros((1, 32, 1024), np.float32),
+            "speaker_embedding": np.zeros(512, np.float32),
+        }
+        xtts = archive(save(latents, metadata={"engine": "xtts"}), {"companion_id": "x", "name": "X"})
+        xtts_unlabelled = archive(save(latents), {"companion_id": "x"})
+        miso = archive(packed([xvec_item()]), {"companion_id": "m", "engine": "miso"})
+        for data, needle in ((xtts, "'xtts' clone"), (xtts_unlabelled, "ref_spk_embedding"), (miso, "miso")):
             r = self._import(data)
             self.assertEqual(r.status_code, 422, r.text)
             self.assertIn(needle, r.json()["error"])
@@ -396,9 +424,9 @@ class ImportTests(_Base):
         cases = {
             "not a zip": b"PK not really",
             "no prompt": archive(None, {"name": "x"}),
-            "garbage prompt": archive(b"not torch"),
-            "too many entries": archive(saved([xvec_item()]), extra={f"f{i}": b"" for i in range(20)}),
-            "huge meta": archive(saved([xvec_item()]), extra={"meta.json": b" " * (tts_server._MAX_META_BYTES + 1)}),
+            "garbage prompt": archive(b"not safetensors"),
+            "too many entries": archive(packed([xvec_item()]), extra={f"f{i}": b"" for i in range(20)}),
+            "huge meta": archive(packed([xvec_item()]), extra={"meta.json": b" " * (tts_server._MAX_META_BYTES + 1)}),
         }
         for name, data in cases.items():
             self.assertEqual(self._import(data).status_code, 422, name)
@@ -406,8 +434,58 @@ class ImportTests(_Base):
 
     def test_oversized_archive_is_413(self):
         with mock.patch.object(tts_server, "_MAX_ARCHIVE_BYTES", 100):
-            r = self._import(archive(saved([xvec_item()]), {"name": "x" * 200}))
+            r = self._import(archive(packed([xvec_item()]), {"name": "x" * 200}))
         self.assertEqual(r.status_code, 413)
+        self.assertEqual(self.s3.objects, {})
+
+    def test_a_legacy_prompt_pt_is_refused_unread(self):
+        """GHSA-63cw-57p8-fm3p: torch.load(weights_only=True) on an upload can run code on torch < 2.10, whatever
+        the allowlist."""
+        legacy = io.BytesIO()
+        with zipfile.ZipFile(legacy, "w") as zf:
+            zf.writestr("prompt.pt", saved([xvec_item()]))
+            zf.writestr("meta.json", json.dumps({"companion_id": "old"}))
+        with mock.patch.object(sys.modules["torch"], "load", side_effect=AssertionError("unpickled an upload")):
+            r = self._import(legacy.getvalue())
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertIn("legacy prompt.pt", r.json()["error"])
+        self.assertEqual(self.s3.objects, {})
+
+    def test_the_speaker_embedding_keeps_its_dtype(self):
+        """numpy has no bfloat16: the archive carries float32 and names the dtype, and import casts it back."""
+        item = icl_item()
+        item.ref_spk_embedding = FakeTensor((1024,), dtype="bfloat16")
+        self.store("bf", [item], {"companion_id": "bf"})
+        r = self._import(self.client.get("/clones/bf/download").content, companion_id="bf2")
+        self.assertEqual(r.status_code, 200, r.text)
+        stored = tts_server._load_prompt(self.s3.objects["voice_clones/bf2/prompt.pt"])[0]
+        self.assertEqual(stored.ref_spk_embedding, FakeTensor((1024,), dtype="bfloat16"))
+        self.assertEqual(stored.ref_code, FakeTensor((120, 16), floating=False))
+
+    def test_bad_prompt_metadata_and_tensors_are_422(self):
+        from safetensors.numpy import save
+
+        spk = np.zeros(1024, np.float32)
+        flags = {"x_vector_only_mode": "true", "icl_mode": "false"}
+        cases = {
+            "no flags": save({"ref_spk_embedding": spk}),
+            "bad flag": save({"ref_spk_embedding": spk}, metadata={**flags, "icl_mode": "yes"}),
+            "both modes": save({"ref_spk_embedding": spk}, metadata={**flags, "icl_mode": "true"}),
+            "nan": save({"ref_spk_embedding": np.full(1024, np.nan, np.float32)}, metadata=flags),
+            "int embedding": save({"ref_spk_embedding": spk.astype(np.int32)}, metadata=flags),
+            "odd dtype": save({"ref_spk_embedding": spk}, metadata={**flags, "ref_spk_embedding_dtype": "complex64"}),
+            "icl without code": save(
+                {"ref_spk_embedding": spk},
+                metadata={"x_vector_only_mode": "false", "icl_mode": "true", "ref_text": "hi"},
+            ),
+            "float code": save(
+                {"ref_spk_embedding": spk, "ref_code": np.zeros((4, 16), np.float32)},
+                metadata={"x_vector_only_mode": "false", "icl_mode": "true", "ref_text": "hi"},
+            ),
+        }
+        for name, prompt in cases.items():
+            r = self._import(archive(prompt, {"companion_id": "bad"}))
+            self.assertEqual(r.status_code, 422, (name, r.text))
         self.assertEqual(self.s3.objects, {})
 
 
@@ -584,7 +662,7 @@ class ConcurrencyTests(_Base):
     def test_concurrent_imports_of_one_id_are_serialised(self):
         # import holds the id's clone lock across its existence check and upload,
         # like /clone-voice: two replace=false imports to one id give 200 and 409.
-        data = archive(saved([xvec_item()]), {"companion_id": "dup"})
+        data = archive(packed([xvec_item()]), {"companion_id": "dup"})
 
         async def run():
             import httpx

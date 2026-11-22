@@ -11,3 +11,4 @@ soundfile
 python-multipart
 pydantic
 pytest
+safetensors
