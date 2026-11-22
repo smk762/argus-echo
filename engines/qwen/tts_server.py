@@ -1021,6 +1021,10 @@ def _validate_prompt(loaded, cls) -> list:
                 ref_text=text)]
 
 
+class RequestRefused(ValueError):
+    """The server's own refusal of a request (422): unlike any other ValueError, its text is written for the client."""
+
+
 def _get_clone_prompt(clone_id: str):
     with _clone_cache_lock:
         if clone_id in _clone_cache:
@@ -1036,13 +1040,13 @@ def _get_clone_prompt(clone_id: str):
     except ClientError as exc:
         error_code = exc.response.get("Error", {}).get("Code", "Unknown")
         logger.error("clone_prompt_s3_error", clone_id=clone_id, error_code=error_code)
-        raise ValueError(f"Voice clone prompt not found: {clone_id}") from exc
+        raise RequestRefused(f"Voice clone prompt not found: {clone_id}") from exc
     buf.seek(0)
     try:
         prompt = _load_prompt(buf)
     except ValueError as exc:
         logger.error("clone_prompt_invalid", clone_id=clone_id, error=str(exc))
-        raise ValueError(f"Voice clone is not a valid Qwen clone: {clone_id}") from exc
+        raise RequestRefused(f"Voice clone is not a valid Qwen clone: {clone_id}") from exc
 
     with _clone_cache_lock:
         _clone_cache[clone_id] = prompt
@@ -1164,17 +1168,21 @@ def _generation_error(exc: Exception, request_id: str) -> JSONResponse:
         return JSONResponse(
             status_code=503, content={"error": f"busy: {exc}", "request_id": request_id}, headers={"Retry-After": "5"}
         )
-    if isinstance(exc, RuntimeError):
-        err_str = str(exc).lower()
-        if "out of memory" in err_str or "cuda" in err_str:
-            gpu_info = _gpu_memory_info()
-            logger.error("tts_gpu_oom", request_id=request_id, error=str(exc), gpu=gpu_info)
-            return JSONResponse(
-                status_code=503, content={"error": "GPU OOM", "request_id": request_id, "gpu": gpu_info}
-            )
-    elif isinstance(exc, ValueError):
-        logger.warning("tts_validation_error", error=str(exc))
-        return JSONResponse(status_code=422, content={"error": str(exc)})
+    # torch.cuda.OutOfMemoryError is a RuntimeError saying "CUDA out of memory". Any other CUDA error (a device-side
+    # assert, an illegal access) is not transient: it goes to the 500 below, not a retryable 503.
+    if isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower():
+        gpu_info = _gpu_memory_info()
+        logger.error("tts_gpu_oom", request_id=request_id, error=str(exc), gpu=gpu_info)
+        return JSONResponse(
+            status_code=503, content={"error": "GPU OOM", "request_id": request_id, "gpu": gpu_info}
+        )
+    if isinstance(exc, RequestRefused):
+        logger.warning("tts_request_refused", request_id=request_id, error=str(exc))
+        return JSONResponse(status_code=422, content={"error": str(exc), "request_id": request_id})
+    if isinstance(exc, ValueError):
+        # A library's ValueError (decoding, tensors) may name paths or internals, like the 500 below.
+        logger.warning("tts_validation_error", request_id=request_id, error=str(exc), exc_info=True)
+        return JSONResponse(status_code=422, content={"error": "Invalid TTS request", "request_id": request_id})
     # The exception text can name paths, devices and other internals: it goes
     # to the log, and the client gets the id to find it by.
     logger.error("tts_generation_failed", request_id=request_id, error=str(exc), exc_info=True)
@@ -1301,14 +1309,14 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
     speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER
     if not speaker:
         try:
-            available = custom.get_supported_speakers()
+            available = sorted(custom.get_supported_speakers() or [])
         except Exception as exc:
             return _generation_error(exc, request_id)
         return JSONResponse(
             status_code=422,
             content={
                 "error": "Either 'speaker', 'voice_description', or 'voice_clone_id' is required.",
-                "available_speakers": list(available),
+                "available_speakers": available,
             },
         )
 

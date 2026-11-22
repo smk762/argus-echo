@@ -195,7 +195,7 @@ Request: `multipart/form-data`:
 | --- | --- | --- |
 | `audio` | yes, one or more | Reference clips. Each is converted to mono 24 kHz, high-passed, VAD-trimmed (when `MISO_PREPROCESS=1`) and loudness-normalised, then all are joined and capped at `MISO_REF_MAX_SECONDS` |
 | `companion_id` | yes | Storage id. Used as given in `voice_clones/<companion_id>/`; cloning the same id again replaces the clone but keeps any `temperature`/`topk` in its `meta.json` |
-| `reference_text` | no | Transcript of the reference audio. Strongly recommended. If empty and `MISO_STT_URL` is set, each stored clip (trimmed, and cut at the cap) is sent to that engine's `POST /transcribe` and the texts are joined in clip order. A clip the cap cuts to under 0.5 s is not transcribed |
+| `reference_text` | no | Transcript of the reference audio. Strongly recommended. If empty and `MISO_STT_URL` is set, each stored clip (trimmed, and cut at the cap) is sent to that engine's `POST /transcribe` and the texts are joined in clip order. A clip the cap cuts to under 0.5 s is not transcribed. A `reference_text` that no longer matches what is stored (a clip failed preprocessing, or the cap cut the reference) is replaced the same way, with the reason in `reference_text_discarded`; without `MISO_STT_URL` that is a `422` |
 | `voice_name` | no | Display name; defaults to `companion_id` |
 | `language` | no | Language of the clips, passed to the STT engine (region dropped: `en-US` → `en`). Default `en` |
 
@@ -222,7 +222,8 @@ preprocessing report:
 `reference_text_source` is `"request"` (the caller sent `reference_text`), `"stt"`
 (machine-made by the `MISO_STT_URL` engine) or `null` (no transcript). With `"stt"`,
 `reference_text_stt` records the language asked for, plus the STT `engine` and `model`
-when its answer names them.
+when its answer names them. `num_clips` counts the clips in the clone: not one that
+failed preprocessing, nor one that starts past `MISO_REF_MAX_SECONDS`.
 
 Status: `422` with no clips, more than `MISO_MAX_CLIPS` (10), no usable audio after
 preprocessing, or under 2 s of speech (6 s or more is recommended); `503` while

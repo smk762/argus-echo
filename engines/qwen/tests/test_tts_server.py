@@ -6,6 +6,7 @@ Run from engines/qwen/: uv run --no-project --python 3.11 --with-requirements re
 """
 import asyncio
 import contextlib
+import json
 import os
 import sys
 import types
@@ -432,7 +433,8 @@ class SynthesiseFileIoTests(unittest.TestCase):
         import numpy as np
         import soundfile as sf
 
-        loop_thread = None  # set by fake_generate, which runs on the event loop
+        loop_thread = None  # set by main() before synthesise() runs, so I/O ahead of generation is classified too
+        generated = False
         on_loop, off_loop = [], []
 
         def spy(name, real):
@@ -443,9 +445,14 @@ class SynthesiseFileIoTests(unittest.TestCase):
             return wrapper
 
         async def fake_generate(req, identity=None):
+            nonlocal generated
+            generated = True
+            return np.zeros(2400, dtype="<f4"), 24000
+
+        async def main():
             nonlocal loop_thread
             loop_thread = threading.get_ident()
-            return np.zeros(2400, dtype="<f4"), 24000
+            return await tts_server.synthesise(tts_server.SynthesiseRequest(text="hi", speaker="ryan"))
 
         uploaded = {}
 
@@ -465,9 +472,9 @@ class SynthesiseFileIoTests(unittest.TestCase):
             for module, name in targets:
                 label = f"{module.__name__}.{name}"
                 stack.enter_context(mock.patch.object(module, name, spy(label, getattr(module, name))))
-            out = asyncio.run(tts_server.synthesise(tts_server.SynthesiseRequest(text="hi", speaker="ryan")))
+            out = asyncio.run(main())
 
-        self.assertIsNotNone(loop_thread)
+        self.assertTrue(generated)
         self.assertEqual(on_loop, [])
         # The spies did see the WAV being written and read back, on another thread:
         # an empty on_loop means something only if the I/O was observed at all.
@@ -475,6 +482,39 @@ class SynthesiseFileIoTests(unittest.TestCase):
         self.assertTrue({"builtins.open", "io.open"} & set(off_loop), off_loop)
         self.assertAlmostEqual(out["duration"], 0.1, places=3)
         self.assertTrue(uploaded["bytes"].startswith(b"RIFF"))
+
+
+class GenerationErrorMappingTests(unittest.TestCase):
+    def answer(self, exc):
+        with mock.patch.object(tts_server, "_gpu_memory_info", return_value=None):
+            resp = tts_server._generation_error(exc, "req-1")
+        return resp.status_code, json.loads(resp.body)
+
+    def test_only_an_out_of_memory_is_a_retryable_oom(self):
+        self.assertEqual(self.answer(RuntimeError("CUDA out of memory. Tried to allocate 2 GiB"))[0], 503)
+        for fatal in ("CUDA error: device-side assert triggered", "CUDA error: an illegal memory access"):
+            status, body = self.answer(RuntimeError(fatal))
+            self.assertEqual(status, 500, fatal)
+            self.assertNotIn("OOM", body["error"])
+            self.assertEqual(body["request_id"], "req-1")
+
+    def test_only_the_servers_own_refusals_reach_the_client(self):
+        status, body = self.answer(tts_server.RequestRefused("Voice clone prompt not found: voice_clones/a/prompt.pt"))
+        self.assertEqual((status, body["request_id"]), (422, "req-1"))
+        self.assertIn("Voice clone prompt not found", body["error"])
+
+        status, body = self.answer(ValueError("cannot open /srv/secret/clone.wav on cuda:0"))
+        self.assertEqual((status, body["request_id"]), (422, "req-1"))
+        self.assertNotIn("/srv/secret", body["error"])
+
+    def test_no_speaker_and_no_listed_speakers_is_422(self):
+        custom = mock.Mock()
+        custom.get_supported_speakers.return_value = None
+        with mock.patch.object(tts_server, "_mgr", mock.Mock(custom_model=custom)), \
+                mock.patch.object(tts_server, "DEFAULT_SPEAKER", ""):
+            resp = asyncio.run(tts_server._plan_generation(tts_server.SynthesiseRequest(text="hi"), "req-1"))
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(json.loads(resp.body)["available_speakers"], [])
 
 
 class S3CredentialTests(unittest.TestCase):

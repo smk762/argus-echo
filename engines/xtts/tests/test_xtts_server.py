@@ -588,6 +588,25 @@ def test_padded_vad_segments_do_not_repeat_audio(monkeypatch):
     assert report["kept_seconds"] == 2.2  # 0.9 s .. 3.1 s, each sample once
 
 
+def test_self_seeded_denoise_reports_the_strength_it_used(monkeypatch):
+    import sys
+    import types
+
+    sr = xs.PREPROCESS_SR
+    _fake_audio_stack(monkeypatch, torch.rand(1, sr * 4) - 0.5, sr, [{"start": 0.0, "end": 4.0}])  # no noise gap
+    used = []
+    nr = types.ModuleType("noisereduce")
+    nr.reduce_noise = lambda y, sr, stationary, prop_decrease: used.append(prop_decrease) or y
+    monkeypatch.setitem(sys.modules, "noisereduce", nr)
+    monkeypatch.setattr(xs, "PREPROCESS_DENOISE", True)
+    monkeypatch.setattr(xs, "PREPROCESS_DENOISE_PROP", 0.3)
+    monkeypatch.setattr(xs, "PREPROCESS_HIGHPASS_HZ", 0)
+    path, report = xs._preprocess_clip("clip.wav")
+    os.unlink(path)
+    assert used == [0.3]
+    assert "denoise(self,0.3)" in report["applied"]
+
+
 def test_padded_spans_merge_overlaps():
     ts = [{"start": 1.0, "end": 2.0}, {"start": 2.05, "end": 2.1}, {"start": 2.1, "end": 3.0}]
     spans = xs._padded_spans(ts, 0.1, 100, 1000)

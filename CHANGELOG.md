@@ -13,6 +13,26 @@
   clones (a longer generation grows the working set, and torch keeps it cached), 178 MiB evicted (#6). The
   4800 it replaces was measured for 1.7b CustomVoice only, and its guess that 0.6b `both` would fit inside it was
   wrong.
+- Miso `/clone-voice` no longer stores a `reference_text` that doesn't match the stored audio (a clip failed
+  preprocessing, or `MISO_REF_MAX_SECONDS` cut the reference): it is replaced by `MISO_STT_URL`'s transcript
+  (`reference_text_discarded` says why), or refused with `422` without one. `num_clips` leaves out clips the cap
+  cut out entirely.
+- Qwen answers only a real CUDA out-of-memory with the retryable `503 GPU OOM`; any other CUDA error is a `500`.
+  A `422` from a library `ValueError` says `Invalid TTS request` (the detail is logged) and, like every error
+  body, carries `request_id`.
+- XTTS `/clones/import` refuses latents not shaped as XTTS-v2's (`speaker_embedding` (1, 512, 1),
+  `gpt_cond_latent` (1, T ≤ 1024, 1024)).
+
+### Fixed
+- Miso: `LocalStorage` normalises its own root (the server's `MISO_DATA_DIR` already was), so one given with a
+  trailing slash or `./` no longer refuses every key; `/analyze-clips` stops spooling parts past `MISO_MAX_CLIPS`; a corrupt, encrypted or unknown-compression archive
+  member is a `422` on `/clones/import`, not a `500`, and an imported clone's `total_seconds` comes from its
+  prompt, `num_clips` only from a whole number in its `meta.json`.
+- Whisper frees a backend whose load or move failed before loading another, and its eviction loop no longer starts
+  a second, untracked one after moving the model to RAM.
+- Qwen: a model listing no speakers gives the missing-speaker `422`, not a `500`.
+- XTTS: re-cloning or re-importing a voice makes it the newest in the clone cache; the self-seeded denoise reports
+  the strength it used.
 
 ## [0.3.0] - 2026-11-22
 

@@ -222,6 +222,20 @@ class TranscribeTest(EngineTest):
         self.assertEqual(r.status_code, 503)
         self.assertEqual(stt_server.mgr.state, stt_server.State.ERROR)
 
+    def test_a_failed_load_is_freed_before_the_retry(self):
+        class BrokenOnce(FakeBackend):
+            def load(self):
+                super().load()
+                if len(FakeBackend.instances) == 1:
+                    raise RuntimeError("CUDA failed with error out of memory")
+
+        with mock.patch.object(stt_server, "backend_factory", BrokenOnce):
+            self.assertEqual(self.post().status_code, 503)
+            self.assertEqual(self.post().status_code, 200, "the retry loads a fresh backend")
+        failed, fresh = FakeBackend.instances
+        self.assertEqual(failed.events, ["load", "free"])
+        self.assertEqual(fresh.events, ["load"])
+
 
 class HealthTest(EngineTest):
     def test_health_is_resident_health_and_advertises_stt(self):
@@ -280,6 +294,29 @@ class LifecycleTest(EngineTest):
                     await asyncio.sleep(0.01)
             self.assertEqual(m.state, stt_server.State.UNLOADED)
             self.assertEqual(self.backend.events, ["load", "to_cpu", "free"])
+
+        asyncio.run(go())
+
+    def test_the_eviction_loop_does_not_start_a_second_one(self):
+        def loops():
+            return [t for t in asyncio.all_tasks() if t.get_coro().__name__ == "_eviction_loop" and not t.done()]
+
+        async def go():
+            m = stt_server.mgr
+            m.keep_alive_gpu, m.keep_alive_cpu = 0.01, 60  # the loop then waits out its CPU phase
+            with mock.patch.object(stt_server, "DEVICE", "cuda"):
+                async with m.lease():
+                    pass
+                for _ in range(100):
+                    if m.state == stt_server.State.CPU:
+                        break
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0.01)
+                self.assertEqual(m.state, stt_server.State.CPU)
+                self.assertEqual(loops(), [m._evict_task])
+                await m.unload()
+                await asyncio.sleep(0)
+                self.assertEqual(loops(), [])
 
         asyncio.run(go())
 
