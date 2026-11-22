@@ -123,7 +123,10 @@ Same seed means same audio only when everything else is the same too:
   the response (`X-XTTS-Device` on a stream) and compare only runs on the same one. Qwen and Miso always generate
   on their configured device;
 - the image and the GPU model: compare `/health` `image`, both its release and its `runtime` (torch, CUDA, cuDNN
-  and the engine library versions), not the revision alone. The driver version isn't there; take it from the host.
+  and the engine library versions), not the revision alone. From 0.3.0 the XTTS, Qwen and Miso images pin every
+  package to an exact version (`engines/<engine>/constraints.txt`; Miso's `uv.lock` plus `server-constraints.txt`),
+  so one revision builds one stack; `runtime` still says what is actually running. The driver version isn't
+  there; take it from the host.
 
 **Measured.** On 2026-11-22 each case below ran twice with seed 42 and once with seed 43, and the outputs were
 compared byte for byte (SHA-256 of the WAV `/synthesise` stores, or of the PCM `/synthesise/stream` sends). Every
