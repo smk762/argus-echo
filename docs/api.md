@@ -335,13 +335,16 @@ client (Home Assistant) reaches it through the `wyoming-whisper` bridge, which p
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `audio` | file | required | WAV or FLAC (sniffed from the magic bytes; nothing else is decoded), 1 or 2 channels (averaged), 8 to 96 kHz |
-| `language` | string | detected | ISO 639-1 (`en`). A region suffix is dropped (`en-US` → `en`). An unknown code is `422` |
+| `audio` | file | required | WAV or FLAC (sniffed from the magic bytes), 1 or 2 channels (averaged), 8 to 96 kHz; or any other audio ffmpeg can demux with a format in `STT_INPUT_FORMATS` (a browser's webm/opus recording, mp3, ogg, m4a, ...), resampled to 16 kHz mono |
+| `language` | string | detected | ISO 639-1 (`en`). A region suffix is dropped (`en-US` → `en`). An unknown code is `422`. Also accepted as a query parameter (`?language=en`, as agent-composer's sidecar took it); the form field wins |
 | `word_timestamps` | bool | `false` | Adds `words` to every segment |
 
-The upload is read through argus-cortex's `read_upload` and `open_audio`, so the byte cap (`STT_MAX_UPLOAD_MB`,
-default 50), the format, channels, rate and duration (`STT_MAX_SECONDS`, default 600) are checked before a sample
-is decoded. Nothing is stored.
+The upload is read through argus-cortex's `read_upload`, so the byte cap (`STT_MAX_UPLOAD_MB`, default 50) holds
+first. WAV and FLAC then go through `open_audio`, which checks channels, rate and duration (`STT_MAX_SECONDS`,
+default 600) before a sample is decoded. Other formats go through ffmpeg exactly as on `/transcriptions`: it reads
+only from a pipe, may use only a demuxer in `STT_INPUT_FORMATS` (`none`: WAV/FLAC only), and stops past
+`STT_MAX_SECONDS` (`413`). Undecodable audio is `400`. At most `STT_MAX_DECODES` requests (default 2, shared with
+`/transcriptions`) decode at once; the rest wait up to `STT_QUEUE_TIMEOUT_S`, then get `503`. Nothing is stored.
 
 ```json
 {
@@ -364,7 +367,7 @@ is empty for silence. Times are seconds from the start of the clip.
 | `400` | Not WAV or FLAC, unreadable, too many channels, a rate outside the list |
 | `413` | Over the byte cap or the duration cap |
 | `422` | Unknown `language` |
-| `503` | Loading, out of GPU memory, or every slot busy for `STT_QUEUE_TIMEOUT_S` (default 30); with `Retry-After` |
+| `503` | Loading, out of GPU memory, or every transcription or decode slot busy for `STT_QUEUE_TIMEOUT_S` (default 30); with `Retry-After` |
 
 Transcriptions run one at a time (`STT_CONCURRENCY`); later requests queue for up to `STT_QUEUE_TIMEOUT_S`.
 Whisper writes numbers as digits (`7.30`, `12%`): normalise both sides before scoring a transcript against a script.
@@ -429,7 +432,7 @@ reason; the reason is logged, never the resolved address.
 | `413` | Body, download, decoded bytes or duration over its cap |
 | `422` | Both fields, a body that isn't the JSON object above, or an unknown `language` |
 | `502` | `audio_url` could not be downloaded |
-| `503` | As `/transcribe`, or every decode slot busy for `STT_QUEUE_TIMEOUT_S`; with `Retry-After` |
+| `503` | As `/transcribe`, with `Retry-After` |
 
 Errors are `{"error": "..."}` as on every echo route; composer's were FastAPI's `{"detail": "..."}`.
 

@@ -17,11 +17,11 @@ or unload waits for every lease to drop. A negative keep-alive pins that stage. 
 CTranslate2's caching allocator (CT2_CUDA_CACHING_ALLOCATOR_CONFIG, set in the Dockerfile) and by
 transcribing one request at a time (STT_CONCURRENCY); gpu-tenant.yaml declares the measured peak to iris.
 
-Uploads are read through argus_cortex.limits (read_upload, then open_audio), so the byte cap, the format
-(WAV or FLAC, sniffed from the magic bytes), the channel count, the sample rate and the duration are checked
-before any sample is decoded. /transcriptions puts its fetched or base64-decoded bytes through the same caps;
-audio that is not WAV or FLAC is decoded by the ffmpeg CLI, reading only from a pipe and only through a demuxer in
-STT_INPUT_FORMATS, and stopped at STT_MAX_SECONDS.
+Uploads are read through argus_cortex.limits (read_upload, then open_audio for WAV or FLAC, sniffed from the magic
+bytes), so the byte cap, the channel count, the sample rate and the duration are checked before any sample is
+decoded. /transcriptions puts its fetched or base64-decoded bytes through the same caps. On both routes, audio that
+is not WAV or FLAC (a browser's webm/opus recording, mp3, ...) is decoded by the ffmpeg CLI, reading only from a
+pipe and only through a demuxer in STT_INPUT_FORMATS, and stopped at STT_MAX_SECONDS.
 
 audio_url (/transcriptions) is fetched with argus_cortex.net.afetch: http(s) only, no credentials in the URL, every
 address the host resolves to must be global (no loopback, private, link-local/metadata, CGNAT, reserved, multicast
@@ -53,10 +53,10 @@ Env vars:
   STT_AUDIO_URL_MAX_REDIRECTS — redirects an audio_url fetch follows, each re-checked (default 0: none)
   STT_DOWNLOAD_TIMEOUT  — seconds for a whole audio_url fetch (default 30)
   STT_DECODE_TIMEOUT    — seconds for one ffmpeg decode (default 120)
-  STT_MAX_DECODES       — /transcriptions requests that may fetch and decode at once (default 2); the rest wait
-                          up to STT_QUEUE_TIMEOUT_S, then 503. Bounds the bytes held and the ffmpeg processes run
-  STT_INPUT_FORMATS     — ffmpeg demuxers /transcriptions may decode non-WAV/FLAC audio with (comma list; default
-                          plain audio containers, no playlists). "none" accepts WAV/FLAC only
+  STT_MAX_DECODES       — requests (/transcribe, /transcriptions) that may decode at once (default 2); the rest
+                          wait up to STT_QUEUE_TIMEOUT_S, then 503. Bounds the bytes held and the ffmpeg processes run
+  STT_INPUT_FORMATS     — ffmpeg demuxers /transcribe and /transcriptions may decode non-WAV/FLAC audio with (comma
+                          list; default plain audio containers, no playlists). "none" accepts WAV/FLAC only
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ from argus_cortex.limits import (
     read_upload,
 )
 from argus_cortex.net import UrlRefused, afetch
-from fastapi import Depends, FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 from starlette.requests import HTTPConnection, Request
@@ -416,9 +416,19 @@ class ModelManager:
 
 mgr = ModelManager()
 _slots = asyncio.Semaphore(CONCURRENCY)
-# /transcriptions' fetch and decode, before it takes a _slots permit: each holds up to MAX_UPLOAD_BYTES of audio, its
-# decoded samples and maybe an ffmpeg process, so they are bounded too.
+# Decoding (and /transcriptions' fetch), before a request takes a _slots permit: each holds up to MAX_UPLOAD_BYTES of
+# audio, its decoded samples and maybe an ffmpeg process, so they are bounded too.
 _intake = asyncio.Semaphore(MAX_DECODES)
+DECODE_BUSY = "busy: every decode slot is taken"
+
+
+async def take_intake() -> bool:
+    """Wait (up to QUEUE_TIMEOUT_S) for an _intake permit. False when none came: answer 503."""
+    try:
+        await asyncio.wait_for(_intake.acquire(), timeout=QUEUE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return False
+    return True
 
 
 class Busy(Exception):
@@ -472,25 +482,38 @@ async def transcribe(
     audio: UploadFile = File(...),
     language: Optional[str] = Form(None),
     word_timestamps: bool = Form(False),
+    language_query: Optional[str] = Query(None, alias="language"),
 ):
+    # `language` as a form field, or as a query parameter (agent-composer's sidecar took it there, and rag-chat sends
+    # it so); the form field wins when both are given.
     try:
-        lang = normalise_language(language)
+        lang = normalise_language(language if language else language_query)
     except LanguageError as exc:
         return _error(422, str(exc))
     if mgr.state == State.LOADING:
         return _error(503, "model loading", retry_after=10)
     try:
         data = await read_upload(audio, MAX_UPLOAD_BYTES, what="audio")
-        clip = await asyncio.to_thread(
-            open_audio, data, max_seconds=MAX_SECONDS, allowed_rates=ALLOWED_RATES, max_bytes=MAX_UPLOAD_BYTES, mono=True
-        )
     except TooLarge as exc:
         return _error(413, str(exc))
     except BadInput as exc:
         return _error(400, str(exc))
+    # At most MAX_DECODES decodes at once, across both routes (see _intake).
+    if not await take_intake():
+        return _error(503, DECODE_BUSY, retry_after=5)
+    try:
+        # WAV/FLAC through open_audio; anything else (a browser's webm/opus recording, mp3, ...) through ffmpeg,
+        # reading only from a pipe and only with a demuxer in STT_INPUT_FORMATS, as /transcriptions does.
+        samples, rate = await asyncio.to_thread(decode_audio_bytes, data)
+    except TooLarge as exc:
+        return _error(413, str(exc))
+    except BadInput as exc:
+        return _error(400, str(exc))
+    finally:
+        _intake.release()
     del data
     try:
-        return await run_transcription(clip.samples, clip.sample_rate, lang, word_timestamps)
+        return await run_transcription(samples, rate, lang, word_timestamps)
     except Busy:
         return _error(503, "busy: every transcription slot is taken", retry_after=5)
     except RuntimeError as exc:
@@ -655,10 +678,8 @@ async def transcriptions(request: Request):
 
     # At most MAX_DECODES requests fetch and decode at once (each holds its audio, its samples and maybe an ffmpeg
     # process); the rest wait like a transcription slot does, then 503.
-    try:
-        await asyncio.wait_for(_intake.acquire(), timeout=QUEUE_TIMEOUT_S)
-    except asyncio.TimeoutError:
-        return _error(503, "busy: every decode slot is taken", retry_after=5)
+    if not await take_intake():
+        return _error(503, DECODE_BUSY, retry_after=5)
     try:
         if req.audio_url:
             data = await fetch_audio_url(req.audio_url)

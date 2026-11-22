@@ -13,6 +13,10 @@
   Whisper runs (`STT_VAD_FILTER`, default on, as composer did; `/transcribe` is unchanged), and audio other than
   WAV/FLAC is decoded with ffmpeg, now in the image, reading only from a pipe and only through a demuxer in
   `STT_INPUT_FORMATS` (`none`: WAV/FLAC only). Models: `TranscriptionsRequest`, `TranscriptionsResult`.
+- Whisper's `POST /transcribe` decodes any format in `STT_INPUT_FORMATS` through the same ffmpeg path (a browser's
+  webm/opus recording, which agent-composer's rag-chat forwards as is, used to be a `400`), and takes `language` as
+  a query parameter too (`?language=en`, as composer's sidecar did; the form field wins). WAV and FLAC still go
+  through `open_audio` (smk762/agent-composer#81).
 - `gpu-tenant.yaml` gives Qwen a `vram_mb` (4800): Qwen3-TTS 1.7b with CustomVoice only, measured on an 8 GB
   RTX 4060 (dragon), CUDA context included. Generating stays inside the loaded footprint; evict and unload leave
   only the ~150 MB CUDA context (#6). Base and 0.6b are still to measure.
@@ -73,10 +77,10 @@
   `/admin/load` already did. Every request used to keep retrying the broken directory until an admin stepped in.
 - Qwen: a GPU/CPU move that fails (and frees the models) clears `/health`'s `weights`, which kept reporting a
   fingerprint for weights no longer loaded.
-- Whisper `/transcriptions`: at most `STT_MAX_DECODES` (default 2) requests fetch and decode at once; the rest
-  queue for `STT_QUEUE_TIMEOUT_S`, then `503`. Nothing used to bound the downloads, base64 bodies and ffmpeg
-  processes in flight. A WAV or FLAC that `open_audio` refuses (a sample rate it doesn't take) is decoded by ffmpeg
-  instead of answering `400`. A test now triggers each argus-cortex fetch-failure message that sorts a failed
+- Whisper: at most `STT_MAX_DECODES` (default 2) requests decode at once, across `/transcribe` and
+  `/transcriptions` (whose fetch counts too); the rest queue for `STT_QUEUE_TIMEOUT_S`, then `503`. Nothing used to
+  bound the downloads, base64 bodies and ffmpeg processes in flight. A WAV or FLAC that `open_audio` refuses (a
+  sample rate it doesn't take) is decoded by ffmpeg instead of answering `400`. A test now triggers each argus-cortex fetch-failure message that sorts a failed
   `audio_url` into `502`/`413`/`400`, so a reworded message fails CI.
 
 ## [0.1.0] - 2026-11-22
