@@ -10,8 +10,8 @@ engine by changing a URL, and a speech-to-text engine:
 | **qwen** | [Qwen3-TTS](https://huggingface.co/Qwen) 0.6B / 1.7B | small | Built-in speakers, voice design from a description |
 | **whisper** | [Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) (faster-whisper) | ~3 GB | Speech to text: 99 languages, word timestamps, live streaming with VAD |
 
-Plus a **Wyoming bridge** that puts any engine in front of Home Assistant or anything else that speaks
-[Wyoming](https://github.com/OHF-Voice/wyoming).
+Plus **Wyoming bridges** that put any engine, text to speech or speech to text, in front of Home Assistant or
+anything else that speaks [Wyoming](https://github.com/OHF-Voice/wyoming).
 
 Every engine loads its model on first use, unloads it when idle, and serves argus-cortex's resident contract
 (`/health`, `/admin/{unload,evict,wake}`), so [argus-iris](https://github.com/smk762/argus-iris) can share a GPU
@@ -32,9 +32,9 @@ docker compose --profile miso up -d --build                  # 24 GB card
 docker compose --profile xtts --profile qwen up -d --build   # 8 GB card
 ```
 
-Ports: Miso `8140`, XTTS `8141`, Qwen `8142`, Whisper `8144`, Wyoming bridges `10240` (XTTS) and `10241` (Miso). They are
-published on `ECHO_BIND`, which defaults to `127.0.0.1`; set it to `0.0.0.0` or a LAN address to serve other
-machines. Miso downloads its ~33 GB checkpoint into `HF_HOME` on first use; the XTTS and Qwen images bake their
+Ports: Miso `8140`, XTTS `8141`, Qwen `8142`, Whisper `8144`; Wyoming bridges `10240` (XTTS), `10241` (Miso),
+`10242` (Qwen) and `10243` (Whisper), see [Home Assistant](docs/voice-cloning.md#home-assistant). They are published on
+`ECHO_BIND`, which defaults to `127.0.0.1`; set it to `0.0.0.0` or a LAN address to serve other machines. Miso downloads its ~33 GB checkpoint into `HF_HOME` on first use; the XTTS and Qwen images bake their
 weights in at build time.
 
 Check an engine (read-only; `--speak` also streams a sentence, which loads the model):
