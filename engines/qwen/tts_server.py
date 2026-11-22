@@ -54,9 +54,9 @@ from typing import AsyncIterator, Optional
 
 import structlog
 from argus_cortex.auth import bearer
-from starlette.requests import HTTPConnection
+from starlette.requests import ClientDisconnect, HTTPConnection
 from fastapi import Depends, FastAPI, File, Form, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = structlog.get_logger(__name__)
@@ -358,20 +358,29 @@ class TTSModelManager:
         Don't call ensure_gpu/demote_to_cpu/unload inside the block: they take
         the lock a waiting demote/unload holds, which would deadlock.
         """
+        await self.acquire()
+        try:
+            yield self
+        finally:
+            self.release()
+
+    async def acquire(self) -> None:
+        """Take a lease by hand (``use()`` is the usual way). Every successful
+        ``acquire()`` needs exactly one ``release()``, on the event loop thread.
+        ``/synthesise/stream`` uses the pair to hand its lease to the response."""
         async with self._lock:
             await self._make_ready()
             self._in_use += 1
             self._idle.clear()
             if self._evict_task and not self._evict_task.done():
                 self._evict_task.cancel()
-        try:
-            yield self
-        finally:
-            self._in_use -= 1
-            self._last_used = time.time()
-            if self._in_use == 0:
-                self._idle.set()
-                self._arm_evict()
+
+    def release(self) -> None:
+        self._in_use -= 1
+        self._last_used = time.time()
+        if self._in_use == 0:
+            self._idle.set()
+            self._arm_evict()
 
     async def _demote_locked(self) -> None:
         await self._await_move()
@@ -586,7 +595,7 @@ class SynthesiseRequest(BaseModel):
     instruction: Optional[str] = None
     emotion: str = "neutral"
     language: str = Field(default="en")
-    speed: Optional[float] = None  # reserved for future use
+    speed: Optional[float] = None  # accepted for the shared contract; Qwen ignores it (XTTS applies it)
 
 
 # ── POST /synthesise ──────────────────────────────────────────────────────────
@@ -617,6 +626,65 @@ async def _generate_audio(req: SynthesiseRequest):
 
 async def _generate_audio_leased(req: SynthesiseRequest):
     """Body of ``_generate_audio``; the caller holds a ``_mgr.use()`` lease."""
+    request_id = uuid.uuid4().hex[:12]  # ties a client-visible error to its log line
+    render = await _plan_generation(req, request_id)
+    if isinstance(render, JSONResponse):
+        return render
+    return await _render(render, req.text, request_id)
+
+
+async def _render(render, text: str, request_id: str):
+    """Run ``render(text)`` in a thread: ``(float32 samples, sample_rate)`` or a JSONResponse."""
+    try:
+        audio_arrays, sample_rate = await asyncio.to_thread(render, text)
+    except Exception as exc:
+        return _generation_error(exc, request_id)
+    return _to_pcm(audio_arrays, sample_rate, request_id, text)
+
+
+def _generation_error(exc: Exception, request_id: str) -> JSONResponse:
+    """The client's answer to a failed generation (or clone-prompt load)."""
+    if isinstance(exc, RuntimeError):
+        err_str = str(exc).lower()
+        if "out of memory" in err_str or "cuda" in err_str:
+            gpu_info = _gpu_memory_info()
+            logger.error("tts_gpu_oom", request_id=request_id, error=str(exc), gpu=gpu_info)
+            return JSONResponse(
+                status_code=503, content={"error": "GPU OOM", "request_id": request_id, "gpu": gpu_info}
+            )
+    elif isinstance(exc, ValueError):
+        logger.warning("tts_validation_error", error=str(exc))
+        return JSONResponse(status_code=422, content={"error": str(exc)})
+    # The exception text can name paths, devices and other internals: it goes
+    # to the log, and the client gets the id to find it by.
+    logger.error("tts_generation_failed", request_id=request_id, error=str(exc), exc_info=True)
+    return JSONResponse(status_code=500, content={"error": "TTS generation failed", "request_id": request_id})
+
+
+def _to_pcm(audio_arrays, sample_rate, request_id: str, text: str):
+    """One contiguous little-endian float32 array from the model's output, or a JSONResponse."""
+    if audio_arrays is None or len(audio_arrays) == 0:
+        logger.error("tts_empty_output", request_id=request_id, text_chars=len(text or ""))
+        return JSONResponse(status_code=500, content={"error": "TTS produced no audio", "request_id": request_id})
+
+    import numpy as np
+
+    audio = np.concatenate(audio_arrays) if len(audio_arrays) > 1 else audio_arrays[0]
+    audio = np.ascontiguousarray(np.asarray(audio), dtype="<f4").reshape(-1)
+    return audio, int(sample_rate)
+
+
+async def _plan_generation(req: SynthesiseRequest, request_id: str):
+    """Validate ``req`` and choose its model, before any audio is rendered.
+
+    Returns ``render(text) -> (audio_arrays, sample_rate)``, a blocking call that
+    speaks ``text`` in the request's voice, or a JSONResponse for a request that
+    can't be served. A clone's prompt is loaded here, so a bad ``voice_clone_id``
+    is an error before ``/synthesise/stream`` sends its 200. The caller holds a lease.
+
+    Uses the Base model for a ``voice_clone_id`` (voice cloning) and the
+    CustomVoice model otherwise (built-in speaker + instruction).
+    """
     instruction = req.instruction
     if instruction is None:
         instruction = EMOTION_TO_INSTRUCTION.get(req.emotion, "")
@@ -631,107 +699,96 @@ async def _generate_audio_leased(req: SynthesiseRequest):
             },
         )
 
-    max_new_tokens = _max_new_tokens_for(req.text)
-    request_id = uuid.uuid4().hex[:12]  # ties a client-visible error to its log line
-
-    try:
-        if req.voice_clone_id:
-            if _mgr.base_model is None:
-                return JSONResponse(status_code=503, content={"error": "Base model not loaded (TTS_LOAD_MODELS=custom_voice)"})
+    if req.voice_clone_id:
+        base = _mgr.base_model
+        if base is None:
+            return JSONResponse(status_code=503, content={"error": "Base model not loaded (TTS_LOAD_MODELS=custom_voice)"})
+        try:
             clone_prompt = await asyncio.to_thread(_get_clone_prompt, req.voice_clone_id)
-            audio_arrays, sample_rate = await asyncio.to_thread(
-                _mgr.base_model.generate_voice_clone,
-                req.text, voice_clone_prompt=clone_prompt, language=language,
-                max_new_tokens=max_new_tokens,
+        except Exception as exc:
+            return _generation_error(exc, request_id)
+
+        def render(text: str):
+            return base.generate_voice_clone(
+                text, voice_clone_prompt=clone_prompt, language=language,
+                max_new_tokens=_max_new_tokens_for(text),
             )
 
-        elif req.voice_description:
-            design_instruct = req.voice_description
-            if instruction:
-                design_instruct = f"{req.voice_description}. {instruction}"
+        return render
 
-            if _mgr.base_model is not None:
-                audio_arrays, sample_rate = await asyncio.to_thread(
-                    _mgr.base_model.generate_voice_design,
-                    req.text, instruct=design_instruct, language=language,
-                    max_new_tokens=max_new_tokens,
-                )
-            elif _mgr.custom_model is not None:
-                fallback_speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER
-                if not fallback_speaker:
-                    available = sorted(_mgr.custom_model.get_supported_speakers() or [])
-                    if not available:
-                        return JSONResponse(
-                            status_code=503,
-                            content={
-                                "error": "Voice design needs the Base model (TTS_LOAD_MODELS=custom_voice) "
-                                "and the CustomVoice model lists no speaker to fall back to."
-                            },
-                        )
-                    fallback_speaker = available[0]
-                logger.info("voice_design_fallback_to_speaker", speaker=fallback_speaker)
-                audio_arrays, sample_rate = await asyncio.to_thread(
-                    _mgr.custom_model.generate_custom_voice,
-                    text=req.text, speaker=fallback_speaker,
-                    instruct=design_instruct, language=language,
-                    max_new_tokens=max_new_tokens,
-                )
-            else:
-                return JSONResponse(status_code=503, content={"error": "No model loaded"})
+    if req.voice_description:
+        design_instruct = req.voice_description
+        if instruction:
+            design_instruct = f"{req.voice_description}. {instruction}"
 
-        else:
-            if _mgr.custom_model is None:
-                return JSONResponse(status_code=503, content={"error": "CustomVoice model not loaded (TTS_LOAD_MODELS=base)"})
-            speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER
-            if not speaker:
-                available = _mgr.custom_model.get_supported_speakers()
+        base = _mgr.base_model
+        if base is not None:
+            def render(text: str):
+                return base.generate_voice_design(
+                    text, instruct=design_instruct, language=language,
+                    max_new_tokens=_max_new_tokens_for(text),
+                )
+
+            return render
+
+        custom = _mgr.custom_model
+        if custom is None:
+            return JSONResponse(status_code=503, content={"error": "No model loaded"})
+        fallback_speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER
+        if not fallback_speaker:
+            try:
+                available = sorted(custom.get_supported_speakers() or [])
+            except Exception as exc:
+                return _generation_error(exc, request_id)
+            if not available:
                 return JSONResponse(
-                    status_code=422,
+                    status_code=503,
                     content={
-                        "error": "Either 'speaker', 'voice_description', or 'voice_clone_id' is required.",
-                        "available_speakers": list(available),
+                        "error": "Voice design needs the Base model (TTS_LOAD_MODELS=custom_voice) "
+                        "and the CustomVoice model lists no speaker to fall back to."
                     },
                 )
-            generate_kwargs: dict = {
-                "text": req.text,
-                "speaker": speaker,
-                "language": language,
-                "max_new_tokens": max_new_tokens,
-            }
-            if instruction:
-                generate_kwargs["instruct"] = instruction
-            audio_arrays, sample_rate = await asyncio.to_thread(
-                _mgr.custom_model.generate_custom_voice, **generate_kwargs,
+            fallback_speaker = available[0]
+        logger.info("voice_design_fallback_to_speaker", speaker=fallback_speaker)
+
+        def render(text: str):
+            return custom.generate_custom_voice(
+                text=text, speaker=fallback_speaker,
+                instruct=design_instruct, language=language,
+                max_new_tokens=_max_new_tokens_for(text),
             )
 
-    except RuntimeError as exc:
-        err_str = str(exc).lower()
-        if "out of memory" in err_str or "cuda" in err_str:
-            gpu_info = _gpu_memory_info()
-            logger.error("tts_gpu_oom", request_id=request_id, error=str(exc), gpu=gpu_info)
-            return JSONResponse(
-                status_code=503, content={"error": "GPU OOM", "request_id": request_id, "gpu": gpu_info}
-            )
-        logger.error("tts_generation_failed", request_id=request_id, error=str(exc), exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "TTS generation failed", "request_id": request_id})
-    except ValueError as exc:
-        logger.warning("tts_validation_error", error=str(exc))
-        return JSONResponse(status_code=422, content={"error": str(exc)})
-    except Exception as exc:
-        # The exception text can name paths, devices and other internals: it goes
-        # to the log, and the client gets the id to find it by.
-        logger.error("tts_generation_failed", request_id=request_id, error=str(exc), exc_info=True)
-        return JSONResponse(status_code=500, content={"error": "TTS generation failed", "request_id": request_id})
+        return render
 
-    if audio_arrays is None or len(audio_arrays) == 0:
-        logger.error("tts_empty_output", request_id=request_id, text_chars=len(req.text or ""))
-        return JSONResponse(status_code=500, content={"error": "TTS produced no audio", "request_id": request_id})
+    custom = _mgr.custom_model
+    if custom is None:
+        return JSONResponse(status_code=503, content={"error": "CustomVoice model not loaded (TTS_LOAD_MODELS=base)"})
+    speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER
+    if not speaker:
+        try:
+            available = custom.get_supported_speakers()
+        except Exception as exc:
+            return _generation_error(exc, request_id)
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": "Either 'speaker', 'voice_description', or 'voice_clone_id' is required.",
+                "available_speakers": list(available),
+            },
+        )
 
-    import numpy as np
+    def render(text: str):
+        generate_kwargs: dict = {
+            "text": text,
+            "speaker": speaker,
+            "language": language,
+            "max_new_tokens": _max_new_tokens_for(text),
+        }
+        if instruction:
+            generate_kwargs["instruct"] = instruction
+        return custom.generate_custom_voice(**generate_kwargs)
 
-    audio = np.concatenate(audio_arrays) if len(audio_arrays) > 1 else audio_arrays[0]
-    audio = np.ascontiguousarray(np.asarray(audio), dtype="<f4").reshape(-1)
-    return audio, int(sample_rate)
+    return render
 
 
 def _encode_wav(audio, sample_rate: int) -> tuple[bytes, float]:
@@ -788,28 +845,197 @@ async def synthesise(req: SynthesiseRequest):
     }
 
 
+# A sentence ends at . ! ? or … (with any closing quotes or brackets) followed by
+# whitespace, at CJK full-width end punctuation, or at a blank line.
+_SENTENCE_BREAK = re.compile(r"([.!?…]+[\"'”’»)\]]*\s+|[。！？]+[\"”’」』）]*\s*|\n\s*\n)")
+_CJK_END = ("。", "！", "？", "」", "』", "）")
+# Fragments shorter than this join the next sentence: "Dr." or "Hi!" alone would
+# be rendered with odd prosody, and a model call per word costs more than it saves.
+_STREAM_MIN_CHARS = 24
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split ``text`` into sentences for ``/synthesise/stream``, merging short ones."""
+    parts = _SENTENCE_BREAK.split(text or "")
+    pieces = []
+    for i in range(0, len(parts), 2):
+        piece = (parts[i] + (parts[i + 1] if i + 1 < len(parts) else "")).strip()
+        if piece:
+            pieces.append(piece)
+
+    def join(a: str, b: str) -> str:
+        return a + b if a.endswith(_CJK_END) else f"{a} {b}"
+
+    sentences: list[str] = []
+    for piece in pieces:
+        if sentences and len(sentences[-1]) < _STREAM_MIN_CHARS:
+            sentences[-1] = join(sentences[-1], piece)
+        else:
+            sentences.append(piece)
+    if len(sentences) > 1 and len(sentences[-1]) < _STREAM_MIN_CHARS:
+        tail = sentences.pop()
+        sentences[-1] = join(sentences[-1], tail)
+    return sentences or [text]
+
+
+class _SentenceStream:
+    """The body of one ``/synthesise/stream`` response: the first sentence's PCM
+    (already rendered), then each following sentence as soon as it is rendered.
+
+    Owns the request's model lease from the moment the response is built, and
+    gives it back exactly once in ``close()``. A sentence still rendering in its
+    worker thread keeps the lease until it finishes, so the idle timer can't move
+    the weights under it. After ``client_gone()`` or ``close()`` no new sentence starts.
+    """
+
+    def __init__(self, render, sentences: list[str], first, sample_rate: int, request_id: str):
+        self._render = render
+        self._rest = sentences[1:]
+        self._first = first
+        self.sample_rate = sample_rate
+        self._request_id = request_id
+        self._inflight: Optional[asyncio.Future] = None
+        self._stop = False
+        self._closed = False
+
+    def client_gone(self) -> None:
+        if not self._stop:
+            logger.info("tts_stream_client_gone", request_id=self._request_id)
+        self._stop = True
+
+    def close(self) -> None:
+        """Give the lease back (once). Called however the response ends."""
+        self._stop = True
+        if self._closed:
+            return
+        self._closed = True
+        fut = self._inflight
+        if fut is not None and not fut.done():
+
+            def _release(f: asyncio.Future) -> None:
+                if not f.cancelled():
+                    f.exception()  # retrieved: the stream has already ended
+                _mgr.release()
+
+            fut.add_done_callback(_release)
+        else:
+            _mgr.release()
+
+    async def chunks(self):
+        try:
+            first, self._first = self._first, None
+            yield first.tobytes()
+            for i, text in enumerate(self._rest, start=2):
+                if self._stop:
+                    return
+                self._inflight = asyncio.ensure_future(asyncio.to_thread(self._render, text))
+                try:
+                    # Shielded: a cancelled response leaves the render to finish,
+                    # and close() releases the lease when it does.
+                    audio_arrays, sample_rate = await asyncio.shield(self._inflight)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # The 200 is already out: all we can do is end the stream early.
+                    logger.error(
+                        "tts_stream_failed", request_id=self._request_id, sentence=i, error=str(exc), exc_info=True
+                    )
+                    return
+                self._inflight = None
+                pcm = _to_pcm(audio_arrays, sample_rate, self._request_id, text)
+                if isinstance(pcm, JSONResponse):
+                    return
+                audio, rate = pcm
+                if rate != self.sample_rate:
+                    logger.error(
+                        "tts_stream_rate_changed", request_id=self._request_id, rate=rate, expected=self.sample_rate
+                    )
+                    return
+                yield audio.tobytes()
+        finally:
+            self.close()
+
+
+class _PCMStreamResponse(StreamingResponse):
+    """Streams a ``_SentenceStream`` and releases its lease however the response
+    ends (finished, failed or cancelled).
+
+    Races the stream against the client's ``http.disconnect`` whatever the ASGI
+    spec version (Starlette only listens for it below 2.4; at 2.4 it notices on
+    the next send, after one more sentence has been rendered). On disconnect
+    the response ends at once and no further sentence starts; one that is
+    already rendering finishes in its thread and then gives the lease back."""
+
+    def __init__(self, stream: _SentenceStream, **kwargs):
+        super().__init__(stream.chunks(), **kwargs)
+        self._stream = stream
+
+    async def __call__(self, scope, receive, send) -> None:
+        async def watch() -> None:
+            while (await receive()).get("type") != "http.disconnect":
+                pass
+            self._stream.client_gone()
+
+        streamer = asyncio.ensure_future(self.stream_response(send))
+        watcher = asyncio.ensure_future(watch())
+        try:
+            await asyncio.wait({streamer, watcher}, return_when=asyncio.FIRST_COMPLETED)
+            if streamer.done():
+                try:
+                    streamer.result()
+                except OSError as exc:
+                    raise ClientDisconnect() from exc
+        finally:
+            for task in (streamer, watcher):
+                task.cancel()
+            with contextlib.suppress(BaseException):  # only reaping the cancelled tasks
+                await asyncio.gather(streamer, watcher, return_exceptions=True)
+            self._stream.close()
+
+
 @app.post("/synthesise/stream")
 async def synthesise_stream(req: SynthesiseRequest):
-    """Return the utterance as raw mono float32 PCM.
+    """Stream the utterance as raw mono float32 PCM, one sentence at a time.
 
-    Argus-mask ``POST /speak`` reads ``X-Sample-Rate``, ``X-Audio-Format`` and
-    ``X-Channels`` and then the body. Qwen renders the whole clip before the
-    first byte; mask buffers that by default.
+    The text is split into sentences, and each sentence's PCM is sent as soon as
+    it is rendered. The first sentence is rendered before the ``200``, so every
+    error up to and including it (validation, loading, out of memory) is a JSON
+    error; a later failure can only end the stream early. Argus-mask ``POST
+    /speak`` reads ``X-Sample-Rate``, ``X-Audio-Format`` and ``X-Channels`` and
+    then the body. One model lease covers the whole stream.
     """
-    rendered = await _generate_audio(req)
-    if isinstance(rendered, JSONResponse):
-        return rendered
-    audio, sample_rate = rendered
-    return Response(
-        content=audio.tobytes(),
-        media_type="application/octet-stream",
-        headers={
-            "X-Sample-Rate": str(sample_rate),
-            "X-Audio-Format": "pcm_f32le",
-            "X-Channels": "1",
-            "Connection": "close",
-        },
-    )
+    if _mgr.state == TTSState.LOADING:
+        return JSONResponse(status_code=503, content={"error": "Models still loading"})
+
+    request_id = uuid.uuid4().hex[:12]
+    await _mgr.acquire()
+    handed_off = False
+    try:
+        render = await _plan_generation(req, request_id)
+        if isinstance(render, JSONResponse):
+            return render
+        sentences = _split_sentences(req.text)
+        first = await _render(render, sentences[0], request_id)
+        if isinstance(first, JSONResponse):
+            return first
+        audio, sample_rate = first
+        stream = _SentenceStream(render, sentences, audio, sample_rate, request_id)
+        response = _PCMStreamResponse(
+            stream,
+            media_type="application/octet-stream",
+            headers={
+                "X-Sample-Rate": str(sample_rate),
+                "X-Audio-Format": "pcm_f32le",
+                "X-Channels": "1",
+                "Connection": "close",
+            },
+        )
+        handed_off = True
+        logger.info("tts_stream_started", request_id=request_id, sentences=len(sentences), language=req.language)
+        return response
+    finally:
+        if not handed_off:
+            _mgr.release()
 
 
 # ── POST /clone-voice ─────────────────────────────────────────────────────────
