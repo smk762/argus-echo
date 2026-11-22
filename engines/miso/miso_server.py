@@ -62,7 +62,13 @@ Env vars:
   ARGUS_ADMIN_TOKEN     — /admin/* needs `Authorization: Bearer <token>`; unset = closed (503)
                           unless ARGUS_ADMIN_INSECURE=1.
                           Unset (default) leaves them open, as argus-iris expects.
-  MISO_WHISPER_URL      — optional STT to auto-transcribe clone refs (default "")
+  MISO_STT_URL          — echo's speech-to-text engine (whisper, `POST /transcribe`).
+                          When set, /clone-voice with an empty `reference_text`
+                          transcribes each clip there; a failure is a 502/503/504,
+                          never a silent empty transcript. Unset (default) leaves
+                          such clones without a transcript. MISO_WHISPER_URL is the
+                          old name, read when MISO_STT_URL is unset.
+  MISO_STT_TIMEOUT_S    — per-clip timeout for that call (default 60)
   Idle lifecycle (unloaded → cpu → gpu, like the XTTS and ModernBERT sidecars):
   MISO_KEEP_ALIVE_GPU   — idle s on GPU before leaving it (default 300).
                           -1 = stay on GPU for ever, 0 = leave right after each request.
@@ -182,7 +188,11 @@ CONTEXT_MAX_SECONDS = float(os.getenv("MISO_CONTEXT_MAX_SECONDS", "20"))
 FRAME_MS = 80  # one Miso/Mimi frame
 # Head-room on the prompt-length estimate (Mimi frame rounding, tokenizer drift).
 CONTEXT_TOKEN_MARGIN = 8
-WHISPER_URL = os.getenv("MISO_WHISPER_URL", "").rstrip("/")
+# Fills an empty /clone-voice reference_text. Env only: a request can't point Miso at a URL.
+STT_URL = (os.getenv("MISO_STT_URL", "").strip() or os.getenv("MISO_WHISPER_URL", "").strip()).rstrip("/")
+STT_TIMEOUT_S = float(os.getenv("MISO_STT_TIMEOUT_S", "60"))
+# Tests swap in an httpx.MockTransport; None is a real network transport.
+_STT_TRANSPORT = None
 # Idle lifecycle: gpu → cpu → unloaded. -1 keeps the
 # model in that stage for ever, 0 leaves it at once. CPU defaults to 0 because an
 # 8B model parked on CPU holds ~17 GB of RSS, which starves a shared host.
@@ -221,6 +231,25 @@ REF_PREPROCESS = os.getenv("MISO_PREPROCESS", "1") == "1"
 
 # Miso supports English only.
 SUPPORTED_LANGS = ["en"]
+
+
+def _primary_language(value: Optional[str]) -> str:
+    """ISO code without its region (`en-US`, `en_GB` → `en`); empty → `en`."""
+    code = (value or "").strip().lower().replace("_", "-").split("-", 1)[0]
+    return code or "en"
+
+
+def _language_refused(value: Optional[str]) -> Optional[JSONResponse]:
+    """422 for a language Miso can't speak, instead of mispronouncing it; None when supported."""
+    if _primary_language(value) in SUPPORTED_LANGS:
+        return None
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": f"Miso supports English only (language 'en'); got {value!r}",
+            "supported_languages": list(SUPPORTED_LANGS),
+        },
+    )
 
 _CLONE_CACHE_MAX = 50
 
@@ -1427,23 +1456,92 @@ def _ref_wav_bytes(ref_audio) -> bytes:
     return buf.getvalue()
 
 
-def _transcribe_reference(wav_bytes: bytes) -> str:
-    """Best-effort transcript for a clone reference via an external Whisper
-    sidecar (MISO_WHISPER_URL). Returns "" on any failure — Miso can still use
-    the audio as acoustic context, just with lower fidelity."""
-    if not WHISPER_URL:
-        return ""
-    try:
-        import httpx
+class STTError(Exception):
+    """The STT engine could not transcribe a clone reference. Carries the HTTP answer for /clone-voice."""
 
-        files = {"audio": ("ref.wav", wav_bytes, "audio/wav")}
-        with httpx.Client(timeout=60) as client:
-            r = client.post(f"{WHISPER_URL}/transcribe", files=files)
-            r.raise_for_status()
-            return (r.json().get("text") or "").strip()
-    except Exception as exc:
-        logger.warning("clone_transcribe_failed", error=str(exc))
-        return ""
+    def __init__(self, message: str, status: int = 502, retry_after: Optional[str] = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+    def response(self) -> JSONResponse:
+        headers = {"Retry-After": self.retry_after} if self.retry_after else None
+        return JSONResponse(status_code=self.status, content={"error": str(self)}, headers=headers)
+
+
+def _stt_upstream_error(r) -> str:
+    try:
+        body = r.json()
+    except ValueError:
+        return r.text[:200]
+    if isinstance(body, dict):
+        return str(body.get("error") or body.get("detail") or body)[:200]
+    return str(body)[:200]
+
+
+def _transcribe_clips(pieces: list, language: str) -> tuple[str, dict]:
+    """Transcribe each clip's stored audio on MISO_STT_URL, in clip order.
+
+    Returns the joined transcript and what to record about it in meta.json.
+    Raises STTError on any failure, and when every clip comes back empty: a
+    clone that silently lost its transcript is worse than a refused one.
+    """
+    import httpx
+
+    texts: list[str] = []
+    info: dict = {"language": language}
+    try:
+        with httpx.Client(base_url=STT_URL, timeout=STT_TIMEOUT_S, transport=_STT_TRANSPORT) as client:
+            for i, piece in enumerate(pieces):
+                files = {"audio": (f"clip{i}.wav", _ref_wav_bytes(piece), "audio/wav")}
+                r = client.post("/transcribe", files=files, data={"language": language})
+                if r.status_code == 503:
+                    raise STTError(
+                        f"Speech-to-text engine busy or loading: {_stt_upstream_error(r)}",
+                        status=503,
+                        retry_after=r.headers.get("Retry-After") or "5",
+                    )
+                if r.status_code != 200:
+                    raise STTError(
+                        f"Speech-to-text engine answered {r.status_code} for clip {i}: {_stt_upstream_error(r)}"
+                    )
+                try:
+                    body = r.json()
+                except ValueError:
+                    body = None
+                if not isinstance(body, dict) or not isinstance(body.get("text"), str):
+                    raise STTError(f"Speech-to-text engine returned no transcript for clip {i}")
+                texts.append(body["text"].strip())
+                for key in ("engine", "model"):  # recorded when the STT engine names them
+                    if isinstance(body.get(key), str) and body[key]:
+                        info[key] = body[key]
+    except httpx.TimeoutException as exc:
+        raise STTError(
+            f"Speech-to-text engine timed out after {STT_TIMEOUT_S:g} s (MISO_STT_TIMEOUT_S)", status=504
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise STTError(f"Speech-to-text engine unreachable: {exc}", status=503, retry_after="5") from exc
+    text = " ".join(t for t in texts if t)
+    if not text:
+        raise STTError("Speech-to-text engine returned an empty transcript for every clip; send reference_text")
+    return text, info
+
+
+def _stored_clip_pieces(ref_audio, lengths: list[int], min_samples: int) -> list:
+    """Split the stored (joined, capped) reference back into its clips, so each
+    transcript matches audio Miso actually keeps. A clip the cap cut to under
+    ``min_samples`` is left out: a word fragment only invites a made-up transcript."""
+    pieces = []
+    start = 0
+    total = ref_audio.shape[-1]
+    for n in lengths:
+        end = min(start + n, total)
+        if end - start >= min_samples:
+            pieces.append(ref_audio[start:end])
+        start += n
+        if start >= total:
+            break
+    return pieces
 
 
 # ── App + request models ──────────────────────────────────────────────────────
@@ -1672,6 +1770,8 @@ async def synthesise(req: SynthesiseRequest):
         return JSONResponse(status_code=503, content={"error": "Model still loading"})
     if not (req.text or "").strip():
         return JSONResponse(status_code=422, content={"error": "text is required"})
+    if (refused := _language_refused(req.language)) is not None:
+        return refused
 
     # In flight from here until run_locked() owns the GPU lock: the idle
     # evict must not unload the model under _prepare_generation().
@@ -1761,6 +1861,8 @@ async def synthesise_stream(req: SynthesiseRequest):
         return JSONResponse(status_code=503, content={"error": "Model still loading"})
     if not (req.text or "").strip():
         return JSONResponse(status_code=422, content={"error": "text is required"})
+    if (refused := _language_refused(req.language)) is not None:
+        return refused
 
     # In flight until run_locked() owns the GPU lock (see /synthesise).
     async with _mgr.hold():
@@ -2035,6 +2137,7 @@ async def clone_voice(
     reference_text: str = Form(""),
     companion_id: str = Form(...),
     voice_name: str = Form(""),
+    language: str = Form("en"),
 ):
     """Create a one-shot Miso clone from one or more reference clips.
 
@@ -2043,7 +2146,9 @@ async def clone_voice(
     transcript + speaker as `voice_clones/{companion_id}/prompt.pt`, plus a
     `meta.json` sidecar — the same layout the XTTS sidecar uses, so /clones,
     download and import are unchanged. `reference_text` is the transcript of the
-    reference audio; if empty and MISO_WHISPER_URL is set we transcribe it.
+    reference audio; if empty and MISO_STT_URL is set, each stored clip is
+    transcribed there (in `language`) and meta.json records
+    `reference_text_source: "stt"`.
     """
     if _mgr.state == TTSState.LOADING:
         return JSONResponse(status_code=503, content={"error": "Model still loading"})
@@ -2105,11 +2210,18 @@ async def clone_voice(
                 pass
 
     ref_text = (reference_text or "").strip()
-    if not ref_text and WHISPER_URL:
+    ref_text_source = "request" if ref_text else None
+    stt_info = None
+    if not ref_text and STT_URL:
         # Transcribe what is stored (the clips that survived preprocessing, trimmed
         # and capped), not an upload: Miso conditions on the (audio, text) pair.
-        wav_bytes = await asyncio.to_thread(_ref_wav_bytes, ref_audio)
-        ref_text = await asyncio.to_thread(_transcribe_reference, wav_bytes)
+        pieces = _stored_clip_pieces(ref_audio, [seg.shape[-1] for seg in segments], SAMPLE_RATE // 2)
+        try:
+            ref_text, stt_info = await asyncio.to_thread(_transcribe_clips, pieces, _primary_language(language))
+        except STTError as exc:
+            logger.warning("clone_transcribe_failed", companion_id=companion_id, status=exc.status, error=str(exc))
+            return exc.response()
+        ref_text_source = "stt"
 
     speaker = DEFAULT_SPEAKER
     prompt = {
@@ -2133,6 +2245,9 @@ async def clone_voice(
         "num_clips": len(segments),  # the clips used; one that failed preprocessing is not in the clone
         "total_seconds": total_seconds,
         "has_transcript": bool(ref_text),
+        # "request" (the caller's reference_text), "stt" (machine-made via MISO_STT_URL) or null.
+        "reference_text_source": ref_text_source,
+        **({"reference_text_stt": stt_info} if stt_info else {}),
         "engine": "miso",
         "created_at": time.time(),
         **_sampling_meta_fields(previous_meta),

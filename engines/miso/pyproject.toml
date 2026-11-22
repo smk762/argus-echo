@@ -22,6 +22,8 @@ dependencies = [
     "silentcipher @ git+https://github.com/SesameAILabs/silentcipher@d46d7d0893a583d8968ab3a6626e2289faec9152",
     # miso_server.py: admin bearer auth and upload caps (argus_cortex.auth, .limits).
     "argus-cortex[server]>=0.8,<0.9",
+    # miso_server.py: the STT client that fills a missing /clone-voice reference_text (MISO_STT_URL).
+    "httpx>=0.27",
 ]
 
 [tool.setuptools]

@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11, <3.13"
 resolution-markers = [
     "sys_platform == 'win32'",
@@ -657,6 +657,7 @@ source = { editable = "." }
 dependencies = [
     { name = "argus-cortex", extra = ["server"] },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'" },
+    { name = "httpx" },
     { name = "huggingface-hub" },
     { name = "moshi" },
     { name = "silentcipher" },
@@ -672,6 +673,7 @@ dependencies = [
 requires-dist = [
     { name = "argus-cortex", extras = ["server"], specifier = ">=0.8,<0.9" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'", specifier = "==0.45.5" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = "==0.28.1" },
     { name = "moshi", specifier = "==0.2.2" },
     { name = "silentcipher", git = "https://github.com/SesameAILabs/silentcipher?rev=d46d7d0893a583d8968ab3a6626e2289faec9152" },

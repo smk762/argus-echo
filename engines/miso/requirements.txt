@@ -9,3 +9,4 @@ torchtune==0.4.0
 torchao==0.9.0
 silentcipher @ git+https://github.com/SesameAILabs/silentcipher@d46d7d0893a583d8968ab3a6626e2289faec9152
 argus-cortex[server]>=0.8,<0.9
+httpx>=0.27
