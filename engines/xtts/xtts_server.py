@@ -80,7 +80,7 @@ from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
 from typing import Literal, Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import structlog
 from argus_cortex.auth import bearer
@@ -295,6 +295,16 @@ def _weight_files(paths: dict[str, Path]) -> list[dict]:
     ]
 
 
+def _fingerprint(files: Optional[list[dict]]) -> Optional[str]:
+    """One sha256 for a loaded weight set, recomputable from ``/health``'s ``weights.files`` (docs/api.md, "Weights
+    fingerprint"): one line ``<name>:<sha256>`` per file, the lines sorted byte-wise as UTF-8, each ending in ``\\n``
+    (the last one too), sha256 of those bytes, lowercase hex. Identical to the Qwen engine's."""
+    if files is None:
+        return None
+    lines = sorted((f"{f['name']}:{f['sha256']}\n".encode() for f in files))
+    return hashlib.sha256(b"".join(lines)).hexdigest()
+
+
 # ── Seeded generation ────────────────────────────────────────────────────────
 
 SEED_MAX = 2**32 - 1  # numpy's legacy seed range, and every engine's contract bound
@@ -394,7 +404,14 @@ class XTTSModelManager:
         # load reads the same weights.
         self._checkpoint: Optional[tuple[str, Path]] = None
         # [{name, sha256, bytes}] of the files the last load of the selected weights read; None until one has.
+        # Their fingerprint (_fingerprint), computed with them. Evicting to the CPU and promoting again moves the same
+        # weights, so it keeps both; only a load (re)sets them.
         self._weight_files: Optional[list[dict]] = None
+        self._weights_fingerprint: Optional[str] = None
+
+    def _set_weight_files(self, files: Optional[list[dict]]) -> None:
+        self._weight_files = files
+        self._weights_fingerprint = _fingerprint(files)
 
     @property
     def state(self) -> TTSState:
@@ -402,10 +419,20 @@ class XTTSModelManager:
 
     @property
     def weights(self) -> dict:
-        """``/health``'s ``weights``: the selected checkpoint (None = stock) and the files its last load hashed."""
+        """``/health``'s ``weights``: the selected checkpoint (None = stock), the files its last load hashed and their
+        fingerprint."""
         return {
             "checkpoint": self._checkpoint[0] if self._checkpoint else None,
+            "fingerprint": self._weights_fingerprint,
             "files": self._weight_files,
+        }
+
+    def identity(self) -> dict:
+        """Which weights a request generates with: call it while holding a lease, so it names the weights that lease
+        holds (``/admin/load`` is refused while any lease is held, so they can't change before the request ends)."""
+        return {
+            "checkpoint": self._checkpoint[0] if self._checkpoint else None,
+            "weights_fingerprint": self._weights_fingerprint,
         }
 
     @property
@@ -439,7 +466,7 @@ class XTTSModelManager:
         from TTS.tts.models.xtts import Xtts
 
         checkpoint = self._checkpoint
-        self._weight_files = None  # until this load hashes what it read
+        self._set_weight_files(None)  # until this load hashes what it read
         if checkpoint is None:
             logger.info("loading_xtts", model=XTTS_MODEL, target="cpu")
             checkpoint_dir, checkpoint_path, config_path = self._stock_paths()
@@ -471,7 +498,7 @@ class XTTSModelManager:
         files = _weight_files(read)
         self._config = config
         self._model = model
-        self._weight_files = files
+        self._set_weight_files(files)
         logger.info("xtts_loaded_cpu", checkpoint=checkpoint[0] if checkpoint else None, files=len(files))
 
     def _move_to_device(self, device: str) -> None:
@@ -701,7 +728,7 @@ class XTTSModelManager:
             if to_stock and self._checkpoint is not None:
                 logger.info("xtts_checkpoint_dropped", checkpoint=self._checkpoint[0])
                 self._checkpoint = None
-                self._weight_files = None
+                self._set_weight_files(None)
             self._state = TTSState.UNLOADED
             logger.info("xtts_fully_unloaded")
             return True
@@ -729,7 +756,7 @@ class XTTSModelManager:
             self._cancel_evict()
             self._free_locked()
             self._checkpoint = checkpoint
-            self._weight_files = None
+            self._set_weight_files(None)
             self._state = TTSState.LOADING
 
             async def load() -> None:
@@ -737,7 +764,7 @@ class XTTSModelManager:
                     await self._do_load()
                 except BaseException:
                     self._checkpoint = None
-                    self._weight_files = None
+                    self._set_weight_files(None)
                     raise
 
             await self._run_transition(load())
@@ -1119,6 +1146,7 @@ async def synthesise(req: SynthesiseRequest):
     # (the app's 503 handler) unless XTTS_CPU_FALLBACK runs this on the CPU.
     async with _mgr.lease(req.device) as ran_on:
         t_ready = time.monotonic()
+        identity = _mgr.identity()  # the weights this lease holds; /admin/load is 409 until it ends
 
         try:
             language = _normalise_language(req.language)
@@ -1179,6 +1207,8 @@ async def synthesise(req: SynthesiseRequest):
         "format": "wav",
         "device": ran_on,
         "seed": req.seed,
+        "checkpoint": identity["checkpoint"],
+        "weights_fingerprint": identity["weights_fingerprint"],
     }
 
 
@@ -1203,6 +1233,7 @@ async def synthesise_stream(req: SynthesiseRequest):
     ran_on = await _mgr.acquire(req.device)
     handed_off = False
     try:
+        identity = _mgr.identity()  # the weights this lease holds; /admin/load is 409 until the stream ends
         # Resolve (and validate) the voice up front so a bad clone id is a 422,
         # not a truncated 200 stream.
         try:
@@ -1311,6 +1342,8 @@ async def synthesise_stream(req: SynthesiseRequest):
             "X-Audio-Format": "pcm_f32le",
             "X-Channels": "1",
             "X-XTTS-Device": ran_on,
+            "X-Echo-Checkpoint": quote(identity["checkpoint"] or ""),  # percent-encoded; empty for stock
+            "X-Echo-Weights": identity["weights_fingerprint"] or "",
         },
     )
 

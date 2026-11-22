@@ -21,6 +21,9 @@ class _Mgr:
     active = 0
     _last_used = 0.0
 
+    def identity(self):
+        return {"checkpoint": None, "weights_fingerprint": None}
+
     @contextlib.asynccontextmanager
     async def lease(self, device=None):
         yield "cuda:0"

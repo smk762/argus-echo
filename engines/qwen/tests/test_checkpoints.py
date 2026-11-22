@@ -63,6 +63,14 @@ class FakeModel:
         self.calls.append(("generate", kw["text"]))
         return [np.zeros(10, dtype="<f4")], 24000
 
+    def generate_voice_design(self, text, **kw):
+        self.calls.append(("design", text))
+        return [np.zeros(10, dtype="<f4")], 24000
+
+    def generate_voice_clone(self, text, **kw):
+        self.calls.append(("clone", text))
+        return [np.zeros(10, dtype="<f4")], 24000
+
 
 class CheckpointTestCase(unittest.TestCase):
     def setUp(self):
@@ -187,7 +195,7 @@ class AdminLoadTests(CheckpointTestCase):
         self.assertEqual(health["model_state"], "gpu")
 
         r = self.client.post("/admin/unload", headers=AUTH)
-        self.assertEqual(r.json()["weights"], {"checkpoint": None, "files": None})
+        self.assertEqual(r.json()["weights"], {"checkpoint": None, "fingerprint": None, "files": None, "models": None})
         self.loads.clear()
         self.lease_once()
         self.assertEqual(self.loads, list(self.stock))  # the next load is stock
@@ -238,13 +246,19 @@ class AdminLoadTests(CheckpointTestCase):
         self.assertIsNone(self.mgr.base_model)  # loaded before the failure, then freed
         self.assertIsNone(self.mgr.custom_model)
         self.assertEqual(self.mgr.state, TTSState.ERROR)
-        self.assertEqual(self.mgr.weights, {"checkpoint": None, "files": None})
+        self.assertEqual(self.mgr.weights, {"checkpoint": None, "fingerprint": None, "files": None, "models": None})
 
     def test_hashes_are_computed_once_per_load_not_per_request(self):
         _write_model(self.root / "voice")
         opened = []
         real = hashlib.sha256
-        with mock.patch.object(tts_server.hashlib, "sha256", lambda *a: opened.append(1) or real(*a)):
+
+        def counting_sha256(*data):  # a file hash starts empty; the fingerprints pass their bytes
+            if not data:
+                opened.append(1)
+            return real(*data)
+
+        with mock.patch.object(tts_server.hashlib, "sha256", counting_sha256):
             self.assertEqual(self.load("voice").status_code, 200)
             self.assertEqual(len(opened), 12)
             for _ in range(3):
@@ -302,6 +316,128 @@ class SeedTests(CheckpointTestCase):
         render = tts_server._seeded(lambda text: text, tts_server.SEED_MAX)
         render("a", 1)
         self.assertEqual(self.calls, [("manual_seed", 0)])
+
+
+class FingerprintTests(CheckpointTestCase):
+    # The worked example in docs/api.md ("Weights fingerprint"): keep the two in step.
+    DOC_FILES = [
+        {"name": "custom_voice/model.safetensors",
+         "sha256": "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c"},
+        {"name": "custom_voice/config.json",
+         "sha256": "b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910"},
+        {"name": "base/model.safetensors",
+         "sha256": "cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2"},
+    ]
+
+    def test_fingerprints_match_the_documented_example(self):
+        f = self.DOC_FILES
+        self.assertEqual(tts_server._slot_fingerprint(f, "custom_voice"),
+                         "b955ea711653a31092cf4acad596e71ac31cb8f85c6feabe209f32ada86fecfb")
+        self.assertEqual(tts_server._slot_fingerprint(f, "base"),
+                         "8763f2a5235402fc83d026fd46b563e7fa6c7b0c9d12a3cad770d4856148eebc")
+        self.assertEqual(tts_server._fingerprint(f),
+                         "e205d97735019470b091f339590c5f050f068b0f7817439400ed4337db73c89c")
+        by_hand = (
+            b"custom_voice/config.json:b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910\n"
+            b"custom_voice/model.safetensors:9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c\n"
+        )
+        self.assertEqual(hashlib.sha256(by_hand).hexdigest(), tts_server._slot_fingerprint(f, "custom_voice"))
+
+    def test_health_has_a_fingerprint_per_slot(self):
+        ckpt = _write_model(self.root / "voice", weights=b"fine-tuned")
+        weights = self.load("voice").json()["weights"]
+        self.assertEqual(weights["fingerprint"], tts_server._fingerprint(weights["files"]))
+        self.assertEqual(set(weights["models"]), {"base", "custom_voice"})
+        cv = weights["models"]["custom_voice"]
+        self.assertEqual(cv["checkpoint"], "voice")
+        self.assertEqual(weights["models"]["base"]["checkpoint"], None)
+        mine = [f for f in weights["files"] if f["name"].startswith("custom_voice/")]
+        self.assertEqual(cv["fingerprint"], tts_server._fingerprint(mine))
+        self.assertTrue(ckpt.exists())
+
+    def _synth(self, **body):
+        r = self.client.post("/synthesise", json={"text": "hello there", **body})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_each_request_reports_the_slot_that_spoke_it(self):
+        _write_model(self.root / "voice", weights=b"fine-tuned")
+        models = self.load("voice").json()["weights"]["models"]
+        with mock.patch.object(tts_server, "_get_clone_prompt", lambda clone_id: ["prompt"]):
+            cases = {
+                "custom_voice": [{"speaker": "ryan"}],
+                "base": [{"voice_clone_id": "voice_clones/x/prompt.pt"}, {"voice_description": "a calm voice"}],
+            }
+            for slot, bodies in cases.items():
+                for body in bodies:
+                    out = self._synth(**body)
+                    self.assertEqual(out["model"], slot, body)
+                    self.assertEqual(out["weights_fingerprint"], models[slot]["fingerprint"], body)
+                    self.assertEqual(out["checkpoint"], "voice" if slot == "custom_voice" else None, body)
+        self.assertEqual([c[0] for c in self.calls], ["generate", "clone", "design"])
+
+    def test_voice_design_without_base_reports_custom_voice(self):
+        with mock.patch.object(tts_server, "LOAD_MODELS", "custom_voice"):
+            models = self.load(None).json()["weights"]["models"]
+            out = self._synth(voice_description="a calm voice")
+        self.assertEqual(set(models), {"custom_voice"})
+        self.assertEqual(out["model"], "custom_voice")
+        self.assertEqual(out["weights_fingerprint"], models["custom_voice"]["fingerprint"])
+        self.assertIsNone(out["checkpoint"])
+
+    def test_stream_headers_name_the_model_and_weights(self):
+        _write_model(self.root / "forge" / "run 7", weights=b"fine-tuned")
+        models = self.load("forge/run 7").json()["weights"]["models"]
+        r = self.client.post("/synthesise/stream", json={"text": "hello there", "speaker": "ryan"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.headers["x-echo-model"], "custom_voice")
+        self.assertEqual(r.headers["x-echo-checkpoint"], "forge/run%207")
+        self.assertEqual(r.headers["x-echo-weights"], models["custom_voice"]["fingerprint"])
+        with mock.patch.object(tts_server, "_get_clone_prompt", lambda clone_id: ["prompt"]):
+            r = self.client.post("/synthesise/stream", json={"text": "hi", "voice_clone_id": "voice_clones/x/prompt.pt"})
+        self.assertEqual(r.headers["x-echo-model"], "base")
+        self.assertEqual(r.headers["x-echo-checkpoint"], "")  # base is stock here
+        self.assertEqual(r.headers["x-echo-weights"], models["base"]["fingerprint"])
+
+    def test_a_load_during_a_stream_is_refused_so_its_headers_stay_true(self):
+        _write_model(self.root / "voice")
+        _write_model(self.root / "other", weights=b"other")
+        models = self.load("voice").json()["weights"]["models"]
+
+        async def run():
+            text = "The first sentence is long enough. Here is the second one, also long."
+            response = await tts_server.synthesise_stream(tts_server.SynthesiseRequest(text=text, speaker="ryan"))
+            self.assertEqual(response.headers["x-echo-weights"], models["custom_voice"]["fingerprint"])
+            self.assertEqual(self.mgr._in_use, 1)  # the stream holds its lease until it closes
+            refused = await tts_server.admin_load(tts_server.LoadRequest(checkpoint="other"))
+            self.assertEqual(refused.status_code, 409)
+            response._stream.close()
+            self.assertEqual(self.mgr._in_use, 0)
+
+        asyncio.run(run())
+        self.assertEqual(self.mgr.weights["checkpoint"], "voice")
+
+    def test_evict_and_promote_keep_the_weights_and_an_idle_reload_rehashes_to_the_same(self):
+        _write_model(self.root / "voice")
+        self.assertEqual(self.load("voice").status_code, 200)
+        loaded = self.mgr.weights
+        hashed = []
+        real = tts_server._sha256
+        with mock.patch.object(tts_server, "DEVICE", "cuda:0"), \
+                mock.patch.object(tts_server, "_sha256", lambda p: hashed.append(p) or real(p)):
+            asyncio.run(self.mgr.demote_to_cpu())
+            self.assertEqual(self.mgr.state, TTSState.CPU)
+            self.lease_once()  # promotes the same models back
+            self.assertEqual(self.mgr.state, TTSState.GPU)
+            self.assertEqual(self.mgr.weights, loaded)
+            self.assertEqual(hashed, [])  # moved, not reloaded
+            self.assertEqual(len(self.loads), 2)
+
+            asyncio.run(self.mgr.unload())  # the full idle unload keeps the selection and its hashes
+            self.assertEqual(self.mgr.weights, loaded)
+            self.lease_once()  # the lazy reload hashes the files again (from the cache) ...
+            self.assertEqual(len(hashed), 12)
+            self.assertEqual(self.mgr.weights, loaded)  # ... to the same fingerprints
 
 
 if __name__ == "__main__":

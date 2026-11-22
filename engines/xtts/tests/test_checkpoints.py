@@ -59,6 +59,17 @@ class _FakeXtts:
     def eval(self):
         return self
 
+    # Device moves (evict to the CPU, promote to the GPU), recorded.
+    def to(self, device):
+        self.moves = getattr(self, "moves", []) + [str(device)]
+        return self
+
+    def cpu(self):
+        return self.to("cpu")
+
+    def modules(self):
+        yield self
+
 
 def _write_checkpoint(path, *, model=b"weights", speakers=False, config=None):
     path.mkdir(parents=True)
@@ -195,7 +206,7 @@ def test_load_reports_the_checkpoint_and_its_hashes_then_unload_returns_to_stock
 
     r = client.post("/admin/unload", headers=AUTH)
     assert r.status_code == 200
-    assert r.json()["weights"] == {"checkpoint": None, "files": None}
+    assert r.json()["weights"] == {"checkpoint": None, "fingerprint": None, "files": None}
 
     async def next_request():
         async with mgr.lease():
@@ -251,7 +262,7 @@ def test_a_failed_load_leaves_nothing_loaded_and_stock_selected(client, coqui, m
     r = client.post("/admin/load", json={"checkpoint": "broken"}, headers=AUTH)
     assert r.status_code == 500 and "size mismatch" in r.json()["error"]
     assert mgr.model is None and mgr.state == xs.TTSState.ERROR
-    assert mgr.weights == {"checkpoint": None, "files": None}
+    assert mgr.weights == {"checkpoint": None, "fingerprint": None, "files": None}
 
 
 def test_a_load_waits_for_a_transition_in_flight(coqui, mgr):
@@ -275,7 +286,13 @@ def test_hashes_are_computed_once_per_load_not_per_request(client, coqui, mgr, m
     monkeypatch.setattr(xs, "_sha256", lambda p: reads.append(p.name) or real(p))
     opened = []
     real_new = hashlib.sha256
-    monkeypatch.setattr(xs.hashlib, "sha256", lambda *a: opened.append(1) or real_new(*a))
+    # File hashing calls sha256() with no data; the fingerprint passes its bytes and is not a file read.
+    def counting_sha256(*data):
+        if not data:
+            opened.append(1)
+        return real_new(*data)
+
+    monkeypatch.setattr(xs.hashlib, "sha256", counting_sha256)
     assert client.post("/admin/load", json={"checkpoint": "voice"}, headers=AUTH).status_code == 200
     assert sorted(reads) == ["config.json", "model.pth", "vocab.json"]
     for _ in range(3):
@@ -399,3 +416,113 @@ def test_a_seeded_generation_runs_alone(torch_calls):
     for t in (t1, t2, t3):
         t.join(5)
     assert events == ["shared in", "shared out", "exclusive in", "exclusive out", "shared in", "shared out"]
+
+
+# ── weights fingerprint ──────────────────────────────────────────────────────
+
+# The worked example in docs/api.md ("Weights fingerprint"): keep the two in step.
+DOC_FILES = [
+    {"name": "model.pth", "sha256": "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c"},
+    {"name": "config.json", "sha256": "b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910"},
+]
+DOC_FINGERPRINT = "311b8ed7abed4ae45274fedccda241ff6d0a129db13ea34b25b9fe0431de2649"
+
+
+def test_fingerprint_matches_the_documented_example():
+    assert xs._fingerprint(DOC_FILES) == DOC_FINGERPRINT
+    by_hand = (
+        b"config.json:b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910\n"
+        b"model.pth:9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c\n"
+    )
+    assert hashlib.sha256(by_hand).hexdigest() == DOC_FINGERPRINT
+    assert xs._fingerprint(list(reversed(DOC_FILES))) == DOC_FINGERPRINT  # the list's order doesn't matter
+    assert xs._fingerprint(None) is None
+
+
+def _load_voice(client, coqui, mgr, torch_calls, name="voice"):
+    _write_checkpoint(coqui.root / name, model=name.encode())
+    r = client.post("/admin/load", json={"checkpoint": name}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    mgr._model = _Model(torch_calls)  # speaks; the loaded files and their fingerprint stay as the load set them
+    return r.json()["weights"]
+
+
+def test_responses_carry_the_weights_their_lease_held(client, coqui, mgr, torch_calls, monkeypatch):
+    monkeypatch.setattr(xs, "_upload_to_s3", lambda data, key: f"http://s3/{key}")
+    weights = _load_voice(client, coqui, mgr, torch_calls, name="forge/run 7")
+    assert weights["fingerprint"] == xs._fingerprint(weights["files"])
+    assert client.get("/health").json()["weights"]["fingerprint"] == weights["fingerprint"]
+    r = client.post("/synthesise", json={"text": "hi", "speaker": "A"})
+    assert r.status_code == 200, r.text
+    assert r.json()["checkpoint"] == "forge/run 7"
+    assert r.json()["weights_fingerprint"] == weights["fingerprint"]
+    r = client.post("/synthesise/stream", json={"text": "hi", "speaker": "A"})
+    assert r.status_code == 200, r.text
+    assert r.headers["x-echo-checkpoint"] == "forge/run%207"  # percent-encoded
+    assert r.headers["x-echo-weights"] == weights["fingerprint"]
+
+
+def test_stock_weights_send_an_empty_checkpoint_header(client, coqui, mgr, torch_calls):
+    assert client.post("/admin/load", json={"checkpoint": None}, headers=AUTH).status_code == 200
+    stock = mgr.weights["fingerprint"]
+    mgr._model = _Model(torch_calls)
+    r = client.post("/synthesise/stream", json={"text": "hi", "speaker": "A"})
+    assert r.headers["x-echo-checkpoint"] == "" and r.headers["x-echo-weights"] == stock
+
+
+def test_a_load_during_a_stream_is_refused_so_its_headers_stay_true(client, coqui, mgr, torch_calls):
+    weights = _load_voice(client, coqui, mgr, torch_calls)
+    _write_checkpoint(coqui.root / "other", model=b"other")
+    go_on = threading.Event()
+
+    def slow_stream(*args, **kwargs):
+        yield np.zeros(4, dtype=np.float32)
+        go_on.wait(5)
+        yield np.zeros(4, dtype=np.float32)
+
+    mgr._model.inference_stream = slow_stream
+
+    async def run():
+        response = await xs.synthesise_stream(xs.SynthesiseRequest(text="hi", speaker="A"))
+        assert response.headers["x-echo-weights"] == weights["fingerprint"]
+        refused = await xs.admin_load(xs.LoadRequest(checkpoint="other"))
+        assert refused.status_code == 409
+        go_on.set()
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        assert len(body) == 32
+        for _ in range(100):  # the producer thread hands the lease back through the loop
+            if mgr.active == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert mgr.active == 0
+
+    asyncio.run(run())
+    assert mgr.weights["checkpoint"] == "voice" and mgr.weights["fingerprint"] == weights["fingerprint"]
+
+
+def test_evict_and_promote_keep_the_weights_and_an_idle_reload_rehashes_to_the_same(coqui, mgr, monkeypatch):
+    monkeypatch.setattr(xs, "DEVICE", "cuda:0")
+    _write_checkpoint(coqui.root / "voice")
+    hashed = []
+    real = xs._sha256
+    monkeypatch.setattr(xs, "_sha256", lambda p: hashed.append(p.name) or real(p))
+
+    async def run():
+        assert await mgr.load_weights(("voice", (coqui.root / "voice").resolve()))
+        loaded = mgr.weights
+        async with mgr.lease() as ran_on:
+            assert ran_on == "cuda:0"
+        assert await mgr.evict() and mgr.state == xs.TTSState.CPU
+        async with mgr.lease() as ran_on:
+            assert ran_on == "cuda:0"
+        assert mgr.model.moves == ["cuda:0", "cpu", "cuda:0"]
+        assert mgr.weights == loaded and len(hashed) == 3  # moved, not reloaded: nothing hashed again
+
+        assert await mgr.unload()  # the full idle unload keeps the selection and its hashes
+        assert mgr.weights == loaded
+        async with mgr.lease():  # the lazy reload hashes the files again (from the cache) ...
+            pass
+        assert len(hashed) == 6
+        assert mgr.weights == loaded  # ... to the same fingerprint
+
+    asyncio.run(run())

@@ -60,7 +60,7 @@ from contextlib import asynccontextmanager
 from enum import Enum
 from pathlib import Path
 from typing import AsyncIterator, Optional
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import structlog
 from argus_cortex.auth import bearer
@@ -334,6 +334,23 @@ def _weight_files(paths: dict[str, Path]) -> list[dict]:
     ]
 
 
+def _fingerprint(files: Optional[list[dict]]) -> Optional[str]:
+    """One sha256 for a set of weight files, recomputable from ``/health``'s ``weights.files`` (docs/api.md, "Weights
+    fingerprint"): one line ``<name>:<sha256>`` per file, ``name`` exactly as listed (slot prefix kept), the lines
+    sorted byte-wise as UTF-8, each ending in ``\\n`` (the last one too), sha256 of those bytes, lowercase hex. A
+    slot's fingerprint is this over the files named ``<slot>/...``. Identical to the XTTS engine's."""
+    if files is None:
+        return None
+    lines = sorted((f"{f['name']}:{f['sha256']}\n".encode() for f in files))
+    return hashlib.sha256(b"".join(lines)).hexdigest()
+
+
+def _slot_fingerprint(files: Optional[list[dict]], slot: str) -> Optional[str]:
+    if files is None:
+        return None
+    return _fingerprint([f for f in files if f["name"].startswith(f"{slot}/")])
+
+
 # ── Seeded generation ────────────────────────────────────────────────────────
 
 SEED_MAX = 2**32 - 1  # numpy's legacy seed range, and every engine's contract bound
@@ -462,7 +479,21 @@ class TTSModelManager:
         # /admin/load and /admin/unload change it; an idle unload keeps it, so the next load reads the same weights.
         self._checkpoint: Optional[tuple[str, Path, str]] = None
         # [{name, sha256, bytes}] of the files the last load of the selected weights read; None until one has.
+        # Computed with them: the fingerprint of all of them, and per loaded slot {checkpoint (its name if that slot
+        # was loaded from it, else None), fingerprint}. Evicting to the CPU and promoting again moves the same
+        # weights, so it keeps all of this; only a load (re)sets it.
         self._weight_files: Optional[list[dict]] = None
+        self._weights_fingerprint: Optional[str] = None
+        self._slots: Optional[dict[str, dict]] = None
+
+    def _set_weights(self, files: Optional[list[dict]], slots: Optional[dict[str, Optional[str]]] = None) -> None:
+        """Record what a load read (``slots``: slot -> the checkpoint name it was loaded from, or None for stock)."""
+        self._weight_files = files
+        self._weights_fingerprint = _fingerprint(files)
+        self._slots = None if files is None else {
+            slot: {"checkpoint": name, "fingerprint": _slot_fingerprint(files, slot)}
+            for slot, name in sorted((slots or {}).items())
+        }
 
     @property
     def state(self) -> TTSState:
@@ -470,11 +501,20 @@ class TTSModelManager:
 
     @property
     def weights(self) -> dict:
-        """``/health``'s ``weights``: the selected checkpoint (None = stock) and the files its last load hashed."""
+        """``/health``'s ``weights``: the selected checkpoint (None = stock), the files its last load hashed, their
+        fingerprint, and each loaded slot's checkpoint and fingerprint (``models``)."""
         return {
             "checkpoint": self._checkpoint[0] if self._checkpoint else None,
+            "fingerprint": self._weights_fingerprint,
             "files": self._weight_files,
+            "models": self._slots,
         }
+
+    def identity(self, slot: Optional[str]) -> dict:
+        """Which weights a request generates with, given the model slot it uses. Call it while holding a lease, so
+        it names the weights that lease holds (``/admin/load`` is refused while any lease is held)."""
+        info = (self._slots or {}).get(slot) or {}
+        return {"model": slot, "checkpoint": info.get("checkpoint"), "weights_fingerprint": info.get("fingerprint")}
 
     @property
     def base_model(self):
@@ -515,7 +555,7 @@ class TTSModelManager:
         # Each slot loads the selected checkpoint if it is that slot's, else the stock model if TTS_LOAD_MODELS
         # asks for it.
         checkpoint = self._checkpoint
-        self._weight_files = None  # until this load hashes what it read
+        self._set_weights(None)  # until this load hashes what it read
         sources: dict[str, tuple[str, Optional[Path]]] = {}  # slot -> (what to load, its directory if local)
         for slot in CHECKPOINT_SLOTS:
             if checkpoint is not None and checkpoint[2] == slot:
@@ -539,7 +579,10 @@ class TTSModelManager:
         for slot, (source, directory) in sources.items():
             for rel, path in _model_files(directory or _stock_dir(source)).items():
                 read[f"{slot}/{rel}"] = path
-        self._weight_files = _weight_files(read)
+        self._set_weights(
+            _weight_files(read),
+            {slot: checkpoint[0] if directory is not None else None for slot, (_, directory) in sources.items()},
+        )
 
     def _move_to_device(self, device: str) -> None:
         import torch
@@ -744,7 +787,7 @@ class TTSModelManager:
             if to_stock and self._checkpoint is not None:
                 logger.info("tts_checkpoint_dropped", checkpoint=self._checkpoint[0])
                 self._checkpoint = None
-                self._weight_files = None
+                self._set_weights(None)
 
     async def load_weights(self, checkpoint: Optional[tuple[str, Path, str]]) -> bool:
         """``/admin/load``: replace the loaded models by *checkpoint* (``(name, directory, slot)``; None = stock),
@@ -762,7 +805,7 @@ class TTSModelManager:
                 self._evict_task.cancel()
             self._unload_locked()
             self._checkpoint = checkpoint
-            self._weight_files = None
+            self._set_weights(None)
             self._state = TTSState.LOADING
 
             async def load() -> None:
@@ -770,7 +813,7 @@ class TTSModelManager:
                     await self._run_load()
                 except BaseException:
                     self._checkpoint = None
-                    self._weight_files = None
+                    self._set_weights(None)
                     raise
 
             self._load_task = asyncio.create_task(load())
@@ -1041,25 +1084,30 @@ def _max_new_tokens_for(text: str) -> int:
     return max(192, min(est, TTS_MAX_NEW_TOKENS_CEILING))
 
 
-async def _generate_audio(req: SynthesiseRequest):
+async def _generate_audio(req: SynthesiseRequest, identity: Optional[dict] = None):
     """Render speech. Returns ``(float32 samples, sample_rate)`` or a JSONResponse error.
 
     Uses Base model if voice_clone_id is provided (voice cloning path).
     Uses CustomVoice model otherwise (predefined speaker + instruction path).
+    ``identity``, when given, is filled with the model and weights that render it (see ``_generate_audio_leased``).
     """
     if _mgr.state == TTSState.LOADING:
         return JSONResponse(status_code=503, content={"error": "Models still loading"})
 
     async with _mgr.use():
-        return await _generate_audio_leased(req)
+        return await _generate_audio_leased(req, identity)
 
 
-async def _generate_audio_leased(req: SynthesiseRequest):
-    """Body of ``_generate_audio``; the caller holds a ``_mgr.use()`` lease."""
+async def _generate_audio_leased(req: SynthesiseRequest, identity: Optional[dict] = None):
+    """Body of ``_generate_audio``; the caller holds a ``_mgr.use()`` lease. ``identity``, when given, is filled
+    with ``_mgr.identity(slot)`` for the slot the request's path uses, read under that lease: ``/admin/load`` is
+    refused while it is held, so these are the weights that generate the audio."""
     request_id = uuid.uuid4().hex[:12]  # ties a client-visible error to its log line
     render = await _plan_generation(req, request_id)
     if isinstance(render, JSONResponse):
         return render
+    if identity is not None:
+        identity.update(_mgr.identity(render.slot))
     return await _render(_seeded(render, req.seed), req.text, request_id)
 
 
@@ -1144,6 +1192,7 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
                 max_new_tokens=_max_new_tokens_for(text),
             )
 
+        render.slot = "base"
         return render
 
     if req.voice_description:
@@ -1159,6 +1208,7 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
                     max_new_tokens=_max_new_tokens_for(text),
                 )
 
+            render.slot = "base"
             return render
 
         custom = _mgr.custom_model
@@ -1188,6 +1238,7 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
                 max_new_tokens=_max_new_tokens_for(text),
             )
 
+        render.slot = "custom_voice"  # the voice-design fallback speaks with CustomVoice
         return render
 
     custom = _mgr.custom_model
@@ -1218,6 +1269,7 @@ async def _plan_generation(req: SynthesiseRequest, request_id: str):
             generate_kwargs["instruct"] = instruction
         return custom.generate_custom_voice(**generate_kwargs)
 
+    render.slot = "custom_voice"
     return render
 
 
@@ -1245,9 +1297,11 @@ def _write_temp_wav(data: bytes) -> str:
 
 @app.post("/synthesise")
 async def synthesise(req: SynthesiseRequest):
-    """Generate speech from text and store a WAV. Returns ``{audio_url, duration, ...}``."""
+    """Generate speech from text and store a WAV. Returns ``{audio_url, duration, ...}``, with the model slot and
+    the weights (checkpoint, fingerprint) that rendered it."""
     t_req = time.monotonic()
-    rendered = await _generate_audio(req)
+    identity: dict = {}
+    rendered = await _generate_audio(req, identity)
     if isinstance(rendered, JSONResponse):
         return rendered
     audio, sample_rate = rendered
@@ -1273,6 +1327,9 @@ async def synthesise(req: SynthesiseRequest):
         "duration_seconds": round(duration, 3),
         "format": "wav",
         "seed": req.seed,
+        "model": identity.get("model"),
+        "checkpoint": identity.get("checkpoint"),
+        "weights_fingerprint": identity.get("weights_fingerprint"),
     }
 
 
@@ -1446,6 +1503,8 @@ async def synthesise_stream(req: SynthesiseRequest):
         render = await _plan_generation(req, request_id)
         if isinstance(render, JSONResponse):
             return render
+        # The weights this lease holds, for the slot this path uses: /admin/load is 409 until the stream ends.
+        identity = _mgr.identity(render.slot)
         render = _seeded(render, req.seed)
         sentences = _split_sentences(req.text)
         first = await _render(render, sentences[0], request_id)
@@ -1461,6 +1520,9 @@ async def synthesise_stream(req: SynthesiseRequest):
                 "X-Audio-Format": "pcm_f32le",
                 "X-Channels": "1",
                 "Connection": "close",
+                "X-Echo-Model": identity["model"] or "",
+                "X-Echo-Checkpoint": quote(identity["checkpoint"] or ""),  # percent-encoded; empty for stock
+                "X-Echo-Weights": identity["weights_fingerprint"] or "",
             },
         )
         handed_off = True
