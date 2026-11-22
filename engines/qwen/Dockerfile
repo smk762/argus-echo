@@ -12,18 +12,23 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get update && \
     apt-get install -y --no-install-recommends sox libsox-dev
 
+# Every package's exact version (#32): all three installs below are constrained by it, so a revision implies its
+# library stack. See the file's header for how it was made and how to change it.
+COPY constraints.txt /tmp/constraints.txt
+
 # torch + torchaudio with CUDA support (build arg selects wheel index)
 ARG TTS_TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch torchaudio --index-url "${TTS_TORCH_INDEX_URL}"
+    pip install -c /tmp/constraints.txt torch torchaudio --index-url "${TTS_TORCH_INDEX_URL}"
 
 # FastAPI + runtime deps; argus-cortex for the admin bearer check.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install fastapi "uvicorn[standard]" structlog python-multipart "argus-cortex[server]>=0.8,<0.10"
+    pip install -c /tmp/constraints.txt fastapi "uvicorn[standard]" structlog python-multipart \
+        "argus-cortex[server]>=0.8,<0.10"
 
 # TTS-specific packages
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install qwen-tts soundfile boto3 safetensors
+    pip install -c /tmp/constraints.txt qwen-tts soundfile boto3 safetensors
 
 # Bake both model variants into the image so first-run is instant.
 ARG TTS_MODEL_SIZE=0.6b

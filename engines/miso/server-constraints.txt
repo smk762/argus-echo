@@ -1,0 +1,32 @@
+# Exact versions for the server packages the Miso image adds on top of uv.lock (#32). uv.lock pins torch, moshi
+# and the rest of the inference environment; `uv pip install` of the server extras in the Dockerfile used to
+# resolve these freely. Taken from ghcr.io/smk762/argus-echo-miso:0.1.0's /app/.venv: every package there that
+# uv.lock doesn't name (the locked ones matched uv.lock exactly). Only these are listed, so a uv.lock bump never
+# conflicts with this file.
+#
+# To upgrade one, change it here and rebuild. When the extras in the Dockerfile change, regenerate this list from
+# a built image (packages in /app/.venv minus `uv export --frozen`).
+annotated-doc==0.0.7
+boto3==1.44.9
+botocore==1.44.9
+contourpy==1.3.3
+cycler==0.12.1
+fastapi==0.165.0
+fonttools==4.68.0
+httptools==0.9.0
+jmespath==1.1.0
+kiwisolver==1.5.1
+matplotlib==3.11.2
+noisereduce==3.0.3
+opentelemetry-api==1.45.2
+pyloudnorm==0.2.0
+pyparsing==3.3.3
+python-dotenv==1.2.4
+python-multipart==0.0.34
+s3transfer==0.19.3
+silero-vad==6.2.3
+structlog==26.1.0
+uvicorn==0.54.0
+uvloop==0.23.0
+watchfiles==1.3.0
+websockets==17.4

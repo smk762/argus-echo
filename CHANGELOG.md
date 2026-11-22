@@ -11,6 +11,15 @@
   before moving them. Stored clones are unchanged (`prompt.pt`, written by the server). Qwen's archive keeps the
   speaker embedding's dtype (bfloat16 included) in its metadata (#6).
 
+### Changed
+- The XTTS, Qwen and Miso images pin every package to an exact version (#32), so a revision implies its library
+  stack: `engines/xtts/constraints.txt` and `engines/qwen/constraints.txt` constrain every `pip install`, and
+  `engines/miso/server-constraints.txt` the server packages Miso adds on top of `uv.lock`. The versions are the
+  ones the published 0.1.0 images contain (XTTS: torch 2.6.0, coqui-tts 0.28.0, transformers 4.57.5; Qwen: torch
+  2.6.0, qwen-tts 0.1.1, transformers 4.57.3), which #30's reproducibility measurement ran, so the audio doesn't
+  change. torch is pinned without its `+cu124` label, so the `*_TORCH_INDEX_URL` build args still pick CPU or
+  CUDA. `tests/test_repo_rules.py` fails an unconstrained install.
+
 ### Added
 - `/health` `image.runtime` on every engine (#32): the versions of python, torch, CUDA and cuDNN (torch engines)
   and each engine's libraries (coqui-tts, qwen-tts, moshi, faster-whisper and ctranslate2, transformers, ...),
