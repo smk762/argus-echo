@@ -28,6 +28,7 @@ class HealthTest(unittest.TestCase):
         body = r.json()
         ResidentHealth.model_validate(body)
         self.assertEqual(body["capabilities"], ["tts"])
+        self.assertEqual(body["engine"], "qwen-tts")  # clients key on it (docs/api.md)
 
 
 if __name__ == "__main__":

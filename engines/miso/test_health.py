@@ -17,6 +17,7 @@ class HealthTest(unittest.TestCase):
         body = r.json()
         ResidentHealth.model_validate(body)
         self.assertEqual(body["capabilities"], ["tts"])
+        self.assertEqual(body["engine"], "miso")  # clients key on it (docs/api.md)
         self.assertEqual(body["image"], {"version": None, "revision": None})
 
     def test_health_reports_the_image_identity(self):

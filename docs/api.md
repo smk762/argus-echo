@@ -172,7 +172,10 @@ On XTTS and Qwen, `GET /speakers` loads the model if it is not loaded.
 `POST /clone-voice` is `multipart/form-data` with one or more `audio` files, `reference_text` (the transcript;
 Miso needs it) and `companion_id` (`^[A-Za-z0-9_-]{1,64}$`). Miso fills an empty `reference_text` from the
 speech-to-text engine when `MISO_STT_URL` names one (see [miso-api.md](miso-api.md#post-clone-voice)). A clone is stored at
-`voice_clones/<companion_id>/prompt.pt` with a `meta.json`, and used by passing its id as `voice_clone_id`.
+`voice_clones/<companion_id>/prompt.pt` with a `meta.json`. To speak with it, send the `voice_clone_id` that
+`/clone-voice` (and `/clones/import`, and each entry of `GET /clones`) returns: that full key,
+`voice_clones/<companion_id>/prompt.pt`, not the bare `companion_id`, which is `422 Voice clone not found`. The
+clone-management routes (`/clones/{companion_id}/download`, `DELETE /clones/{companion_id}`) take the bare id.
 **Clones are engine-specific**: each engine's `prompt.pt` is its own format, which is why each engine gets its
 own bucket. Download archives differ too: Miso's holds `prompt.safetensors` + `meta.json` and its import refuses
 an archive with only a pickled `prompt.pt` (an older Miso download; re-export it), while XTTS's and Qwen's hold
@@ -185,8 +188,9 @@ an archive with only a pickled `prompt.pt` (an older Miso download; re-export it
 
 `GET /health` is argus-cortex's `ResidentHealth`, which argus-iris reads: top-level `model_state` (`unloaded`,
 `loading`, `cpu`, `gpu`, `error`), `busy`, `idle_s`, and a `gpu` memory block, plus `engine`, `model`,
-`device` and `capabilities` (the contracts the engine serves: `["tts"]` or `["stt"]`; `argus-echo check` runs
-only those suites, and treats an engine that names none as `tts`). It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
+`device` and `capabilities`. `engine` is exactly one of `miso`, `xtts-v2`, `qwen-tts` or `whisper`, and clients
+may key on it. `capabilities` lists the contracts the engine serves (`["tts"]` or `["stt"]`; `argus-echo check`
+runs only those suites, and treats an engine that names none as `tts`). It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
 `"status": "gpu_error"` after a CUDA error that is not an out-of-memory: such an error breaks the process's GPU
 context, so the worker needs a restart. (An out-of-memory is a `503 GPU OOM` on the request and can be retried.)
 
