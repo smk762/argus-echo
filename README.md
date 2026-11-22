@@ -1,13 +1,14 @@
 # argus-echo
 
-The Argus suite's speech servers. Three text-to-speech engines behind one HTTP contract, so a client switches
-engine by changing a URL:
+The Argus suite's speech servers: three text-to-speech engines behind one HTTP contract, so a client switches
+engine by changing a URL, and a speech-to-text engine:
 
 | Engine | Model | VRAM | Strengths |
 | --- | --- | --- | --- |
 | **miso** | [Miso TTS 8B](https://huggingface.co/MisoLabs/MisoTTS) | ~17 GB | Most natural and expressive; one-shot cloning; English |
 | **xtts** | [Coqui XTTS-v2](https://huggingface.co/coqui/XTTS-v2) | ~2 GB | Multi-clip cloning, 17 languages, low-latency streaming |
 | **qwen** | [Qwen3-TTS](https://huggingface.co/Qwen) 0.6B / 1.7B | small | Built-in speakers, voice design from a description |
+| **whisper** | [Whisper large-v3-turbo](https://huggingface.co/openai/whisper-large-v3-turbo) (faster-whisper) | ~3 GB | Speech to text: 99 languages, word timestamps, live streaming with VAD |
 
 Plus a **Wyoming bridge** that puts any engine in front of Home Assistant or anything else that speaks
 [Wyoming](https://github.com/OHF-Voice/wyoming).
@@ -31,7 +32,7 @@ docker compose --profile miso up -d --build                  # 24 GB card
 docker compose --profile xtts --profile qwen up -d --build   # 8 GB card
 ```
 
-Ports: Miso `8140`, XTTS `8141`, Qwen `8142`, Wyoming bridges `10240` (XTTS) and `10241` (Miso). They are
+Ports: Miso `8140`, XTTS `8141`, Qwen `8142`, Whisper `8144`, Wyoming bridges `10240` (XTTS) and `10241` (Miso). They are
 published on `ECHO_BIND`, which defaults to `127.0.0.1`; set it to `0.0.0.0` or a LAN address to serve other
 machines. Miso downloads its ~33 GB checkpoint into `HF_HOME` on first use; the XTTS and Qwen images bake their
 weights in at build time.
@@ -41,6 +42,7 @@ Check an engine (read-only; `--speak` also streams a sentence, which loads the m
 ```sh
 uvx argus-echo check http://localhost:8140
 uvx argus-echo check http://localhost:8141 --speak "Hello there." --speaker "Claribel Dervla"
+uvx argus-echo check http://localhost:8144 --transcribe       # speech to text: a bundled 11 s clip
 ```
 
 Or by hand:
@@ -71,6 +73,7 @@ Clone a real person's voice only with their consent. Details: [docs/api.md#secur
 | [docs/miso-api.md](docs/miso-api.md), [docs/miso-config.md](docs/miso-config.md) | Miso's full API and every `MISO_*` setting |
 | [docs/xtts.md](docs/xtts.md) | XTTS-v2 settings and licence |
 | [docs/qwen.md](docs/qwen.md) | Qwen3-TTS settings and differences |
+| [docs/whisper.md](docs/whisper.md) | Speech to text: model choice, licences, VRAM, settings |
 | [docs/voice-cloning.md](docs/voice-cloning.md) | What makes a good reference on each engine; Home Assistant |
 
 ## Layout
@@ -79,7 +82,7 @@ Clone a real person's voice only with their consent. Details: [docs/api.md#secur
 compose.yaml          one profile per engine
 gpu-tenant.yaml       the residents argus-iris manages
 engines/<engine>/     each engine's server, Dockerfile and tests (its own Python environment)
-src/argus_echo/       the contract in Python, and `argus-echo check`
+src/argus_echo/       the contracts in Python (contract/tts.py, contract/stt.py), and `argus-echo check`
 ```
 
 The engines don't import `argus_echo`: their dependencies conflict (Miso pins torch 2.4), so they share the
