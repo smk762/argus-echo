@@ -141,6 +141,12 @@ def test_a_legacy_prompt_pt_is_refused_unread(env):
         (_prompt(arrays={"gpt_cond_latent": GPT.astype(np.int32), "speaker_embedding": SPK}), "float"),
         (_prompt(arrays={"gpt_cond_latent": np.zeros((0,), np.float32), "speaker_embedding": SPK}), "non-empty"),
         (_prompt(arrays={"gpt_cond_latent": np.full((2,), np.nan, np.float32), "speaker_embedding": SPK}), "finite"),
+        (_prompt(arrays={"gpt_cond_latent": GPT, "speaker_embedding": SPK.reshape(512)}), "speaker_embedding"),
+        (_prompt(arrays={"gpt_cond_latent": GPT, "speaker_embedding": np.ones((1, 256, 1), np.float32)}), "(1, 512, 1)"),
+        (_prompt(arrays={"gpt_cond_latent": GPT[0], "speaker_embedding": SPK}), "gpt_cond_latent"),
+        (_prompt(arrays={"gpt_cond_latent": GPT[..., :512].copy(), "speaker_embedding": SPK}), "(1, T, 1024)"),
+        (_prompt(arrays={"gpt_cond_latent": np.ones((2, 32, 1024), np.float32), "speaker_embedding": SPK}), "(1, T"),
+        (_prompt(arrays={"gpt_cond_latent": np.ones((1, 1025, 1024), np.float32), "speaker_embedding": SPK}), "at most"),
     ],
 )
 def test_bad_prompts_are_422_and_store_nothing(env, prompt, needle):
@@ -148,6 +154,16 @@ def test_bad_prompts_are_422_and_store_nothing(env, prompt, needle):
     assert r.status_code == 422, r.text
     assert needle in r.json()["error"]
     assert env.s3.objects == {}
+
+
+def test_a_replaced_clone_is_the_newest_in_the_cache(env, monkeypatch):
+    monkeypatch.setattr(xs, "_CLONE_CACHE_MAX", 2)
+    archive = _zip({"prompt.safetensors": _prompt()})
+    for cid in ("alice", "bob"):
+        assert _import(env, archive, companion_id=cid).status_code == 200
+    assert _import(env, archive, companion_id="alice", replace="true").status_code == 200
+    assert _import(env, archive, companion_id="carol").status_code == 200
+    assert list(xs._clone_cache) == ["voice_clones/alice/prompt.pt", "voice_clones/carol/prompt.pt"]
 
 
 def test_an_archive_with_no_prompt_is_422(env):

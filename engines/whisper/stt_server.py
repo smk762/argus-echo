@@ -321,6 +321,13 @@ class ModelManager:
         if self.state == State.GPU and self.backend is not None:
             return
         if self.state in (State.UNLOADED, State.ERROR) or self.backend is None:
+            # A failed load or move leaves its backend partly on the GPU or in RAM: free it before building another.
+            stale, self.backend = self.backend, None
+            if stale is not None:
+                try:
+                    await asyncio.to_thread(stale.free)
+                except Exception as exc:
+                    logger.warning("stt_free_failed", error=str(exc) or type(exc).__name__)
             self.state = State.LOADING
             self.backend = backend_factory()
             await self._shielded(self.backend.load, State.GPU)
@@ -368,7 +375,8 @@ class ModelManager:
             if self.state != State.GPU or not self.resident_device or self.backend is None:
                 return False
             await self._shielded(self.backend.to_cpu, State.CPU)
-        if self.active == 0:
+        # The eviction loop goes on to its CPU phase itself; arming here would start a second, untracked loop.
+        if self.active == 0 and asyncio.current_task() is not self._evict_task:
             self._arm_evict()
         return True
 

@@ -227,6 +227,45 @@ class CloneVoiceTest(_LocalStorageCase):
         self.assertEqual(r.json()["reference_text_source"], "request")
         self.assertNotIn("reference_text_stt", r.json())
 
+    def test_clips_the_cap_cuts_out_are_not_counted(self):
+        self._preprocess(torch.full((3 * SR,), 0.25), torch.full((3 * SR,), 0.25), torch.full((3 * SR,), 0.25))
+        with mock.patch.object(srv, "STT_URL", ""), mock.patch.object(srv, "REF_MAX_SECONDS", 5.0):
+            r = self._post(files=[("audio", (f"{i}.wav", f"clip-{i}".encode(), "audio/wav")) for i in range(3)])
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["num_clips"], 2)
+        self.assertEqual(json.loads(self.storage.get("voice_clones/alice/meta.json"))["num_clips"], 2)
+
+    def test_caller_transcript_of_a_dropped_clip_is_refused_without_stt(self):
+        self._preprocess(torch.full((3 * SR,), 0.25))
+        files = [("audio", ("bad.wav", b"broken", "audio/wav")), ("audio", ("a.wav", b"clip-0", "audio/wav"))]
+        with mock.patch.object(srv, "STT_URL", ""):
+            r = self._post(files=files, reference_text="words from both clips")
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertIn("failed preprocessing", r.json()["error"])
+        self.assertEqual(self.storage.list_keys("voice_clones/"), [])
+
+    def test_caller_transcript_of_a_capped_reference_is_refused_without_stt(self):
+        self._preprocess(torch.full((3 * SR,), 0.25), torch.full((3 * SR,), 0.25))
+        files = [("audio", (f"{i}.wav", f"clip-{i}".encode(), "audio/wav")) for i in range(2)]
+        with mock.patch.object(srv, "STT_URL", ""), mock.patch.object(srv, "REF_MAX_SECONDS", 4.0):
+            r = self._post(files=files, reference_text="all six seconds")
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertIn("MISO_REF_MAX_SECONDS", r.json()["error"])
+        self.assertEqual(self.storage.list_keys("voice_clones/"), [])
+
+    def test_caller_transcript_that_no_longer_matches_is_replaced_by_stt(self):
+        self._preprocess(torch.full((3 * SR,), 0.25), torch.full((3 * SR,), 0.25))
+        seen = self._stt(lambda req, i: httpx.Response(200, json={"text": f"clip {i}"}))
+        files = [("audio", (f"{i}.wav", f"clip-{i}".encode(), "audio/wav")) for i in range(2)]
+        with mock.patch.object(srv, "REF_MAX_SECONDS", 4.0):
+            r = self._post(files=files, reference_text="all six seconds")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(r.json()["reference_text_source"], "stt")
+        self.assertIn("MISO_REF_MAX_SECONDS", r.json()["reference_text_discarded"])
+        stored = torch.load(io.BytesIO(self.storage.get("voice_clones/alice/prompt.pt")), weights_only=True)
+        self.assertEqual(stored["ref_text"], "clip 0 clip 1")
+
     def test_without_stt_url_the_clone_has_no_transcript(self):
         self._preprocess(torch.full((3 * SR,), 0.25))
         with mock.patch.object(srv, "STT_URL", ""):
@@ -314,6 +353,17 @@ class ImportCloneTest(_LocalStorageCase):
             with self.assertRaises(ValueError, msg=str(prompt)):
                 srv._import_clone(_archive(prompt), "bob", "")
         self.assertEqual(self.storage.list_keys("voice_clones/"), [])
+
+    def test_sidecar_numbers_are_validated_and_duration_comes_from_the_prompt(self):
+        for bad in ({"total_seconds": "x", "num_clips": "3"}, {"total_seconds": None, "num_clips": True},
+                    {"total_seconds": {"a": 1}, "num_clips": -2}, {"total_seconds": 999.0, "num_clips": 2.5}):
+            out = srv._import_clone(_archive({"ref_audio": torch.zeros(2 * SR)}, bad), "bob", "", replace=True)
+            stored = json.loads(self.storage.get("voice_clones/bob/meta.json"))
+            for meta in (out, stored):
+                self.assertEqual((meta["total_seconds"], meta["num_clips"]), (2.0, 0), bad)
+            self.assertEqual(out["duration"], 2.0)
+        out = srv._import_clone(_archive({"ref_audio": torch.zeros(SR)}, {"num_clips": 3}), "bob", "", replace=True)
+        self.assertEqual(out["num_clips"], 3)
 
     def test_fallback_duration_uses_the_clones_sample_rate(self):
         out = srv._import_clone(_archive({"ref_audio": torch.zeros(32000), "sample_rate": 16000}), "bob", "")
@@ -491,6 +541,30 @@ class CloneArchiveSafetyTest(_LocalStorageCase):
         for label, blob in cases.items():
             r = self._import(_zip({"prompt.safetensors": blob}), companion_id="bob")
             self.assertEqual(r.status_code, 422, f"{label}: {r.text}")
+        self.assertEqual(self.storage.list_keys("voice_clones/"), [])
+
+    def test_unreadable_members_are_422(self):
+        def patched(member: str, offset: int, size: int, change) -> bytes:
+            """The archive with one field of ``member``'s central directory entry passed through ``change``."""
+            data = bytearray(_archive({"ref_audio": torch.zeros(SR)}, {"name": "x"}))
+            at = data.find(b"PK\x01\x02")
+            while data[at + 46 : at + 46 + len(member)] != member.encode():
+                at = data.find(b"PK\x01\x02", at + 4)
+            field = slice(at + offset, at + offset + size)
+            data[field] = change(int.from_bytes(data[field], "little")).to_bytes(size, "little")
+            return bytes(data)
+
+        for member in ("prompt.safetensors", "meta.json"):
+            cases = {
+                "bad crc": patched(member, 16, 4, lambda crc: crc ^ 1),
+                "encrypted": patched(member, 8, 2, lambda flags: flags | 0x1),
+                "unknown compression": patched(member, 10, 2, lambda _method: 99),
+            }
+            for label, archive in cases.items():
+                with self.subTest(member=member, case=label):
+                    r = self._import(archive, companion_id="bob")
+                    self.assertEqual(r.status_code, 422, r.text)
+                    self.assertIn(f"Cannot read {member}", r.json()["error"])
         self.assertEqual(self.storage.list_keys("voice_clones/"), [])
 
     def test_oversized_members_are_refused(self):

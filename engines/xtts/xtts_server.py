@@ -1627,11 +1627,9 @@ def _preprocess_clip(in_path: str) -> tuple[str, dict]:
                 report["applied"].append(f"denoise(seeded,{PREPROCESS_DENOISE_PROP})")
             else:
                 # No clean gap to seed from: self-estimate, but be more conservative.
-                den = nr.reduce_noise(
-                    y=sp, sr=sr, stationary=True,
-                    prop_decrease=min(PREPROCESS_DENOISE_PROP, 0.6),
-                )
-                report["applied"].append("denoise(self,0.6)")
+                prop = min(PREPROCESS_DENOISE_PROP, 0.6)
+                den = nr.reduce_noise(y=sp, sr=sr, stationary=True, prop_decrease=prop)
+                report["applied"].append(f"denoise(self,{prop})")
             speech = torch.from_numpy(np.ascontiguousarray(den, dtype=np.float32))
         except Exception as exc:
             report["warnings"].append(f"denoise_failed:{exc}")
@@ -2042,6 +2040,7 @@ async def clone_voice(
 
     with _clone_cache_lock:
         _clone_cache[s3_key] = prompt
+        _clone_cache.move_to_end(s3_key)  # a re-clone keeps its old place otherwise, and is evicted first
         if len(_clone_cache) > _CLONE_CACHE_MAX:
             _clone_cache.popitem(last=False)
 
@@ -2115,6 +2114,9 @@ _LEGACY_ARCHIVE_PROMPT = "prompt.pt"
 _ARCHIVE_FORMAT = "xtts-clone"
 _ARCHIVE_FORMAT_VERSION = "1"
 _LATENT_KEYS = ("gpt_cond_latent", "speaker_embedding")
+_GPT_LATENT_DIM = 1024
+_SPEAKER_EMBEDDING_DIM = 512
+_MAX_GPT_LATENT_LEN = 1024  # the perceiver resampler makes 32
 
 
 def _to_array(tensor):
@@ -2179,6 +2181,16 @@ def _prompt_from_safetensors(data: bytes) -> dict:
         a = arrays[k]
         if not (a.dtype.kind == "f" and a.size > 0 and np.isfinite(a).all()):
             raise ValueError("prompt.safetensors latents must be non-empty, finite float tensors")
+    # XTTS-v2's shapes, so a broken clone fails here rather than in inference() on every request.
+    gpt, spk = arrays["gpt_cond_latent"], arrays["speaker_embedding"]
+    if spk.shape != (1, _SPEAKER_EMBEDDING_DIM, 1):
+        raise ValueError(f"prompt.safetensors speaker_embedding must be shaped (1, {_SPEAKER_EMBEDDING_DIM}, 1)")
+    if not (gpt.ndim == 3 and gpt.shape[0] == 1 and gpt.shape[2] == _GPT_LATENT_DIM
+            and gpt.shape[1] <= _MAX_GPT_LATENT_LEN):
+        raise ValueError(
+            f"prompt.safetensors gpt_cond_latent must be shaped (1, T, {_GPT_LATENT_DIM}) "
+            f"with T at most {_MAX_GPT_LATENT_LEN}"
+        )
     return {k: _from_array(arrays[k].astype(np.float32)) for k in _LATENT_KEYS}
 
 
@@ -2395,6 +2407,7 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
 
     with _clone_cache_lock:
         _clone_cache[s3_key] = prompt
+        _clone_cache.move_to_end(s3_key)
         if len(_clone_cache) > _CLONE_CACHE_MAX:
             _clone_cache.popitem(last=False)
 

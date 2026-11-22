@@ -34,6 +34,20 @@ class LocalStorageTest(unittest.TestCase):
         self.assertEqual(self.storage._path("/etc/passwd"), os.path.join(self.root, "etc/passwd"))
         self.assertEqual(self.storage._path("a/../b.wav"), os.path.join(self.root, "b.wav"))
 
+    def test_an_unnormalised_root_still_stores_and_confines(self):
+        for root in (self.root + "/", os.path.join(self.root, ".", "")):
+            storage = srv.LocalStorage(root, "http://x")
+            storage.put("generated/a.wav", b"RIFF")
+            self.assertEqual(storage.get("generated/a.wav"), b"RIFF")
+            self.assertEqual(storage.list_keys("generated/"), ["generated/a.wav"])
+            with self.assertRaises(ValueError):
+                storage._path("../secret.txt")
+        cwd = os.getcwd()
+        self.addCleanup(os.chdir, cwd)
+        os.chdir(self.outer.name)
+        relative = srv.LocalStorage("./data/", "http://x")
+        self.assertEqual(relative.get("generated/a.wav"), b"RIFF")
+
     def test_media_route_answers_404_for_traversal(self):
         self.storage.put("generated/a.wav", b"RIFF")
         self.assertEqual(self.client.get("/media/generated/a.wav").content, b"RIFF")

@@ -230,6 +230,7 @@ def test_null_loads_the_stock_weights(client, coqui):
 def test_an_idle_unload_keeps_the_checkpoint(client, coqui, mgr):
     _write_checkpoint(coqui.root / "voice")
     assert client.post("/admin/load", json={"checkpoint": "voice"}, headers=AUTH).status_code == 200
+    loaded = len(_FakeXtts.loads)
 
     async def idle_then_request():
         assert await mgr.unload()  # what the eviction loop calls
@@ -237,6 +238,7 @@ def test_an_idle_unload_keeps_the_checkpoint(client, coqui, mgr):
             pass
 
     asyncio.run(idle_then_request())
+    assert len(_FakeXtts.loads) == loaded + 1, "the lease reloads"
     assert _FakeXtts.loads[-1].endswith("voice")
     assert mgr.weights["checkpoint"] == "voice"
 

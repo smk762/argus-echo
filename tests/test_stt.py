@@ -128,8 +128,14 @@ def test_a_custom_clip_only_needs_non_empty_text(tmp_path) -> None:
 def test_an_engine_advertising_both_gets_both_suites() -> None:
     seen: list[str] = []
     health = {**HEALTH, "capabilities": ["tts", "stt"]}
-    check("http://e", transport=stt_engine(health=health, seen=seen))
+    report = check("http://e", transport=stt_engine(health=health, seen=seen))
     assert "GET /clones" in seen
+    assert any(f.name == "POST /transcribe" for f in report.findings), "the read-only stt check is missing"
+
+    seen.clear()
+    check("http://e", transcribe=True, transport=stt_engine(health=health, seen=seen))
+    assert "GET /clones" in seen
+    assert "POST /transcribe" in seen
 
 
 def test_cli_transcribe_flag(monkeypatch) -> None:

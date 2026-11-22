@@ -111,6 +111,7 @@ import ctypes
 import functools
 import gc
 import io
+import itertools
 import json
 import math
 import os
@@ -129,6 +130,7 @@ from typing import Optional
 
 import structlog
 from argus_cortex.auth import bearer
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import HTTPConnection
 from argus_cortex.limits import BadInput, TooLarge, read_upload
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
@@ -177,6 +179,7 @@ MAX_CLIPS = int(os.getenv("MISO_MAX_CLIPS", "10"))
 # caps the whole body of each upload route first: its files plus form fields
 # and multipart framing (_FORM_SLACK).
 _FORM_SLACK = 1024 * 1024
+_MAX_FORM_FIELDS = 16
 _UPLOAD_BODY_CAPS = {
     "/analyze-clips": lambda: MAX_CLIPS * MAX_CLIP_BYTES + _FORM_SLACK,
     "/clone-voice": lambda: MAX_CLIPS * MAX_CLIP_BYTES + _FORM_SLACK,
@@ -309,7 +312,9 @@ class Storage:
 
 class LocalStorage(Storage):
     def __init__(self, root: str, public_url: str) -> None:
-        self.root = root
+        # _path compares against os.path.commonpath, which normalises, so the root
+        # must be normalised too ("./media/" would otherwise refuse every key).
+        self.root = os.path.abspath(root)
         self.public_url = public_url.rstrip("/")
         os.makedirs(self.root, exist_ok=True)
 
@@ -2126,12 +2131,19 @@ async def analyze_clips(request: Request):
 
     Reads the ``audio`` multipart parts directly (robust to the lone-file-list
     body-parsing quirk in some Starlette versions)."""
-    form = await request.form()
+    too_many = JSONResponse(status_code=422, content={"error": f"At most {MAX_CLIPS} clips (MISO_MAX_CLIPS)"})
+    try:
+        # _UploadBodyCap bounds the bytes; these bound how many parts get spooled within them.
+        form = await request.form(max_files=MAX_CLIPS, max_fields=_MAX_FORM_FIELDS)
+    except StarletteHTTPException as exc:
+        if "Too many files" in str(exc.detail):
+            return too_many
+        return JSONResponse(status_code=exc.status_code, content={"error": str(exc.detail)})
     clips = [u for u in form.getlist("audio") if hasattr(u, "read")]
     if not clips:
         return JSONResponse(status_code=422, content={"error": "No clips provided"})
     if len(clips) > MAX_CLIPS:
-        return JSONResponse(status_code=422, content={"error": f"At most {MAX_CLIPS} clips (MISO_MAX_CLIPS)"})
+        return too_many
 
     raw_paths: list[str] = []
     names: list[str] = []
@@ -2176,7 +2188,9 @@ async def clone_voice(
     download and import are unchanged. `reference_text` is the transcript of the
     reference audio; if empty and MISO_STT_URL is set, each stored clip is
     transcribed there (in `language`) and meta.json records
-    `reference_text_source: "stt"`.
+    `reference_text_source: "stt"`. A `reference_text` that no longer matches the
+    stored audio (a clip failed preprocessing, or the cap cut the reference) is
+    replaced the same way, or refused with 422 when MISO_STT_URL is unset.
     """
     if _mgr.state == TTSState.LOADING:
         return JSONResponse(status_code=503, content={"error": "Model still loading"})
@@ -2222,7 +2236,11 @@ async def clone_voice(
 
         ref_audio = torch.cat(segments)
         max_samps = int(REF_MAX_SECONDS * SAMPLE_RATE)
-        if ref_audio.shape[-1] > max_samps:
+        lengths = [seg.shape[-1] for seg in segments]
+        # A clip that starts past the cap is not in the clone at all.
+        num_clips = sum(1 for start in itertools.accumulate([0] + lengths[:-1]) if start < max_samps)
+        capped = ref_audio.shape[-1] > max_samps
+        if capped:
             ref_audio = ref_audio[:max_samps]
         total_seconds = round(ref_audio.shape[-1] / SAMPLE_RATE, 2)
         if total_seconds < 2.0:
@@ -2238,12 +2256,32 @@ async def clone_voice(
                 pass
 
     ref_text = (reference_text or "").strip()
+    ref_text_discarded = None
+    if ref_text and (len(segments) < len(clips) or capped):
+        # Miso conditions on the (audio, text) pair, and the caller's transcript
+        # covers audio the clone no longer holds.
+        ref_text_discarded = (
+            f"{len(clips) - len(segments)} clip(s) failed preprocessing"
+            if len(segments) < len(clips)
+            else f"the reference was cut to MISO_REF_MAX_SECONDS ({REF_MAX_SECONDS:g} s)"
+        )
+        if not STT_URL:
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "error": f"reference_text no longer matches the stored audio: {ref_text_discarded}. "
+                    "Send only the clips it transcribes, within the cap, or leave reference_text empty.",
+                    "clips": reports,
+                },
+            )
+        logger.warning("clone_reference_text_discarded", companion_id=companion_id, reason=ref_text_discarded)
+        ref_text = ""
     ref_text_source = "request" if ref_text else None
     stt_info = None
     if not ref_text and STT_URL:
         # Transcribe what is stored (the clips that survived preprocessing, trimmed
         # and capped), not an upload: Miso conditions on the (audio, text) pair.
-        pieces = _stored_clip_pieces(ref_audio, [seg.shape[-1] for seg in segments], SAMPLE_RATE // 2)
+        pieces = _stored_clip_pieces(ref_audio, lengths, SAMPLE_RATE // 2)
         try:
             ref_text, stt_info = await asyncio.to_thread(_transcribe_clips, pieces, _primary_language(language))
         except STTError as exc:
@@ -2270,12 +2308,15 @@ async def clone_voice(
         "voice_clone_id": s3_key,
         "companion_id": companion_id,
         "name": voice_name or companion_id,
-        "num_clips": len(segments),  # the clips used; one that failed preprocessing is not in the clone
+        # The clips used: one that failed preprocessing or that the cap cut out is not in the clone.
+        "num_clips": num_clips,
         "total_seconds": total_seconds,
         "has_transcript": bool(ref_text),
         # "request" (the caller's reference_text), "stt" (machine-made via MISO_STT_URL) or null.
         "reference_text_source": ref_text_source,
         **({"reference_text_stt": stt_info} if stt_info else {}),
+        # Why the caller's reference_text was replaced by STT's.
+        **({"reference_text_discarded": ref_text_discarded} if ref_text_discarded else {}),
         "engine": "miso",
         "created_at": time.time(),
         **_sampling_meta_fields(previous_meta),
@@ -2289,7 +2330,7 @@ async def clone_voice(
     if len(_clone_cache) > _CLONE_CACHE_MAX:
         _clone_cache.popitem(last=False)
 
-    logger.info("voice_cloned", companion_id=companion_id, clips=len(segments), uploaded=len(clips), duration=total_seconds, s3_key=s3_key)
+    logger.info("voice_cloned", companion_id=companion_id, clips=num_clips, uploaded=len(clips), duration=total_seconds, s3_key=s3_key)
     return {**meta, "duration": total_seconds, "clips": reports}
 
 
@@ -2581,21 +2622,33 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
             )
         raise ValueError(f"Archive does not contain {_ARCHIVE_PROMPT}")
 
+    def _read(name: str) -> bytes:
+        # A bad CRC, an encrypted member or an unknown compression method is a bad archive, not a server error.
+        try:
+            return z.read(name)
+        except (zipfile.BadZipFile, RuntimeError, NotImplementedError, EOFError) as exc:
+            raise ValueError(f"Cannot read {name} from the archive: {exc}") from exc
+
     src_meta: dict = {}
     if meta_name:
+        meta_bytes = _read(meta_name)
         try:
-            src_meta = json.loads(z.read(meta_name).decode("utf-8"))
+            src_meta = json.loads(meta_bytes.decode("utf-8"))
         except (ValueError, json.JSONDecodeError):
             src_meta = {}
         if not isinstance(src_meta, dict):
             src_meta = {}  # valid JSON, but not an object: as good as no sidecar
 
-    prompt = _prompt_from_safetensors(z.read(prompt_name), src_meta.get("ref_text", ""))
+    prompt = _prompt_from_safetensors(_read(prompt_name), src_meta.get("ref_text", ""))
     sample_rate = prompt["sample_rate"]
 
     def _meta_str(field: str) -> str:
         value = src_meta.get(field)
         return value.strip() if isinstance(value, str) else ""
+
+    num_clips = src_meta.get("num_clips")
+    if isinstance(num_clips, bool) or not isinstance(num_clips, int) or not 0 <= num_clips <= 1000:
+        num_clips = 0
 
     companion_id = (companion_override or "").strip() or _meta_str("companion_id")
     companion_id = _slugify(companion_id or name_override or _meta_str("name") or "imported-voice")
@@ -2615,9 +2668,9 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
         "voice_clone_id": s3_key,
         "companion_id": companion_id,
         "name": name_override or _meta_str("name") or companion_id,
-        "num_clips": src_meta.get("num_clips", 0),
-        # The clone's own rate: an imported prompt need not be at this server's SAMPLE_RATE.
-        "total_seconds": src_meta.get("total_seconds", round(prompt["ref_audio"].shape[-1] / sample_rate, 2)),
+        "num_clips": num_clips,
+        # From the validated prompt, never the sidecar; the clone's own rate, which need not be this server's.
+        "total_seconds": round(prompt["ref_audio"].shape[-1] / sample_rate, 2),
         "imported": True,
         "engine": "miso",
         "created_at": time.time(),

@@ -180,5 +180,22 @@ class UploadBodyCapTest(unittest.TestCase):
         r = self.client.post("/analyze-clips", files=files)
         self.assertEqual(r.status_code, 422, r.text)
 
+    def test_parts_past_max_clips_are_never_spooled(self):
+        from starlette.datastructures import UploadFile
+
+        spooled = set()
+        real_write = UploadFile.write
+
+        async def counting_write(self, data):
+            spooled.add(id(self))
+            return await real_write(self, data)
+
+        files = [("audio", (f"c{i}.wav", b"x" * 10, "audio/wav")) for i in range(5)]
+        with mock.patch.object(UploadFile, "write", counting_write):
+            r = self.client.post("/analyze-clips", files=files)
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertIn("At most 2 clips", r.json()["error"])
+        self.assertLessEqual(len(spooled), srv.MAX_CLIPS)
+
     def test_other_routes_are_untouched(self):
         self.assertEqual(self.client.get("/clones").status_code, 200)
