@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Security
+- XTTS and Qwen clone archives carry `prompt.safetensors`, as Miso's have since #20. `GET /clones/{id}/download`
+  writes it and `POST /clones/import` reads it with safetensors only. An uploaded archive used to reach
+  `torch.load(weights_only=True)` (Qwen: with one class allowed), which on these images' torch 2.6 is
+  GHSA-63cw-57p8-fm3p, code execution through an untrusted checkpoint (fixed in torch 2.10). An archive holding
+  only a pickled `prompt.pt` is now refused unread (`422`): re-download clones from an engine on this version
+  before moving them. Stored clones are unchanged (`prompt.pt`, written by the server). Qwen's archive keeps the
+  speaker embedding's dtype (bfloat16 included) in its metadata (#6).
+
 ### Added
 - `QWEN_TAG` picks the Qwen image's tag on its own (default `ECHO_TAG`). The published image bakes 0.6b, so a host
   running 1.7b builds it locally under its own tag while `ECHO_TAG` keeps pulling the published images for the
