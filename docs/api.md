@@ -314,6 +314,7 @@ client (Home Assistant) reaches it through the `wyoming-whisper` bridge, which p
 | Method | Path | Notes |
 | --- | --- | --- |
 | POST | `/transcribe` | One clip in, one transcript out |
+| POST | `/transcriptions` | agent-composer's JSON route: a URL or base64 clip in, composer's transcript shape out |
 | WS | `/transcribe/stream` | Live PCM in, partial and final transcripts out |
 | GET | `/health` | `ResidentHealth` plus `engine`, `model`, `revision`, `device`, `capabilities`, `streams` |
 | POST | `/admin/{evict,unload,wake}` | As above; evict moves the weights to host RAM |
@@ -358,6 +359,65 @@ is empty for silence. Times are seconds from the start of the clip.
 Transcriptions run one at a time (`STT_CONCURRENCY`); later requests queue for up to `STT_QUEUE_TIMEOUT_S`.
 Whisper writes numbers as digits (`7.30`, `12%`): normalise both sides before scoring a transcript against a script.
 
+### `POST /transcriptions`
+
+agent-composer's whisper sidecar route, kept so kimini-api moves to echo unchanged (smk762/agent-composer#81). New
+callers should use `/transcribe`. JSON body (unknown fields are ignored, nulls are fine):
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `audio_url` | string | An `http`/`https` URL the engine downloads (rules below) |
+| `audio_base64` | string | The audio as standard base64; a `data:...;base64,` prefix is accepted |
+| `language` | string | As on `/transcribe`: ISO 639-1, a region suffix dropped, detected when absent; unknown is `422` |
+
+Exactly one of `audio_url` and `audio_base64`: both is `422`, neither `400`.
+
+```json
+{"text": "And so, my fellow Americans, ...", "language": "en", "duration_seconds": 11.0, "confidence": 0.96}
+```
+
+`confidence` is Whisper's language-detection probability (`1.0` when `language` was given), as composer reported it;
+it says nothing about the transcript. No segments or word times: use `/transcribe` for those.
+
+The audio gets the same caps as a `/transcribe` upload before anything is decoded: the request body is capped at the
+base64 size of `STT_MAX_UPLOAD_MB`, the base64 length is checked before decoding, and the decoded bytes, the
+download, the format and the duration (`STT_MAX_SECONDS`) are checked as on `/transcribe`. WAV and FLAC go through
+argus-cortex's `open_audio`. Anything else is decoded by the ffmpeg CLI (in the image): the bytes go in on a pipe,
+`-protocol_whitelist pipe` stops anything inside them (a playlist, a reference) from opening a file or the network,
+`-format_whitelist` allows only the demuxers in `STT_INPUT_FORMATS` (plain audio containers by default: WAV, MP3,
+Ogg/Opus, FLAC, WebM/Matroska, MP4/M4A, AAC, AIFF, CAF, AMR, AU; no playlists), and output stops just past
+`STT_MAX_SECONDS`. `STT_INPUT_FORMATS=none` accepts WAV and FLAC only.
+
+Unlike `/transcribe`, it runs faster-whisper's Silero VAD filter, which drops silence before Whisper runs
+(`STT_VAD_FILTER`, default `1`), as composer's sidecar did: Whisper is prone to inventing text for silence, and kimini-api's audio is unedited.
+`/transcribe` keeps it off so its segment times cover the whole clip; set `STT_VAD_FILTER=0` for the same here.
+
+`audio_url` is fetched with argus-cortex's `afetch`:
+
+- `http` and `https` only, and no `user:password@`.
+- Every address the host resolves to must be public: loopback, private, link-local (cloud metadata), CGNAT,
+  multicast, reserved and unspecified addresses are refused, IPv4 inside IPv6 included, unless the host (`host` or
+  `host:port`) is in `STT_AUDIO_URL_ALLOWED_HOSTS` (e.g. `minio:9000`).
+- The connection is pinned to the address that was checked (`Host` and TLS SNI keep the name), so a DNS rebind
+  between the check and the connect can't move it.
+- Redirects are not followed (`STT_AUDIO_URL_MAX_REDIRECTS`, default `0`); when they are, every hop is checked again.
+- The body is capped at `STT_MAX_UPLOAD_MB` as it streams (a larger `Content-Length` is refused before reading), and
+  the whole fetch at `STT_DOWNLOAD_TIMEOUT` seconds (default 30). Environment proxies are ignored.
+
+A refused URL answers `{"error": "audio_url is not an allowed http(s) URL"}` (`400`) and a failed download (refused
+connection, timeout, redirect, a non-200 answer) `{"error": "Could not download audio_url"}` (`502`), whatever the
+reason; the reason is logged, never the resolved address.
+
+| Status | When |
+| --- | --- |
+| `400` | Neither field, bad base64, a refused `audio_url`, audio ffmpeg (or, for WAV/FLAC, `open_audio`) can't read |
+| `413` | Body, download, decoded bytes or duration over its cap |
+| `422` | Both fields, a body that isn't the JSON object above, or an unknown `language` |
+| `502` | `audio_url` could not be downloaded |
+| `503` | As `/transcribe`, with `Retry-After` |
+
+Errors are `{"error": "..."}` as on every echo route; composer's were FastAPI's `{"detail": "..."}`.
+
 ### `WS /transcribe/stream`
 
 For live speech. The server cuts the stream into utterances with voice activity detection (Silero VAD, the
@@ -381,5 +441,6 @@ At most `STT_STREAM_MAX_SESSIONS` (default 4) streams are open at once; the next
 `1013`. The model lease is held per transcription, not per stream, so an idle stream does not keep the model on
 the GPU. Silence alone loads nothing.
 
-`/transcribe` and `/transcribe/stream` are unauthenticated, like the TTS routes: keep the port on a trusted
-network.
+`/transcribe`, `/transcriptions` and `/transcribe/stream` are unauthenticated, like the TTS routes: keep the port on
+a trusted network. `/transcriptions` makes the engine fetch URLs: its SSRF policy keeps it off private addresses,
+but anyone who can reach the port can make it download from the internet.

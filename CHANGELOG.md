@@ -3,6 +3,13 @@
 ## [Unreleased]
 
 ### Added
+- Whisper serves agent-composer's `POST /transcriptions` (smk762/agent-composer#81), so kimini-api can move off
+  composer's whisper sidecar: a JSON body with `audio_url` (fetched under argus-cortex's SSRF policy, capped as it
+  streams, `STT_AUDIO_URL_ALLOWED_HOSTS` for trusted internal hosts, redirects off by default) or `audio_base64`,
+  and composer's `{text, language, duration_seconds, confidence}` back. Silero VAD drops silence before
+  Whisper runs (`STT_VAD_FILTER`, default on, as composer did; `/transcribe` is unchanged), and audio other than
+  WAV/FLAC is decoded with ffmpeg, now in the image, reading only from a pipe and only through a demuxer in
+  `STT_INPUT_FORMATS` (`none`: WAV/FLAC only). Models: `TranscriptionsRequest`, `TranscriptionsResult`.
 - `gpu-tenant.yaml` gives Qwen a `vram_mb` (4800): Qwen3-TTS 1.7b with CustomVoice only, measured on an 8 GB
   RTX 4060 (dragon), CUDA context included. Generating stays inside the loaded footprint; evict and unload leave
   only the ~150 MB CUDA context (#6). Base and 0.6b are still to measure.

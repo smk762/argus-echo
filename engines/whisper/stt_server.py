@@ -4,6 +4,8 @@ argus-echo's speech-to-text engine: faster-whisper (Whisper large-v3-turbo on CT
 Serves the ``stt`` contract (docs/api.md, "Speech to text"):
 
   POST /transcribe          — multipart WAV/FLAC in, {text, language, duration, segments} out
+  POST /transcriptions      — JSON {audio_url | audio_base64, language} in, {text, language, duration_seconds,
+                              confidence} out (agent-composer's whisper sidecar route, for kimini-api)
   WS   /transcribe/stream   — 16 kHz s16le PCM in, partial and final transcripts out, cut by Silero VAD
   GET  /health              — argus-cortex ResidentHealth + engine fields, capabilities ["stt"]
   POST /admin/{evict,unload,wake}
@@ -17,7 +19,16 @@ transcribing one request at a time (STT_CONCURRENCY); gpu-tenant.yaml declares t
 
 Uploads are read through argus_cortex.limits (read_upload, then open_audio), so the byte cap, the format
 (WAV or FLAC, sniffed from the magic bytes), the channel count, the sample rate and the duration are checked
-before any sample is decoded.
+before any sample is decoded. /transcriptions puts its fetched or base64-decoded bytes through the same caps;
+audio that is not WAV or FLAC is decoded by the ffmpeg CLI, reading only from a pipe and only through a demuxer in
+STT_INPUT_FORMATS, and stopped at STT_MAX_SECONDS.
+
+audio_url (/transcriptions) is fetched with argus_cortex.net.afetch: http(s) only, no credentials in the URL, every
+address the host resolves to must be global (no loopback, private, link-local/metadata, CGNAT, reserved, multicast
+or unspecified, IPv4 embedded in IPv6 included) unless the host is in STT_AUDIO_URL_ALLOWED_HOSTS, the connection is
+pinned to the checked address, a redirect is followed only up to STT_AUDIO_URL_MAX_REDIRECTS (default 0) and each
+hop is checked again, the body is capped at STT_MAX_UPLOAD_MB as it streams, and the whole fetch at
+STT_DOWNLOAD_TIMEOUT. Failures answer one generic 400 or 502.
 
 Env vars:
   STT_MODEL             — Hugging Face repo of the CTranslate2 weights (default mobiuslabsgmbh/faster-whisper-large-v3-turbo)
@@ -35,6 +46,15 @@ Env vars:
   STT_MAX_SECONDS       — longest audio accepted (default 600)
   STT_STREAM_MAX_SESSIONS, STT_STREAM_MIN_SILENCE_MS, STT_STREAM_MAX_UTTERANCE_S, STT_STREAM_PARTIAL_S,
   STT_VAD_THRESHOLD     — streaming; see docs/api.md
+  STT_VAD_FILTER        — "1" (default) runs faster-whisper's Silero VAD pre-filter on /transcriptions (as composer's
+                          sidecar did); /transcribe never uses it
+  STT_AUDIO_URL_ALLOWED_HOSTS — `host` or `host:port` entries /transcriptions may fetch although they resolve to a
+                          private address (e.g. `minio:9000`). Default empty
+  STT_AUDIO_URL_MAX_REDIRECTS — redirects an audio_url fetch follows, each re-checked (default 0: none)
+  STT_DOWNLOAD_TIMEOUT  — seconds for a whole audio_url fetch (default 30)
+  STT_DECODE_TIMEOUT    — seconds for one ffmpeg decode (default 120)
+  STT_INPUT_FORMATS     — ffmpeg demuxers /transcriptions may decode non-WAV/FLAC audio with (comma list; default
+                          plain audio containers, no playlists). "none" accepts WAV/FLAC only
 """
 
 from __future__ import annotations
@@ -44,6 +64,7 @@ import contextlib
 import gc
 import json
 import os
+import subprocess
 import time
 from contextlib import asynccontextmanager
 from enum import Enum
@@ -52,10 +73,20 @@ from typing import Any, Callable, Optional, Protocol
 import numpy as np
 import structlog
 from argus_cortex.auth import bearer
-from argus_cortex.limits import DEFAULT_SAMPLE_RATES, BadInput, TooLarge, open_audio, read_upload
+from argus_cortex.limits import (
+    DEFAULT_SAMPLE_RATES,
+    BadInput,
+    TooLarge,
+    decode_base64,
+    open_audio,
+    read_body,
+    read_upload,
+)
+from argus_cortex.net import UrlRefused, afetch
 from fastapi import Depends, FastAPI, File, Form, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from starlette.requests import HTTPConnection
+from pydantic import BaseModel, ValidationError
+from starlette.requests import HTTPConnection, Request
 
 logger = structlog.get_logger()
 
@@ -88,6 +119,16 @@ STREAM_MIN_SILENCE_MS = _env_int("STT_STREAM_MIN_SILENCE_MS", 600)
 STREAM_MAX_UTTERANCE_S = _env_float("STT_STREAM_MAX_UTTERANCE_S", 30)
 STREAM_PARTIAL_S = _env_float("STT_STREAM_PARTIAL_S", 1.0)
 VAD_THRESHOLD = _env_float("STT_VAD_THRESHOLD", 0.5)
+# /transcriptions (agent-composer's route). Its byte and duration caps are MAX_UPLOAD_BYTES and MAX_SECONDS.
+VAD_FILTER = os.getenv("STT_VAD_FILTER", "1") == "1"
+AUDIO_URL_ALLOWED_HOSTS = tuple(h.strip().lower() for h in os.getenv("STT_AUDIO_URL_ALLOWED_HOSTS", "").split(",") if h.strip())
+AUDIO_URL_MAX_REDIRECTS = max(0, _env_int("STT_AUDIO_URL_MAX_REDIRECTS", 0))
+DOWNLOAD_TIMEOUT = _env_float("STT_DOWNLOAD_TIMEOUT", 30)
+DECODE_TIMEOUT = _env_float("STT_DECODE_TIMEOUT", 120)
+# Demuxers ffmpeg may pick (it probes the content, whatever the URL says). Plain audio/AV containers only: a playlist
+# or concat demuxer (hls, concat, ...) would open other resources named inside the audio. Names are ffmpeg's.
+_INPUT_FORMATS_RAW = os.getenv("STT_INPUT_FORMATS", "wav,w64,mp3,ogg,flac,webm,matroska,mp4,m4a,aac,aiff,caf,amr,au")
+INPUT_FORMATS = "" if _INPUT_FORMATS_RAW.strip().lower() == "none" else _INPUT_FORMATS_RAW.replace(" ", "")
 
 SAMPLE_RATE = 16000  # Whisper's rate; uploads at other rates are resampled
 ALLOWED_RATES = tuple(sorted({*DEFAULT_SAMPLE_RATES, 88200, 96000}))
@@ -129,7 +170,9 @@ class Backend(Protocol):
     def to_cpu(self) -> None: ...
     def to_device(self) -> None: ...
     def free(self) -> None: ...
-    def transcribe(self, samples: np.ndarray, sample_rate: int, language: Optional[str], word_timestamps: bool) -> dict: ...
+    def transcribe(
+        self, samples: np.ndarray, sample_rate: int, language: Optional[str], word_timestamps: bool, vad_filter: bool = False
+    ) -> dict: ...
 
 
 def resample(samples: np.ndarray, rate: int, target: int = SAMPLE_RATE) -> np.ndarray:
@@ -175,14 +218,16 @@ class WhisperBackend:
         self._model = None
         gc.collect()
 
-    def transcribe(self, samples: np.ndarray, sample_rate: int, language: Optional[str], word_timestamps: bool) -> dict:
+    def transcribe(
+        self, samples: np.ndarray, sample_rate: int, language: Optional[str], word_timestamps: bool, vad_filter: bool = False
+    ) -> dict:
         audio = resample(samples, sample_rate)
         segments, info = self._model.transcribe(
             audio,
             language=language,
             beam_size=BEAM_SIZE,
             word_timestamps=word_timestamps,
-            vad_filter=False,
+            vad_filter=vad_filter,
             condition_on_previous_text=False,
         )
         out = []
@@ -374,7 +419,9 @@ class Busy(Exception):
     pass
 
 
-async def run_transcription(samples: np.ndarray, rate: int, language: Optional[str], word_timestamps: bool) -> dict:
+async def run_transcription(
+    samples: np.ndarray, rate: int, language: Optional[str], word_timestamps: bool, *, vad_filter: bool = False
+) -> dict:
     """Wait (bounded) for a slot, take a lease and transcribe in a thread."""
     try:
         await asyncio.wait_for(_slots.acquire(), timeout=QUEUE_TIMEOUT_S)
@@ -382,7 +429,7 @@ async def run_transcription(samples: np.ndarray, rate: int, language: Optional[s
         raise Busy() from None
     try:
         async with mgr.lease() as backend:
-            return await asyncio.to_thread(backend.transcribe, samples, rate, language, word_timestamps)
+            return await asyncio.to_thread(backend.transcribe, samples, rate, language, word_timestamps, vad_filter)
     finally:
         _slots.release()
 
@@ -445,6 +492,178 @@ async def transcribe(
         if failure is None:
             raise
         return failure
+
+
+# ── POST /transcriptions (agent-composer's JSON route, for kimini-api) ───────
+
+AUDIO_URL_REJECTED = "audio_url is not an allowed http(s) URL"
+AUDIO_URL_FAILED = "Could not download audio_url"
+#: Tests replace these: a resolver (host, port) -> addresses for afetch, and an httpx transport.
+audio_url_resolver: Optional[Callable[[str, int], list[str]]] = None
+audio_url_transport: Any = None
+# argus_cortex.net's UrlRefused reasons for a fetch that was allowed but failed (502); every other refusal is a 400.
+_UPSTREAM_FAILURES = (
+    "could not fetch",
+    "could not connect",
+    "the fetch took longer",
+    "more than",  # ... redirects
+    "a redirect without",
+    "the response has an unsupported",
+    "the response body could not",
+)
+
+
+class TranscriptionsRequest(BaseModel):
+    """composer's body; unknown fields are ignored, as composer did."""
+
+    audio_url: Optional[str] = None
+    audio_base64: Optional[str] = None
+    language: Optional[str] = None
+
+
+class AudioURLError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _max_body_bytes() -> int:
+    """The JSON body: base64 of MAX_UPLOAD_BYTES plus room for the URL, the language and the JSON around them."""
+    return 4 * ((MAX_UPLOAD_BYTES + 2) // 3) + 64 * 1024
+
+
+async def fetch_audio_url(url: str) -> bytes:
+    """The body of *url* under argus-cortex's SSRF policy, capped at MAX_UPLOAD_BYTES. AudioURLError otherwise:
+    413 over the cap, 400 for a URL that may not be fetched, 502 when the fetch itself fails. The reason is logged;
+    the client gets a generic message (no resolved address, no upstream status)."""
+    try:
+        reply = await afetch(
+            url,
+            allow_hosts=AUDIO_URL_ALLOWED_HOSTS,
+            timeout=DOWNLOAD_TIMEOUT,
+            deadline=DOWNLOAD_TIMEOUT,
+            max_bytes=MAX_UPLOAD_BYTES,
+            max_redirects=AUDIO_URL_MAX_REDIRECTS,
+            resolve=audio_url_resolver,
+            transport=audio_url_transport,
+        )
+    except UrlRefused as exc:
+        reason = str(exc)
+        logger.warning("stt_audio_url_refused", reason=reason)
+        if reason.startswith("the response is larger than"):
+            raise AudioURLError(413, f"audio is larger than {MAX_UPLOAD_BYTES} bytes") from None
+        # Allowed, but the fetch failed: unreachable, too slow, redirected, or a body that can't be read. (Prefixes:
+        # a reason that names the host starts with it, and a host has no spaces.)
+        if reason.startswith(_UPSTREAM_FAILURES):
+            raise AudioURLError(502, AUDIO_URL_FAILED) from None
+        raise AudioURLError(400, AUDIO_URL_REJECTED) from None
+    if reply.status != 200:
+        logger.warning("stt_audio_url_fetch_failed", status=reply.status)
+        raise AudioURLError(502, AUDIO_URL_FAILED)
+    return reply.body
+
+
+def _is_wav_or_flac(data: bytes) -> bool:
+    return (data[:4] == b"RIFF" and data[8:12] == b"WAVE") or data[:4] == b"fLaC"
+
+
+def ffmpeg_decode(data: bytes) -> np.ndarray:
+    """Any audio ffmpeg can demux with a format in INPUT_FORMATS -> 16 kHz mono float32, at most MAX_SECONDS.
+
+    The bytes go in on stdin and the only protocol ffmpeg may open is ``pipe``, so nothing in them (a playlist, a
+    reference) can make it read a file or the network. Output stops just past MAX_SECONDS (``-t``), so a long or
+    lying stream costs no more than the cap. TooLarge past the cap, BadInput when ffmpeg can't decode it."""
+    limit = int(MAX_SECONDS * SAMPLE_RATE)
+    cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-protocol_whitelist", "pipe", "-format_whitelist", INPUT_FORMATS,
+        "-i", "pipe:0", "-map", "0:a:0", "-t", f"{MAX_SECONDS + 0.1:.3f}",
+        "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE), "pipe:1",
+    ]  # fmt: skip
+    try:
+        proc = subprocess.run(cmd, input=data, capture_output=True, timeout=DECODE_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("stt_decode_failed", error=str(exc)[:300])
+        raise BadInput("could not decode the audio") from None
+    if proc.returncode != 0:
+        logger.warning("stt_decode_failed", code=proc.returncode, error=proc.stderr.decode(errors="replace")[-300:])
+        raise BadInput("could not decode the audio")
+    samples = np.frombuffer(proc.stdout[: len(proc.stdout) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
+    if len(samples) > limit:
+        raise TooLarge(f"audio at {SAMPLE_RATE} Hz", limit, "frames")
+    if len(samples) == 0:
+        raise BadInput("audio has no samples")
+    return samples
+
+
+def decode_audio_bytes(data: bytes) -> tuple[np.ndarray, int]:
+    """WAV/FLAC through open_audio (as /transcribe); anything else through ffmpeg when INPUT_FORMATS allows it."""
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise TooLarge("audio", MAX_UPLOAD_BYTES)
+    if _is_wav_or_flac(data) or not INPUT_FORMATS:
+        clip = open_audio(data, max_seconds=MAX_SECONDS, allowed_rates=ALLOWED_RATES, max_bytes=MAX_UPLOAD_BYTES, mono=True)
+        return clip.samples, clip.sample_rate
+    return ffmpeg_decode(data), SAMPLE_RATE
+
+
+@app.post("/transcriptions")
+async def transcriptions(request: Request):
+    """agent-composer's whisper sidecar route, so kimini-api moves to echo unchanged: a JSON body with ``audio_url``
+    (fetched here) or ``audio_base64``, and ``{text, language, duration_seconds, confidence}`` back."""
+    try:
+        body = await read_body(request, _max_body_bytes(), what="request body")
+    except TooLarge as exc:
+        return _error(413, str(exc))
+    except BadInput as exc:
+        return _error(400, str(exc))
+    try:
+        req = TranscriptionsRequest.model_validate_json(body)
+    except ValidationError:
+        return _error(422, "the body must be a JSON object with audio_url or audio_base64 (strings) and language")
+    del body
+    if req.audio_url and req.audio_base64:
+        return _error(422, "Provide audio_url or audio_base64, not both")
+    if not req.audio_url and not req.audio_base64:
+        return _error(400, "audio_url or audio_base64 is required")
+    try:
+        lang = normalise_language(req.language)
+    except LanguageError as exc:
+        return _error(422, str(exc))
+    if mgr.state == State.LOADING:
+        return _error(503, "model loading", retry_after=10)
+
+    try:
+        if req.audio_url:
+            data = await fetch_audio_url(req.audio_url)
+        else:
+            data = await asyncio.to_thread(decode_base64, req.audio_base64, MAX_UPLOAD_BYTES, what="audio_base64")
+        req = None  # drop the base64 text before decoding
+        samples, rate = await asyncio.to_thread(decode_audio_bytes, data)
+    except AudioURLError as exc:
+        return _error(exc.status, exc.message)
+    except TooLarge as exc:
+        return _error(413, str(exc))
+    except BadInput as exc:
+        return _error(400, str(exc))
+    del data
+    try:
+        result = await run_transcription(samples, rate, lang, False, vad_filter=VAD_FILTER)
+    except Busy:
+        return _error(503, "busy: every transcription slot is taken", retry_after=5)
+    except RuntimeError as exc:
+        failure = _model_failure(exc)
+        if failure is None:
+            raise
+        return failure
+    prob = result.get("language_probability")
+    return {
+        "text": result["text"],
+        "language": result["language"] or "en",
+        "duration_seconds": round(float(result["duration"]), 3),
+        # faster-whisper's language probability, as composer reported it (1.0 when the language was given).
+        "confidence": round(float(prob), 4) if prob is not None else 1.0,
+    }
 
 
 # ── Streaming ─────────────────────────────────────────────────────────────────

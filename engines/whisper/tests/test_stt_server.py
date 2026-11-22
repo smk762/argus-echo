@@ -42,8 +42,10 @@ class FakeBackend:
     def free(self):
         self.events.append("free")
 
-    def transcribe(self, samples, sample_rate, language, word_timestamps):
-        self.calls.append({"n": len(samples), "rate": sample_rate, "language": language, "words": word_timestamps})
+    def transcribe(self, samples, sample_rate, language, word_timestamps, vad_filter=False):
+        self.calls.append(
+            {"n": len(samples), "rate": sample_rate, "language": language, "words": word_timestamps, "vad": vad_filter}
+        )
         dur = len(samples) / sample_rate
         seg = {"start": 0.0, "end": round(dur, 3), "text": f"heard {len(samples)} samples"}
         if word_timestamps:
@@ -119,7 +121,9 @@ class TranscribeTest(EngineTest):
     def test_stereo_is_averaged_to_mono_and_the_rate_kept(self):
         r = self.post(wav(seconds=0.5, rate=48000, channels=2))
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self.backend.calls[0], {"n": 24000, "rate": 48000, "language": None, "words": False})
+        self.assertEqual(
+            self.backend.calls[0], {"n": 24000, "rate": 48000, "language": None, "words": False, "vad": False}
+        )
 
     def test_flac_and_float_wav_are_read(self):
         for data in (wav(fmt="FLAC", subtype="PCM_16"), wav(subtype="FLOAT")):
