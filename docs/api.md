@@ -123,7 +123,9 @@ Each engine loads its model on first use and leaves the GPU after an idle period
 The `stt` contract, served by the **whisper** engine (published on `8144`). Its Python statement is
 [src/argus_echo/contract/stt.py](../src/argus_echo/contract/stt.py). An engine names what it serves in
 `GET /health` as `capabilities` (`["stt"]` here); an engine that names nothing is a TTS engine, and
-`argus-echo check` runs only the matching checks. Model choice and settings: [whisper.md](whisper.md).
+`argus-echo check` runs only the matching checks. Model choice and settings: [whisper.md](whisper.md). A Wyoming
+client (Home Assistant) reaches it through the `wyoming-whisper` bridge, which posts each utterance to
+`/transcribe` ([voice-cloning.md#home-assistant](voice-cloning.md#home-assistant)).
 
 | Method | Path | Notes |
 | --- | --- | --- |

@@ -1,7 +1,7 @@
 name: Engines
 
 # Each engine's unit tests, in that engine's own environment. They stub or mock the models, so no GPU or weights
-# are needed. Miso resolves its locked environment (torch 2.4) from engines/miso/uv.lock; XTTS and Qwen stub torch;
+# are needed. Miso resolves its locked environment (torch 2.9) from engines/miso/uv.lock; XTTS and Qwen stub torch;
 # Whisper takes a fake model and VAD, so faster-whisper is not installed.
 # Each engine's test dependencies are in its requirements-test.txt, which ai-code-auditor's validate_patch also reads.
 
@@ -55,7 +55,7 @@ jobs:
       - name: ruff (errors only)
         run: uvx ruff@0.15.16 check --select E9,F63,F7,F82 .
       - name: imports
-        run: uv run --no-project --python 3.11 --with-requirements requirements.txt python -c "import tts_bridge"
+        run: uv run --no-project --python 3.11 --with-requirements requirements.txt python -c "import tts_bridge, asr_bridge"
       - name: pytest
         run: uv run --no-project --python 3.11 --with-requirements requirements.txt --with pytest python -m pytest -q tests
 
@@ -65,7 +65,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Every profile resolves
         run: |
-          for p in miso xtts qwen whisper wyoming-xtts wyoming-miso; do
+          for p in miso xtts qwen whisper wyoming-xtts wyoming-miso wyoming-qwen wyoming-whisper; do
             docker compose --profile "$p" config -q && echo "$p ok"
           done
 

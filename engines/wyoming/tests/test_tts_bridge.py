@@ -98,6 +98,50 @@ class CloneKeyTests(_CacheCase):
         self.assertEqual([c.args[0].type for c in handler.write_event.call_args_list], ["audio-start", "audio-stop"])
 
 
+class StreamRateTests(unittest.TestCase):
+    def test_rate_comes_from_the_stream_header(self):
+        self.assertEqual(tts_bridge._stream_rate({"x-sample-rate": "16000"}), 16000)
+
+    def test_missing_or_bad_header_falls_back_to_24k(self):
+        for headers in ({}, {"x-sample-rate": "fast"}, {"x-sample-rate": "0"}, {"x-sample-rate": "10000000"}):
+            self.assertEqual(tts_bridge._stream_rate(headers), 24000, msg=headers)
+
+
+class SynthesizeStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def _synth(self, engine):
+        import httpx
+
+        real = httpx.AsyncClient
+
+        def client(**kwargs):
+            kwargs["transport"] = httpx.MockTransport(engine)
+            return real(**kwargs)
+
+        handler = tts_bridge.XttsEventHandler.__new__(tts_bridge.XttsEventHandler)
+        handler.write_event = mock.AsyncMock()
+        with mock.patch.object(tts_bridge.httpx, "AsyncClient", client):
+            await handler._synthesize(Synthesize(text="hello", voice=SynthesizeVoice(name="ryan")))
+        return [c.args[0] for c in handler.write_event.call_args_list]
+
+    async def test_audio_start_carries_the_engines_rate(self):
+        import httpx
+        import numpy as np
+
+        body = np.zeros(1600, dtype="<f4").tobytes()
+        events = await self._synth(lambda r: httpx.Response(200, content=body, headers={"X-Sample-Rate": "16000"}))
+        self.assertEqual([e.type for e in events], ["audio-start", "audio-chunk", "audio-stop"])
+        self.assertEqual(events[0].data["rate"], 16000)
+        self.assertEqual(events[1].data["rate"], 16000)
+
+    async def test_a_failed_request_still_answers_with_an_empty_clip(self):
+        import httpx
+
+        with self.assertLogs(level="ERROR"):
+            events = await self._synth(lambda r: httpx.Response(503, json={"error": "busy"}))
+        self.assertEqual([e.type for e in events], ["audio-start", "audio-stop"])
+        self.assertEqual(events[0].data["rate"], 24000)
+
+
 class CloneCacheTests(_CacheCase):
     async def test_deleted_clone_leaves_the_key_cache(self):
         calls = []
