@@ -1,5 +1,12 @@
 # Voice cloning: getting the best results
 
+**Clone on XTTS-v2.** It is the suite's cloning engine (argus-echo#51): consumers that clone (argus-mask,
+argus-proof's speech grids) use echo's XTTS, and fine-tunes go through argus-forge's XTTS-v2 path. It has the most
+built-in speakers (58, each in any of its 17 languages), averages several reference clips, and is the smallest
+engine (about 2 GB). Its weights are under the Coqui Public Model Licence, which is **non-commercial**: so are
+clones and fine-tunes made with it. If that matters, Qwen3-TTS (Apache-2.0) is the fallback. Miso and Qwen can
+still clone, as below, but they are outside the suite's cloning path.
+
 The engines clone differently, so the best reference differs per engine. argus-mask's
 [voices guide](https://github.com/smk762/argus-mask/blob/dev/docs/voices.md) covers recording, synthetic voices
 and consent in depth; this page is what each engine does with what you send.
@@ -46,7 +53,7 @@ and consent in depth; this page is what each engine does with what you send.
 
 - `/clone-voice` takes one clip and stores the Base model's prompt.
 - For a voice that doesn't exist, steer a CustomVoice speaker with a `voice_description` or an `instruction` (1.7B
-  model only) instead of cloning. A common route: design a voice on Qwen, then clone the result on Miso for quality.
+  model only) instead of cloning.
 
 ## After cloning
 

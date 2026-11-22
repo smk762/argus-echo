@@ -2,7 +2,8 @@
 
 [Coqui XTTS-v2](https://huggingface.co/coqui/XTTS-v2) through the maintained
 [`coqui-tts`](https://github.com/idiap/coqui-ai-TTS) fork: zero-shot cloning from several reference clips, 17
-languages, and streaming within a sentence. About 2 GB of VRAM, so it fits an 8 GB card.
+languages, and streaming within a sentence. About 2 GB of VRAM, so it fits an 8 GB card. It is the suite's
+cloning engine (argus-echo#51): clone voices here, and fine-tune it with argus-forge.
 
 Source: [engines/xtts/xtts_server.py](../engines/xtts/xtts_server.py). Contract: [api.md](api.md). Published on
 `8141` by `compose.yaml` (`--profile xtts`).
