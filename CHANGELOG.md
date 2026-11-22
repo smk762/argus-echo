@@ -3,8 +3,9 @@
 ## [Unreleased]
 
 ### Changed
-- `gpu-tenant.yaml` gives Qwen `vram_mb: 5500`, measured for compose's default (0.6b with `both`, which can clone)
-  on dragon's RTX 4060 with 0.3.0: 4366 MiB loaded, 5178 MiB peak speaking a clone, 178 MiB evicted (#6). The
+- `gpu-tenant.yaml` gives Qwen `vram_mb: 5800`, measured for compose's default (0.6b with `both`, which can clone)
+  on dragon's RTX 4060 with 0.3.0: 4366 MiB loaded, 5178 MiB peak speaking a short clone, 5692 MiB speaking 27 s
+  clones (a longer generation grows the working set, and torch keeps it cached), 178 MiB evicted (#6). The
   4800 it replaces was measured for 1.7b CustomVoice only, and its guess that 0.6b `both` would fit inside it was
   wrong.
 
