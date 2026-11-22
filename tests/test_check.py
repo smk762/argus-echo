@@ -140,6 +140,17 @@ def test_check_reports_stock_weights_not_yet_hashed() -> None:
     assert found["image"] == "version=unset revision=unset"
 
 
+def test_check_reports_the_runtime_libraries() -> None:
+    runtime = {"python": "3.11.18", "torch": "2.6.0+cu124", "cuda": "12.4", "cudnn": "90100", "coqui-tts": None}
+    health = {**HEALTH, "image": {"version": "0.3.0", "revision": "abc", "runtime": runtime}}
+    report = check("http://e", transport=engine(health=health))
+    assert report.ok, report.findings
+    found = {f.name: f.detail for f in report.findings}
+    assert found["image"] == (
+        "version=0.3.0 revision=abc; python=3.11.18 torch=2.6.0+cu124 cuda=12.4 cudnn=90100 coqui-tts=none"
+    )
+
+
 def test_check_fails_malformed_weights() -> None:
     health = {**HEALTH, "weights": {"checkpoint": None, "files": [{"name": "model.pth", "sha256": "nope"}]}}
     report = check("http://e", transport=engine(health=health))

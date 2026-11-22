@@ -2495,7 +2495,7 @@ async def health():
         "keep_alive_cpu": KEEP_ALIVE_CPU,
         "gpu": gpu_info,
         "weights": _mgr.weights,
-        "image": _image(),
+        "image": await asyncio.to_thread(_image),
     }
 
 
@@ -2588,9 +2588,42 @@ class LoadRequest(BaseModel):
 
 
 def _image() -> dict:
-    """``/health``'s ``image``: the release and git revision baked in at build time (null for a local build). A
-    container can't see its own image digest; whoever deployed it (compose, iris) knows that."""
-    return {"version": ECHO_VERSION, "revision": ECHO_REVISION}
+    """``/health``'s ``image``: the release and git revision baked in at build time (null for a local build), and the
+    runtime libraries (_runtime). A container can't see its own image digest; whoever deployed it (compose, iris)
+    knows that. Blocking the first time: call it in a thread."""
+    return {"version": ECHO_VERSION, "revision": ECHO_REVISION, "runtime": _runtime()}
+
+
+# What shapes the audio besides the weights and the code: two builds of one revision can install different
+# libraries (#32), so /health names them. Read once (importlib.metadata, and torch for CUDA and cuDNN).
+RUNTIME_PACKAGES = ("qwen-tts", "transformers", "accelerate", "torchaudio", "numpy")
+
+
+@functools.lru_cache(maxsize=1)
+def _runtime() -> dict:
+    """``/health``'s ``image.runtime``: ``{name: version or None}`` for python, torch, CUDA, cuDNN and
+    RUNTIME_PACKAGES. Blocking the first time (it imports torch): call it in a thread."""
+    import importlib.metadata
+    import platform
+
+    out: dict = {"python": platform.python_version(), "torch": None, "cuda": None, "cudnn": None}
+    torch = None
+    with contextlib.suppress(ImportError):  # no torch installed (the engines' tests): torch, cuda, cudnn stay null
+        import torch
+    if torch is not None:
+        version = getattr(torch, "__version__", None)
+        out["torch"] = str(version) if version else None
+        out["cuda"] = getattr(getattr(torch, "version", None), "cuda", None)
+        cudnn = None
+        with contextlib.suppress(Exception):  # a CPU-only build, or a stand-in torch, has no cuDNN to name
+            cudnn = torch.backends.cudnn.version()
+        out["cudnn"] = str(cudnn) if cudnn else None
+    for name in RUNTIME_PACKAGES:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
 
 
 @app.post("/admin/load", dependencies=[Depends(_require_admin)])

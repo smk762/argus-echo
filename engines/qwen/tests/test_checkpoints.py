@@ -310,9 +310,24 @@ class AdminLoadTests(CheckpointTestCase):
         self.assertEqual(len(opened), 12)
 
     def test_health_reports_the_image_identity(self):
-        self.assertEqual(self.client.get("/health").json()["image"], {"version": None, "revision": None})
+        image = self.client.get("/health").json()["image"]
+        self.assertEqual((image["version"], image["revision"]), (None, None))
         with mock.patch.object(tts_server, "ECHO_VERSION", "0.2.0"), mock.patch.object(tts_server, "ECHO_REVISION", "abc"):
-            self.assertEqual(self.client.get("/health").json()["image"], {"version": "0.2.0", "revision": "abc"})
+            image = self.client.get("/health").json()["image"]
+        self.assertEqual((image["version"], image["revision"]), ("0.2.0", "abc"))
+
+    def test_health_reports_the_runtime_libraries(self):
+        """#32: the library versions that shape the audio, so a revision isn't mistaken for a fixed stack."""
+        import importlib.metadata
+
+        versions = {"qwen-tts": "0.1.1", "transformers": "4.57.3", "accelerate": "1.12.0", "torchaudio": "2.6.0",
+                    "numpy": "2.4.6"}
+        tts_server._runtime.cache_clear()
+        self.addCleanup(tts_server._runtime.cache_clear)
+        with mock.patch.object(importlib.metadata, "version", lambda name: versions[name]):
+            runtime = self.client.get("/health").json()["image"]["runtime"]
+        self.assertEqual({k: runtime[k] for k in versions}, versions)
+        self.assertEqual(set(runtime), {"python", "torch", "cuda", "cudnn", *versions})
 
 
 class SeedTests(CheckpointTestCase):

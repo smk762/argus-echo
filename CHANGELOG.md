@@ -12,6 +12,12 @@
   speaker embedding's dtype (bfloat16 included) in its metadata (#6).
 
 ### Added
+- `/health` `image.runtime` on every engine (#32): the versions of python, torch, CUDA and cuDNN (torch engines)
+  and each engine's libraries (coqui-tts, qwen-tts, moshi, faster-whisper and ctranslate2, transformers, ...),
+  read once from the running process. A revision doesn't fix the stack, so reproducibility claims compare
+  `runtime` too. Whisper's `/health` gains `image` (`version`, `revision`, `runtime`), and its image now takes
+  the release's `ECHO_VERSION`/`ECHO_REVISION` build args. `ImageIdentity.runtime` in the contract;
+  `argus-echo check` prints it.
 - `QWEN_TAG` picks the Qwen image's tag on its own (default `ECHO_TAG`). The published image bakes 0.6b, so a host
   running 1.7b builds it locally under its own tag while `ECHO_TAG` keeps pulling the published images for the
   other engines.

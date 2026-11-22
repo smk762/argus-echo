@@ -58,12 +58,14 @@ Env vars:
                           wait up to STT_QUEUE_TIMEOUT_S, then 503. Bounds the bytes held and the ffmpeg processes run
   STT_INPUT_FORMATS     — ffmpeg demuxers /transcribe and /transcriptions may decode non-WAV/FLAC audio with (comma
                           list; default plain audio containers, no playlists). "none" accepts WAV/FLAC only
+  ECHO_VERSION / ECHO_REVISION — the image's release and git revision (build args), reported in /health as ``image``
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import gc
 import json
 import os
@@ -107,6 +109,9 @@ def _env_int(name: str, default: int) -> int:
 # "large-v3-turbo" alias downloads (MIT, like the original), pinned to one commit.
 MODEL_REPO = os.getenv("STT_MODEL", "mobiuslabsgmbh/faster-whisper-large-v3-turbo")
 MODEL_REVISION = os.getenv("STT_MODEL_REVISION", "0a363e9161cbc7ed1431c9597a8ceaf0c4f78fcf")
+# The image's identity, baked in at build time (release.yml); None for a local build.
+ECHO_VERSION: Optional[str] = os.getenv("ECHO_VERSION", "").strip() or None
+ECHO_REVISION: Optional[str] = os.getenv("ECHO_REVISION", "").strip() or None
 MODEL_PATH = os.getenv("STT_MODEL_PATH", "")
 DEVICE = os.getenv("STT_DEVICE", "cuda")
 COMPUTE_TYPE = os.getenv("STT_COMPUTE_TYPE", "float16" if DEVICE.startswith("cuda") else "int8")
@@ -983,6 +988,26 @@ def _gpu_block() -> dict:
     }
 
 
+# What shapes the transcript besides the weights and the code: two builds of one revision can install different
+# libraries (#32), so /health names them. CTranslate2 bundles no CUDA; the pip-installed cuBLAS and cuDNN are listed.
+RUNTIME_PACKAGES = ("faster-whisper", "ctranslate2", "nvidia-cublas-cu12", "nvidia-cudnn-cu12", "numpy")
+
+
+@functools.lru_cache(maxsize=1)
+def _runtime() -> dict:
+    """``/health``'s ``image.runtime``: ``{name: version or None}`` for python and RUNTIME_PACKAGES, read once."""
+    import importlib.metadata
+    import platform
+
+    out: dict = {"python": platform.python_version()}
+    for name in RUNTIME_PACKAGES:
+        try:
+            out[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            out[name] = None
+    return out
+
+
 @app.get("/health")
 async def health():
     if mgr.state == State.LOADING:
@@ -1002,6 +1027,9 @@ async def health():
         "keep_alive_cpu": KEEP_ALIVE_CPU,
         "streams": _sessions,
         "gpu": _gpu_block(),
+        # The release and revision baked in at build time, and the runtime libraries; a container can't see its own
+        # image digest.
+        "image": {"version": ECHO_VERSION, "revision": ECHO_REVISION, "runtime": _runtime()},
     }
     if mgr.state == State.ERROR:
         body["error"] = mgr.error

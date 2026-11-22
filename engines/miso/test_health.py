@@ -18,12 +18,20 @@ class HealthTest(unittest.TestCase):
         ResidentHealth.model_validate(body)
         self.assertEqual(body["capabilities"], ["tts"])
         self.assertEqual(body["engine"], "miso")  # clients key on it (docs/api.md)
-        self.assertEqual(body["image"], {"version": None, "revision": None})
+        # image also carries runtime, checked below; a local build has no release identity.
+        self.assertEqual((body["image"]["version"], body["image"]["revision"]), (None, None))
 
     def test_health_reports_the_image_identity(self):
         with mock.patch.object(srv, "ECHO_VERSION", "0.2.0"), mock.patch.object(srv, "ECHO_REVISION", "abc123"):
             body = TestClient(srv.app).get("/health").json()
-        self.assertEqual(body["image"], {"version": "0.2.0", "revision": "abc123"})
+        self.assertEqual((body["image"]["version"], body["image"]["revision"]), ("0.2.0", "abc123"))
+
+    def test_health_reports_the_runtime_libraries(self):
+        """#32: the library versions that shape the audio (null for one that isn't installed)."""
+        runtime = TestClient(srv.app).get("/health").json()["image"]["runtime"]
+        expected = {"python", "torch", "cuda", "cudnn", "moshi", "transformers", "torchaudio", "numpy"}
+        self.assertEqual(set(runtime), expected)
+        self.assertTrue(runtime["python"])
 
 
 if __name__ == "__main__":
