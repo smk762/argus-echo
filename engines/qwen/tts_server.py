@@ -2466,15 +2466,17 @@ def _runtime() -> dict:
     import platform
 
     out: dict = {"python": platform.python_version(), "torch": None, "cuda": None, "cudnn": None}
-    try:
+    torch = None
+    with contextlib.suppress(ImportError):  # no torch installed (the engines' tests): torch, cuda, cudnn stay null
         import torch
-
-        out["torch"] = str(torch.__version__)
-        out["cuda"] = getattr(torch.version, "cuda", None)
-        cudnn = torch.backends.cudnn.version()
+    if torch is not None:
+        version = getattr(torch, "__version__", None)
+        out["torch"] = str(version) if version else None
+        out["cuda"] = getattr(getattr(torch, "version", None), "cuda", None)
+        cudnn = None
+        with contextlib.suppress(Exception):  # a CPU-only build, or a stand-in torch, has no cuDNN to name
+            cudnn = torch.backends.cudnn.version()
         out["cudnn"] = str(cudnn) if cudnn else None
-    except Exception:  # no torch (tests), or no CUDA build: those stay null
-        pass
     for name in RUNTIME_PACKAGES:
         try:
             out[name] = importlib.metadata.version(name)
