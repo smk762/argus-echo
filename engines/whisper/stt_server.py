@@ -551,7 +551,8 @@ async def _stream(ws: WebSocket) -> None:
         min_silence=round(STREAM_MIN_SILENCE_MS / 1000 / frame_s),
         max_frames=round(STREAM_MAX_UTTERANCE_S / frame_s),
     )
-    preroll_frames = round(0.3 / frame_s)
+    # The frames that confirmed the onset, plus 200 ms before it, so the first word is not clipped.
+    preroll_frames = endpointer.min_speech + round(0.2 / frame_s)
     vad = vad_factory()
     language: Optional[str] = None
     word_timestamps = False
