@@ -35,9 +35,14 @@ residents:
     warm_path: /admin/wake
     admin_auth: true
 
+  # Qwen3-TTS 1.7b, CustomVoice only (QWEN_LOAD_MODELS=custom_voice): measured on dragon's RTX 4060 (8 GB), CUDA
+  # context included: 4.8 GB of device memory loaded, and a generation stays inside it (torch: 4.0 GB allocated,
+  # 4.5 GB reserved); 4.4 GB just after /admin/wake. /admin/evict and /admin/unload leave only the CUDA context
+  # (~150 MB). Loading Base as well (`both`, needed for cloning) and the 0.6b size are not measured yet (#6).
   - name: qwen
     adapter: argus-http
     container: argus-echo-qwen
+    vram_mb: 4800
     health_path: /health
     unload_path: /admin/unload
     evict_path: /admin/evict

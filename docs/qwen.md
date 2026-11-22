@@ -62,8 +62,8 @@ use the first index in `order`). The response has the XTTS shape (`clips`, `orde
 | --- | --- | --- |
 | `TTS_MODEL_SIZE` | `0.6b` | `0.6b` or `1.7b` (compose: `QWEN_MODEL_SIZE`, also the image build arg) |
 | `TTS_DEVICE` | `cuda:0` | `cuda:N` or `cpu` |
-| `TTS_LOAD_MODELS` | `both` | `both`, `custom_voice` or `base` |
-| `TTS_DEFAULT_SPEAKER` | empty | Speaker for requests that name none |
+| `TTS_LOAD_MODELS` | `both` | `both`, `custom_voice` or `base` (compose: `QWEN_LOAD_MODELS`) |
+| `TTS_DEFAULT_SPEAKER` | empty | Speaker for requests that name none (compose: `QWEN_DEFAULT_SPEAKER`) |
 | `TTS_PRELOAD` | `0` | `1` loads at startup |
 | `TTS_KEEP_ALIVE_GPU` | `120` | Idle seconds on the GPU before moving to CPU. `-1` = never, `0` = at once |
 | `TTS_KEEP_ALIVE_CPU` | `600` | Idle seconds on CPU before unloading. `-1` = never, `0` = at once |
