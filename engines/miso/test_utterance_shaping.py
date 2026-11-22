@@ -115,6 +115,8 @@ class LengthBudgetTest(unittest.TestCase):
 class _ChunkGenerator:
     """Yields fixed chunks of constant, full-level audio; generate() returns all of it."""
 
+    _text_tokenizer = _Tokenizer()  # the prompt-length check counts the text's tokens
+
     def __init__(self, sizes, level=0.1):
         self.chunks = [np.full(n, level, dtype=np.float32) for n in sizes]
 
@@ -184,9 +186,16 @@ class RequestContextTest(unittest.TestCase):
             return srv._prepare_generation(req)
 
     def test_no_context_is_unchanged(self):
-        speaker, context, *_ = self._prepare(None, gen=object())  # generator not consulted
+        speaker, context, *_ = self._prepare(None)
         self.assertEqual(speaker, 3)
         self.assertEqual(context, [self.ref])
+
+    def test_overlong_reference_without_context_is_422_material(self):
+        # No request context, but the reference alone leaves no room to generate:
+        # the same ValueError as with context, not a mid-stream Generator failure.
+        self.ref.audio = torch.zeros(FRAME * 2040)
+        with self.assertRaisesRegex(ValueError, "too long for the prompt"):
+            self._prepare(None)
 
     def test_reference_first_then_request_segments_in_order(self):
         older = np.full(FRAME * 3, 0.2, dtype=np.float32)

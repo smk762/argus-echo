@@ -170,6 +170,8 @@ Response `200`:
   `recommended` is `score >= MISO_ANALYZE_THRESHOLD`.
 - `flags` can include `clipping`, `noisy`, `very_short`, `vad_no_speech`,
   `vad_failed:…`, `unreadable:…`.
+- `speech_seconds` is `0` with `vad_no_speech`. With `vad_failed:…` it is
+  unknown and falls back to `raw_seconds`.
 - `order` lists clip indexes best first; `rank` is each clip's position in it.
 - `consistency` is always `null`: Miso has no speaker embedding to compare clips with.
 - `gpt_cond_len` is `MISO_REF_MAX_SECONDS`, kept under the XTTS key name.
@@ -190,7 +192,7 @@ Request: `multipart/form-data`:
 | --- | --- | --- |
 | `audio` | yes, one or more | Reference clips. Each is converted to mono 24 kHz, high-passed, VAD-trimmed (when `MISO_PREPROCESS=1`) and loudness-normalised, then all are joined and capped at `MISO_REF_MAX_SECONDS` |
 | `companion_id` | yes | Storage id. Used as given in `voice_clones/<companion_id>/`; cloning the same id again replaces the clone but keeps any `temperature`/`topk` in its `meta.json` |
-| `reference_text` | no | Transcript of the reference audio. Strongly recommended. If empty and `MISO_WHISPER_URL` is set, the first clip is transcribed |
+| `reference_text` | no | Transcript of the reference audio. Strongly recommended. If empty and `MISO_WHISPER_URL` is set, the stored reference (the joined, trimmed clips) is transcribed |
 | `voice_name` | no | Display name; defaults to `companion_id` |
 
 Response `200`: the clone's metadata, plus `duration` and a per-clip
@@ -255,14 +257,17 @@ Request: `multipart/form-data`:
 | `archive` | yes | The zip. Must contain a `prompt.pt` (up to 64 MB) with a `ref_audio` tensor; `meta.json` is optional |
 | `companion_id` | no | Id to store under. Default: the archive's `companion_id`, then `voice_name`, then its name. Always slugified |
 | `voice_name` | no | Display name override |
+| `replace` | no | `true` overwrites a clone already stored under the target id. Default `false` |
 
 `prompt.pt` is loaded with `torch.load(weights_only=True)`, so archives cannot
 run code.
 
 Response `200`: the new metadata (with `"imported": true`) plus `duration`.
 `413` if the archive is over `MISO_MAX_ARCHIVE_MB` (64 MB by default), or the
-body over that + 1 MB (refused before it is written to disk). `422`
-for a bad zip, a missing or invalid `prompt.pt`, or a `prompt.pt` or
+body over that + 1 MB (refused before it is written to disk). `409` if the
+target id already has a clone and `replace` is not `true`. `422`
+for a bad zip, a missing or invalid `prompt.pt` (including a malformed
+`speaker` or `sample_rate`, or an empty `ref_audio`), or a `prompt.pt` or
 `meta.json` that is too large.
 
 ## GET /speakers

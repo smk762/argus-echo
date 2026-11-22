@@ -5,6 +5,7 @@ Needs fastapi, python-multipart, httpx and structlog.
 Run from engines/qwen/: python -m pytest tests -q (see the README for the uv command)
 """
 import asyncio
+import contextlib
 import os
 import sys
 import types
@@ -418,29 +419,32 @@ class CloneVoiceTests(unittest.TestCase):
             tts_server._mgr._idle.set()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class SynthesiseFileIoTests(unittest.TestCase):
     """630f3c112e: the WAV is written and read back off the event loop, not on it."""
 
     def test_synthesise_does_no_file_io_on_the_event_loop_thread(self):
         import builtins
+        import io
+        import tempfile
         import threading
 
         import numpy as np
+        import soundfile as sf
 
-        loop_thread = threading.get_ident()
-        on_loop = []
-        real_open = builtins.open
+        loop_thread = None  # set by fake_generate, which runs on the event loop
+        on_loop, off_loop = [], []
 
-        def spy_open(*args, **kwargs):
-            if threading.get_ident() == loop_thread:
-                on_loop.append(args[0] if args else kwargs.get("file"))
-            return real_open(*args, **kwargs)
+        def spy(name, real):
+            def wrapper(*args, **kwargs):
+                (on_loop if threading.get_ident() == loop_thread else off_loop).append(name)
+                return real(*args, **kwargs)
+
+            return wrapper
 
         async def fake_generate(req):
+            nonlocal loop_thread
+            loop_thread = threading.get_ident()
             return np.zeros(2400, dtype="<f4"), 24000
 
         uploaded = {}
@@ -449,12 +453,201 @@ class SynthesiseFileIoTests(unittest.TestCase):
             uploaded["bytes"] = data
             return f"s3://bucket/{key}"
 
-        with mock.patch.object(tts_server, "_generate_audio", fake_generate), \
-                mock.patch.object(tts_server, "_upload_to_s3", fake_upload), \
-                mock.patch.object(tts_server, "open", spy_open, create=True):
+        # Every way the WAV can reach the disk, not just a bare open() in tts_server:
+        # soundfile writes through libsndfile, tempfile opens through io.open.
+        targets = [
+            (builtins, "open"), (io, "open"), (os, "open"), (os, "unlink"),
+            (tempfile, "NamedTemporaryFile"), (sf, "write"), (sf, "read"), (sf, "info"), (sf, "SoundFile"),
+        ]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(tts_server, "_generate_audio", fake_generate))
+            stack.enter_context(mock.patch.object(tts_server, "_upload_to_s3", fake_upload))
+            for module, name in targets:
+                label = f"{module.__name__}.{name}"
+                stack.enter_context(mock.patch.object(module, name, spy(label, getattr(module, name))))
             out = asyncio.run(tts_server.synthesise(tts_server.SynthesiseRequest(text="hi", speaker="ryan")))
 
+        self.assertIsNotNone(loop_thread)
         self.assertEqual(on_loop, [])
+        # The spies did see the WAV being written and read back, on another thread:
+        # an empty on_loop means something only if the I/O was observed at all.
+        self.assertIn("soundfile.write", off_loop)
+        self.assertTrue({"builtins.open", "io.open"} & set(off_loop), off_loop)
         self.assertAlmostEqual(out["duration"], 0.1, places=3)
         self.assertTrue(uploaded["bytes"].startswith(b"RIFF"))
 
+
+class S3CredentialTests(unittest.TestCase):
+    """No fallback to MinIO's stock root credentials."""
+
+    def test_missing_credentials_are_refused(self):
+        for key, secret in (("", ""), ("key", ""), ("", "secret")):
+            with mock.patch.object(tts_server, "S3_ACCESS_KEY_ID", key), \
+                    mock.patch.object(tts_server, "S3_SECRET_ACCESS_KEY", secret), \
+                    mock.patch.object(tts_server, "_s3_client", None):
+                with self.assertRaisesRegex(RuntimeError, "S3_ACCESS_KEY_ID"):
+                    tts_server._require_s3_credentials()
+                with self.assertRaisesRegex(RuntimeError, "S3_ACCESS_KEY_ID"):
+                    tts_server._get_s3_client()
+
+    def test_module_has_no_default_credentials(self):
+        import importlib
+
+        env = {k: v for k, v in os.environ.items() if k not in ("S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            spec = importlib.util.spec_from_file_location("tts_server_noenv", tts_server.__file__)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        self.assertEqual((module.S3_ACCESS_KEY_ID, module.S3_SECRET_ACCESS_KEY), ("", ""))
+
+    def test_startup_fails_without_credentials(self):
+        async def start():
+            async with tts_server.lifespan(tts_server.app):
+                pass
+
+        with mock.patch.object(tts_server, "S3_ACCESS_KEY_ID", ""), \
+                mock.patch.object(tts_server, "S3_SECRET_ACCESS_KEY", ""):
+            with self.assertRaisesRegex(RuntimeError, "S3_ACCESS_KEY_ID"):
+                asyncio.run(start())
+
+    def test_configured_credentials_reach_boto3(self):
+        boto3 = mock.Mock()
+        with mock.patch.object(tts_server, "S3_ACCESS_KEY_ID", "key"), \
+                mock.patch.object(tts_server, "S3_SECRET_ACCESS_KEY", "secret"), \
+                mock.patch.object(tts_server, "_s3_client", None), \
+                mock.patch.dict(sys.modules, {"boto3": boto3}):
+            tts_server._get_s3_client()
+        kwargs = boto3.client.call_args.kwargs
+        self.assertEqual((kwargs["aws_access_key_id"], kwargs["aws_secret_access_key"]), ("key", "secret"))
+
+
+@mock.patch.object(tts_server, "DEVICE", "cuda:0")
+class FailedTransitionTests(unittest.IsolatedAsyncioTestCase):
+    """A load or move that fails part-way must not leave weights resident."""
+
+    async def test_partial_load_failure_frees_the_base_model(self):
+        mgr = TTSModelManager()
+        mgr.keep_alive_gpu, mgr.keep_alive_cpu = -1, -1
+        seen_on_entry = []
+
+        def load(device):
+            seen_on_entry.append(mgr._base_model)
+            mgr._base_model = FakeWrapper()  # base loads…
+            if len(seen_on_entry) == 1:
+                raise RuntimeError("CUDA out of memory")  # …custom_voice does not
+            mgr._custom_model = FakeWrapper()
+
+        mgr._load = load
+        with self.assertRaises(RuntimeError):
+            async with mgr.use():
+                pass
+        self.assertEqual(mgr.state, TTSState.ERROR)
+        self.assertIsNone(mgr.base_model)
+        self.assertIsNone(mgr.custom_model)
+
+        async with mgr.use():
+            self.assertEqual(mgr.state, TTSState.GPU)
+        self.assertEqual(seen_on_entry, [None, None])  # the retry did not load beside an old copy
+
+    async def test_failed_promotion_frees_the_models(self):
+        mgr = _manager(gpu=-1, cpu=-1)
+        mgr._state = TTSState.CPU
+
+        def move(device):
+            raise RuntimeError("CUDA out of memory")
+
+        mgr._move_to_device = move
+        with self.assertRaisesRegex(RuntimeError, "out of memory"):
+            async with mgr.use():
+                pass
+        self.assertEqual(mgr._in_use, 0)
+        self.assertEqual(mgr.state, TTSState.ERROR)  # not "cpu" with weights half on the GPU
+        self.assertIsNone(mgr.base_model)
+        self.assertIsNone(mgr.custom_model)
+        self.assertFalse(mgr.is_ready)
+
+    async def test_failed_idle_demotion_is_logged_and_frees_the_models(self):
+        mgr = _manager(gpu=0.01, cpu=-1)
+
+        def move(device):
+            raise RuntimeError("cannot allocate memory")
+
+        mgr._move_to_device = move
+        with mock.patch.object(tts_server, "logger") as log:
+            async with mgr.use():
+                pass
+            task = mgr._evict_task
+            await asyncio.wait_for(asyncio.shield(task), 2)
+            self.assertIsNone(task.exception())  # not an unretrieved task exception
+            events = [c.args[0] for c in log.error.call_args_list]
+        self.assertIn("tts_eviction_failed", events)
+        self.assertEqual(mgr.state, TTSState.ERROR)
+        self.assertIsNone(mgr.base_model)
+
+
+class _Models:
+    def __init__(self, base=None, custom=None):
+        self.base_model, self.custom_model, self.state = base, custom, TTSState.GPU
+
+
+class GenerationErrorTests(unittest.TestCase):
+    def _run(self, models, **req):
+        import json
+
+        with mock.patch.object(tts_server, "_mgr", models), mock.patch.object(tts_server, "DEFAULT_SPEAKER", ""):
+            out = asyncio.run(tts_server._generate_audio_leased(tts_server.SynthesiseRequest(**req)))
+        self.assertIsInstance(out, tts_server.JSONResponse)
+        return out.status_code, json.loads(out.body)
+
+    def test_empty_model_output_is_a_structured_error(self):
+        custom = mock.Mock()
+        custom.generate_custom_voice.return_value = ([], 24000)
+        status, body = self._run(_Models(custom=custom), text="…", speaker="ryan")
+        self.assertEqual(status, 500)
+        self.assertEqual(body["error"], "TTS produced no audio")
+        self.assertTrue(body["request_id"])
+
+    def test_voice_design_fallback_without_speakers_is_503(self):
+        custom = mock.Mock()
+        custom.get_supported_speakers.return_value = []
+        status, body = self._run(_Models(custom=custom), text="hi", voice_description="a calm voice")
+        self.assertEqual(status, 503)
+        self.assertIn("no speaker", body["error"])
+        custom.generate_custom_voice.assert_not_called()
+
+    def test_voice_design_fallback_uses_the_first_speaker(self):
+        import numpy as np
+
+        custom = mock.Mock()
+        custom.get_supported_speakers.return_value = ["vivian", "ryan"]
+        custom.generate_custom_voice.return_value = ([np.zeros(10, dtype="<f4")], 24000)
+        with mock.patch.object(tts_server, "_mgr", _Models(custom=custom)), \
+                mock.patch.object(tts_server, "DEFAULT_SPEAKER", ""):
+            req = tts_server.SynthesiseRequest(text="hi", voice_description="a calm voice")
+            audio, rate = asyncio.run(tts_server._generate_audio_leased(req))
+        self.assertEqual((len(audio), rate), (10, 24000))
+        self.assertEqual(custom.generate_custom_voice.call_args.kwargs["speaker"], "ryan")
+
+    def test_internal_exception_text_stays_out_of_the_response(self):
+        secret = "/srv/models/private/clone.pt"
+        for exc, status in (
+            (OSError(f"cannot read {secret}"), 500),
+            (RuntimeError(f"shape mismatch at {secret}"), 500),
+            (RuntimeError(f"CUDA out of memory at {secret}"), 503),
+        ):
+            custom = mock.Mock()
+            custom.generate_custom_voice.side_effect = exc
+            with mock.patch.object(tts_server, "_gpu_memory_info", return_value=None), \
+                    mock.patch.object(tts_server, "logger") as log:
+                got, body = self._run(_Models(custom=custom), text="hi", speaker="ryan")
+            self.assertEqual(got, status, exc)
+            self.assertNotIn("/srv/models", str(body), exc)
+            self.assertNotIn("detail", body)
+            # The full text is in the log, under the id the client was given.
+            logged = log.error.call_args
+            self.assertIn(secret, logged.kwargs["error"])
+            self.assertEqual(logged.kwargs["request_id"], body["request_id"])
+
+
+if __name__ == "__main__":
+    unittest.main()

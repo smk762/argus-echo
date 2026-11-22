@@ -25,7 +25,7 @@ def llama3_2_8B():
         embed_dim=4096,
         max_seq_len=2048,
         intermediate_dim=14_336,
-        attn_dropout=0.1,
+        attn_dropout=0.0,  # inference only: no dropout even if .eval() is missed
         norm_eps=1e-5,
         rope_base=500_000,
         scale_factor=32,
@@ -41,7 +41,7 @@ def llama3_2_300M():
         embed_dim=1536,
         max_seq_len=2048,
         intermediate_dim=6912,
-        attn_dropout=0.1,
+        attn_dropout=0.0,  # inference only: no dropout even if .eval() is missed
         norm_eps=1e-5,
         rope_base=500_000,
         scale_factor=32,

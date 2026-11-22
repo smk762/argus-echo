@@ -81,8 +81,10 @@ PRELOAD = os.getenv("TTS_PRELOAD", "0") == "1"
 KEEP_ALIVE_GPU: float = float(os.getenv("TTS_KEEP_ALIVE_GPU", "120"))
 KEEP_ALIVE_CPU: float = float(os.getenv("TTS_KEEP_ALIVE_CPU", "600"))
 S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "http://localhost:9000")
-S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "minioadmin")
-S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "minioadmin")
+# No default credentials: a deployment that forgot them must not run on MinIO's
+# well-known root account. See _require_s3_credentials().
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "").strip()
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "").strip()
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "voice")
 S3_PUBLIC_URL = os.getenv("S3_PUBLIC_URL", "http://localhost:9000/voice")
 
@@ -254,6 +256,10 @@ class TTSModelManager:
         try:
             await asyncio.to_thread(self._load, DEVICE)
         except Exception as exc:
+            # _load assigns the base model before it loads custom_voice. Free what
+            # it got as far as, or that copy stays on the GPU with no idle timer
+            # and the retry allocates a second one beside it.
+            self._free_models()
             self._state = TTSState.ERROR
             self._error = str(exc)
             logger.error("tts_load_failed", error=str(exc))
@@ -280,7 +286,17 @@ class TTSModelManager:
         where the weights are."""
 
         async def run() -> None:
-            await asyncio.to_thread(self._move_to_device, device)
+            try:
+                await asyncio.to_thread(self._move_to_device, device)
+            except Exception as exc:
+                # Part of the weights may have moved: neither device's state is
+                # true any more, and no idle timer is armed. Drop the models so
+                # nothing stays resident; the next request loads them afresh.
+                self._free_models()
+                self._state = TTSState.ERROR
+                self._error = str(exc)
+                logger.error("tts_move_failed", target=device, error=str(exc))
+                raise
             self._state = state
             if self._in_use == 0 and not self._lock.locked():
                 # Its caller was cancelled and nobody else holds the lock: arm
@@ -381,7 +397,8 @@ class TTSModelManager:
             if self._state == TTSState.CPU:
                 self._arm_evict()
 
-    def _unload_locked(self) -> None:
+    def _free_models(self) -> None:
+        """Drop both models and return their memory. Does not set the state."""
         for attr in ("_base_model", "_custom_model"):
             model = getattr(self, attr)
             if model is not None:
@@ -391,6 +408,9 @@ class TTSModelManager:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def _unload_locked(self) -> None:
+        self._free_models()
         self._state = TTSState.UNLOADED
         logger.info("tts_fully_unloaded")
 
@@ -447,6 +467,10 @@ class TTSModelManager:
                 self._unload_locked()
         except asyncio.CancelledError:
             pass
+        except Exception:
+            # Nothing awaits this task. A failed move has already freed the models
+            # and set ERROR (see _move); log instead of dying unretrieved.
+            logger.error("tts_eviction_failed", state=self._state.value, exc_info=True)
 
 
 # ── Global state ─────────────────────────────────────────────────────────────
@@ -457,9 +481,17 @@ _clone_cache: OrderedDict = OrderedDict()
 _clone_cache_lock = threading.Lock()
 
 
+def _require_s3_credentials() -> None:
+    """Raise unless both S3 credentials are configured. Called at startup, and
+    again before the first client is built for anything that skips the lifespan."""
+    if not (S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY):
+        raise RuntimeError("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be set; there are no defaults")
+
+
 def _get_s3_client():
     global _s3_client
     if _s3_client is None:
+        _require_s3_credentials()
         import boto3
 
         _s3_client = boto3.client(
@@ -533,6 +565,7 @@ def _get_supported_languages() -> list[str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _require_s3_credentials()  # fail at startup, not on the first upload
     if PRELOAD:
         await _mgr.ensure_gpu()
     yield
@@ -599,6 +632,7 @@ async def _generate_audio_leased(req: SynthesiseRequest):
         )
 
     max_new_tokens = _max_new_tokens_for(req.text)
+    request_id = uuid.uuid4().hex[:12]  # ties a client-visible error to its log line
 
     try:
         if req.voice_clone_id:
@@ -623,8 +657,18 @@ async def _generate_audio_leased(req: SynthesiseRequest):
                     max_new_tokens=max_new_tokens,
                 )
             elif _mgr.custom_model is not None:
-                available = _mgr.custom_model.get_supported_speakers()
-                fallback_speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER or sorted(available)[0]
+                fallback_speaker = (req.speaker or "").strip() or DEFAULT_SPEAKER
+                if not fallback_speaker:
+                    available = sorted(_mgr.custom_model.get_supported_speakers() or [])
+                    if not available:
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "error": "Voice design needs the Base model (TTS_LOAD_MODELS=custom_voice) "
+                                "and the CustomVoice model lists no speaker to fall back to."
+                            },
+                        )
+                    fallback_speaker = available[0]
                 logger.info("voice_design_fallback_to_speaker", speaker=fallback_speaker)
                 audio_arrays, sample_rate = await asyncio.to_thread(
                     _mgr.custom_model.generate_custom_voice,
@@ -664,15 +708,24 @@ async def _generate_audio_leased(req: SynthesiseRequest):
         err_str = str(exc).lower()
         if "out of memory" in err_str or "cuda" in err_str:
             gpu_info = _gpu_memory_info()
-            logger.error("tts_gpu_oom", error=str(exc), gpu=gpu_info)
-            return JSONResponse(status_code=503, content={"error": "GPU OOM", "detail": str(exc), "gpu": gpu_info})
-        raise
+            logger.error("tts_gpu_oom", request_id=request_id, error=str(exc), gpu=gpu_info)
+            return JSONResponse(
+                status_code=503, content={"error": "GPU OOM", "request_id": request_id, "gpu": gpu_info}
+            )
+        logger.error("tts_generation_failed", request_id=request_id, error=str(exc), exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "TTS generation failed", "request_id": request_id})
     except ValueError as exc:
         logger.warning("tts_validation_error", error=str(exc))
         return JSONResponse(status_code=422, content={"error": str(exc)})
     except Exception as exc:
-        logger.error("tts_generation_failed", error=str(exc), exc_info=True)
-        return JSONResponse(status_code=500, content={"error": f"TTS generation failed: {exc}"})
+        # The exception text can name paths, devices and other internals: it goes
+        # to the log, and the client gets the id to find it by.
+        logger.error("tts_generation_failed", request_id=request_id, error=str(exc), exc_info=True)
+        return JSONResponse(status_code=500, content={"error": "TTS generation failed", "request_id": request_id})
+
+    if audio_arrays is None or len(audio_arrays) == 0:
+        logger.error("tts_empty_output", request_id=request_id, text_chars=len(req.text or ""))
+        return JSONResponse(status_code=500, content={"error": "TTS produced no audio", "request_id": request_id})
 
     import numpy as np
 
@@ -861,7 +914,7 @@ async def _clone_voice_leased(audio: UploadFile, reference_text: str, companion_
         if "out of memory" in err_str or "cuda" in err_str:
             gpu_info = _gpu_memory_info()
             logger.error("tts_clone_gpu_oom", error=str(exc), gpu=gpu_info)
-            return JSONResponse(status_code=503, content={"error": "GPU OOM", "detail": str(exc), "gpu": gpu_info})
+            return JSONResponse(status_code=503, content={"error": "GPU OOM", "gpu": gpu_info})
         raise
     finally:
         os.unlink(tmp_path)

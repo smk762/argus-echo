@@ -44,3 +44,4 @@ Reference-clip preprocessing, applied to each clip before the latents are comput
 
 Storage is S3 only: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` (compose:
 `XTTS_S3_BUCKET`, default `voice-xtts`) and `S3_PUBLIC_URL` (compose: `XTTS_S3_PUBLIC_URL`). The bucket must exist.
+`S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` have no default: the server refuses to start without both.

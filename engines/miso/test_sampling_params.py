@@ -19,7 +19,14 @@ class _Audio:
         return np.zeros(4, dtype=np.float32)
 
 
+class _Tokenizer:
+    def encode(self, text):
+        return text.split()
+
+
 class _Generator:
+    _text_tokenizer = _Tokenizer()  # the prompt-length check counts the text's tokens
+
     def __init__(self):
         self.calls = []
 
