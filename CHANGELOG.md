@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+- `QWEN_TAG` picks the Qwen image's tag on its own (default `ECHO_TAG`). The published image bakes 0.6b, so a host
+  running 1.7b builds it locally under its own tag while `ECHO_TAG` keeps pulling the published images for the
+  other engines.
+
 ### Fixed
 - Whisper decodes an MP4/M4A/MOV whose index (`moov`) comes after the audio, the default for ffmpeg and most
   recorders without faststart. Read from a pipe, the demuxer couldn't seek back to it, so anything past its

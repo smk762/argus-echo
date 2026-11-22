@@ -120,7 +120,7 @@ services:
       context: ./engines/qwen
       args:
         TTS_MODEL_SIZE: ${QWEN_MODEL_SIZE:-0.6b}
-    image: ghcr.io/smk762/argus-echo-qwen:${ECHO_TAG:-local}
+    image: ghcr.io/smk762/argus-echo-qwen:${QWEN_TAG:-${ECHO_TAG:-local}}
     container_name: argus-echo-qwen
     restart: unless-stopped
     ports:
