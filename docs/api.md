@@ -57,7 +57,12 @@ An engine ignores fields it has no use for instead of refusing them, so one requ
 exception is a `language` the engine cannot speak: Miso refuses it rather than mispronounce it.
 
 `/synthesise` stores a WAV and returns `{"audio_url", "duration", "duration_seconds", "format", "seed"}` (`seed`
-echoes the request's, or `null`). XTTS adds `device`: where it ran (`cpu` or its `XTTS_DEVICE`).
+echoes the request's, or `null`). XTTS adds `device`: where it ran (`cpu` or its `XTTS_DEVICE`). XTTS and Qwen add
+the weights that generated this utterance: `checkpoint` (the name loaded with `/admin/load`, or `null` for stock)
+and `weights_fingerprint` (see [Weights fingerprint](#weights-fingerprint)). Qwen also adds `model`, the slot that
+spoke it: `base` for a `voice_clone_id` or a `voice_description` rendered by Base, `custom_voice` for a built-in
+`speaker` and for a `voice_description` that falls back to a CustomVoice speaker (no Base loaded); its
+`checkpoint` and `weights_fingerprint` are that slot's. Miso reports none of these.
 
 `/synthesise/stream` answers `200` with `Content-Type: application/octet-stream` and the PCM layout in headers:
 
@@ -67,7 +72,20 @@ echoes the request's, or `null`). XTTS adds `device`: where it ran (`cpu` or its
 | `X-Audio-Format` | `pcm_f32le` (little-endian float32 in [-1, 1]) |
 | `X-Channels` | `1` |
 
-XTTS also sends `X-XTTS-Device`: where the stream runs (`cpu` or its `XTTS_DEVICE`).
+XTTS also sends `X-XTTS-Device`: where the stream runs (`cpu` or its `XTTS_DEVICE`). XTTS and Qwen send the
+weights generating the stream, with the other headers, before the first byte:
+
+| Header | Engines | Value |
+| --- | --- | --- |
+| `X-Echo-Checkpoint` | XTTS, Qwen | The checkpoint name, percent-encoded (`forge/run%207`); empty for stock weights |
+| `X-Echo-Weights` | XTTS, Qwen | The [weights fingerprint](#weights-fingerprint) |
+| `X-Echo-Model` | Qwen | `base` or `custom_voice`, as `model` above |
+
+These (and the `/synthesise` fields) are read under the request's model lease, which it holds until the last
+byte. `/admin/load` answers `409` while any lease is held, so the weights can't change between the header and the
+end of the utterance. **Pin the fingerprint from each response, not from `/health`**: the engine is shared, and
+another client can load other weights between your `/health` read and your request (or swap A, B and back to A).
+`/health`'s `weights.files` is also `null` until the first load, and both engines load lazily.
 
 Read the format from the headers rather than assuming it. Errors found before audio starts (validation, model
 loading, out of memory, busy) are normal JSON errors; once the `200` is sent, a failure can only end the stream
@@ -158,12 +176,22 @@ Two blocks identify what is running, so a client (argus-proof's run manifest) ca
   image built without them (a local `docker compose build`). The image **digest** is not there: it only exists
   once the image is built, and a running container cannot read it (nor the OCI labels the release sets). Take it
   from whoever deployed the container (`docker inspect`, compose, iris), or record the tag.
-- `weights` (XTTS, Qwen): `{"checkpoint", "files"}`. `checkpoint` is the name loaded with `POST /admin/load`, or
-  `null` for the stock weights. `files` lists `{"name", "sha256", "bytes"}` for every file the last load of those
-  weights read: hashed once, in the load's worker thread, never per request (an unchanged file is not even
-  re-read on a later reload). It is `null` until those weights have been loaded. Stock weights are hashed too, so
-  either can be pinned. Qwen prefixes each name with its model slot (`base/model.safetensors`,
-  `custom_voice/speech_tokenizer/model.safetensors`, ...).
+- `weights` (XTTS, Qwen): `{"checkpoint", "fingerprint", "files"}`, plus `models` on Qwen. `checkpoint` is the
+  name loaded with `POST /admin/load`, or `null` for the stock weights. `files` lists `{"name", "sha256", "bytes"}`
+  for every file the last load of those weights read: hashed once, in the load's worker thread, never per request
+  (an unchanged file is not even re-read on a later reload). Stock weights are hashed too, so either can be pinned.
+  `fingerprint` is the [weights fingerprint](#weights-fingerprint) of all of `files`, computed with them. Qwen
+  prefixes each name with its model slot (`base/model.safetensors`,
+  `custom_voice/speech_tokenizer/model.safetensors`, ...) and adds `models`: per loaded slot,
+  `{"checkpoint", "fingerprint"}`, where `checkpoint` is the name if that slot was loaded from the checkpoint (else
+  `null`) and `fingerprint` covers only that slot's files. That per-slot fingerprint is the one a Qwen response
+  reports. `files`, `fingerprint` and `models` are `null` until the selected weights have been loaded.
+
+  When they change: only a load sets them. Evicting to the CPU and promoting back moves the same weights, so they
+  stay as they were, with nothing hashed again. A full idle unload keeps the selection and its last hashes; the
+  next request's lazy reload hashes the same files again (from a cache keyed by path, size and mtime, so unchanged
+  files aren't read) and comes out with the same fingerprint, or a different one if a file changed on disk.
+  `/admin/load` replaces them, and `/admin/unload` clears them (stock is selected; the next load hashes it).
 
 Each engine loads its model on first use and leaves the GPU after an idle period (`MISO_KEEP_ALIVE_GPU`,
 `XTTS_KEEP_ALIVE_GPU`, `TTS_KEEP_ALIVE_GPU`). The admin routes move it on demand:
@@ -180,6 +208,42 @@ to the driver, so `gpu.reserved_mb` falls to about 0. What remains is the proces
 (about 320 MB on an RTX 3090 for XTTS or Qwen) that torch can neither see nor free: only ending the process returns
 it. `gpu.cuda_context` (XTTS, Qwen) says whether the process holds one. iris measures what each process holds on its
 own, and its `restart_residual_mb` rule restarts a resident that is unloaded but still holds that much.
+
+### Weights fingerprint
+
+One sha256 that names a set of weight files, so a response can say which weights produced it. Recompute it from
+`/health`'s `weights.files` (or with `argus_echo.contract.weights_fingerprint`):
+
+1. Take the files: all of `weights.files` for XTTS's fingerprint and for Qwen's top-level `weights.fingerprint`;
+   for a Qwen slot (`weights.models.<slot>.fingerprint`, and what a Qwen response reports), only the files whose
+   `name` starts with `<slot>/` (`base/` or `custom_voice/`).
+2. Make one line per file: `<name>:<sha256>`, with `name` exactly as listed, **the slot prefix kept** on Qwen, and
+   `sha256` as listed (lowercase hex). Each line ends with a line feed (`\n`, 0x0A), the last one included.
+3. Encode each line as UTF-8 and sort the lines byte-wise (on the whole line, not just the name).
+4. Concatenate them, take the sha256 of those bytes, and write it as 64 lowercase hex digits.
+
+XTTS uses the same recipe; its names have no prefix. Worked example (the sha256 values are those of the strings
+`weights`, `config` and `base`), Qwen with three files:
+
+| `name` | `sha256` |
+| --- | --- |
+| `custom_voice/model.safetensors` | `9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c` |
+| `custom_voice/config.json` | `b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910` |
+| `base/model.safetensors` | `cae662172fd450bb0cd710a769079c05bfc5d8e35efa6576edc7d0377afdd4a2` |
+
+The `custom_voice` fingerprint hashes these 2 lines (in this order, each ending in `\n`):
+
+```
+custom_voice/config.json:b79606fb3afea5bd1609ed40b622142f1c98125abcfe89a76a661b0e8e343910
+custom_voice/model.safetensors:9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c
+```
+
+and is `b955ea711653a31092cf4acad596e71ac31cb8f85c6feabe209f32ada86fecfb`. The `base` fingerprint (one line) is
+`8763f2a5235402fc83d026fd46b563e7fa6c7b0c9d12a3cad770d4856148eebc`, and all three files together (the top-level
+`weights.fingerprint`) give `e205d97735019470b091f339590c5f050f068b0f7817439400ed4337db73c89c`. For XTTS, the files
+`config.json` and `model.pth` with the first two sha256 values above give
+`311b8ed7abed4ae45274fedccda241ff6d0a129db13ea34b25b9fe0431de2649`. The engines' tests and the package's assert
+these digests with the code's own function, so these docs and the code can't drift apart unnoticed.
 
 ### Fine-tuned checkpoints
 

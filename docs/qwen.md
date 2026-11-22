@@ -110,7 +110,7 @@ with `speaker`) replaces CustomVoice, a `base` one replaces Base (cloning). The 
 `/health` `weights.files` lists the sha256 of every file at the top of each loaded model's directory and in its
 `speech_tokenizer/` (dotfiles skipped), prefixed with the slot: `custom_voice/model.safetensors`,
 `base/speech_tokenizer/model.safetensors`, and so on. Both slots are listed, the stock one included, so the whole
-loaded state is pinned. The stock files are read from the Hugging Face cache the image baked.
+loaded state is pinned. The stock files are read from the Hugging Face cache the image baked. `weights.models` gives each slot's checkpoint and fingerprint; `/synthesise` (`model`, `checkpoint`, `weights_fingerprint`) and `/synthesise/stream` (`X-Echo-Model`, `X-Echo-Checkpoint`, `X-Echo-Weights`) report the slot that spoke each utterance and its fingerprint. See [api.md#weights-fingerprint](api.md#weights-fingerprint).
 
 ## Home Assistant
 

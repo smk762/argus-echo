@@ -93,4 +93,4 @@ a legacy `model.pth` that pickles its `XttsConfig` object (coqui rewrites such a
 
 `/health` `weights.files` lists the sha256 of `config.json`, `model.pth`, `vocab.json` and `speakers_xtts.pth` (when
 present) as the load read them. The stock model is hashed the same way on its first load (about 1.8 GB, a few
-seconds once per process).
+seconds once per process). `weights.fingerprint` combines those hashes; `/synthesise` (`checkpoint`, `weights_fingerprint`) and `/synthesise/stream` (`X-Echo-Checkpoint`, `X-Echo-Weights`) report it per utterance, which is what to pin. See [api.md#weights-fingerprint](api.md#weights-fingerprint).

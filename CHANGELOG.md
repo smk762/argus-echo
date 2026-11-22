@@ -31,6 +31,14 @@
   from the RNG in between; Qwen's stream seeds sentence *i* with `seed + i`. `/synthesise` echoes `seed`.
   docs/api.md#reproducibility says per engine and route what it makes reproducible (streams included) and why
   it is expected rather than guaranteed on CUDA.
+- Per-utterance weights fingerprint (XTTS, Qwen): a sha256 over the sorted `name:sha256` lines of the loaded files
+  (recipe and worked example in docs/api.md#weights-fingerprint), computed once per load. `/synthesise` returns
+  `checkpoint` and `weights_fingerprint`; `/synthesise/stream` sends `X-Echo-Checkpoint` (percent-encoded, empty
+  for stock) and `X-Echo-Weights`, both read under the request's lease (`/admin/load` is `409` until it ends).
+  Qwen reports the slot that spoke it (`model` / `X-Echo-Model`: `base` or `custom_voice`) and that slot's
+  fingerprint, and `/health` `weights` adds `fingerprint` and, on Qwen, `models` (per-slot checkpoint and
+  fingerprint). An evict and re-promote keeps them; an idle reload re-hashes to the same fingerprint. Miso reports
+  no fingerprint.
 - `argus-echo check` reports the image identity and the loaded checkpoint with its file hashes when `/health` has
   them (read-only: it never calls `/admin/load`). The contract adds `LoadCheckpointRequest`, `Weights`,
   `WeightFile`, `ImageIdentity`, `SEED_MAX` and `LOAD_PATH`.
