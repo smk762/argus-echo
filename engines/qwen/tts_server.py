@@ -732,6 +732,7 @@ class SynthesiseRequest(BaseModel):
     emotion: str = "neutral"
     language: str = Field(default="en")
     speed: Optional[float] = None  # accepted for the shared contract; Qwen ignores it (XTTS applies it)
+    device: Optional[str] = None  # XTTS-only ("cpu": no GPU promotion); Qwen ignores it
 
 
 # ── POST /synthesise ──────────────────────────────────────────────────────────

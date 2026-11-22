@@ -48,12 +48,14 @@ XTTS on `8141`, Qwen on `8142` and Whisper (speech to text) on `8144`.
 | `instruction` | string | `null` | Qwen only: delivery instruction for a built-in speaker. Ignored elsewhere |
 | `emotion` | string | `"neutral"` | Qwen only. Ignored elsewhere |
 | `speed` | number | `null` | XTTS only: speaking-rate multiplier passed to inference (`1.0` when unset or not positive). Miso and Qwen accept it and ignore it |
+| `device` | `"cpu"` | `null` | XTTS only: run without promoting the model to the GPU (a client sends it when argus-iris refuses its GPU lease); any other value is `422`. A model already on the GPU runs there. Miso and Qwen accept it and ignore it. See [xtts.md](xtts.md#gpu-memory-and-cpu-fallback) |
 | `temperature`, `topk`, `context` | | | Miso only; see [miso-api.md](miso-api.md) |
 
 An engine ignores fields it has no use for instead of refusing them, so one request body works on all three. The
 exception is a `language` the engine cannot speak: Miso refuses it rather than mispronounce it.
 
-`/synthesise` stores a WAV and returns `{"audio_url", "duration", "duration_seconds", "format"}`.
+`/synthesise` stores a WAV and returns `{"audio_url", "duration", "duration_seconds", "format"}`. XTTS adds
+`device`: where it ran (`cpu` or its `XTTS_DEVICE`).
 
 `/synthesise/stream` answers `200` with `Content-Type: application/octet-stream` and the PCM layout in headers:
 
@@ -63,6 +65,8 @@ exception is a `language` the engine cannot speak: Miso refuses it rather than m
 | `X-Audio-Format` | `pcm_f32le` (little-endian float32 in [-1, 1]) |
 | `X-Channels` | `1` |
 
+XTTS also sends `X-XTTS-Device`: where the stream runs (`cpu` or its `XTTS_DEVICE`).
+
 Read the format from the headers rather than assuming it. Errors found before audio starts (validation, model
 loading, out of memory, busy) are normal JSON errors; once the `200` is sent, a failure can only end the stream
 early. How soon audio starts differs: Miso and XTTS stream within a sentence, while Qwen splits the text into
@@ -70,7 +74,9 @@ sentences and sends each one as soon as it is rendered (the first byte comes aft
 renders that first sentence before answering `200`, so an error in it is still a JSON error. When the client
 disconnects, XTTS stops at the next chunk and Qwen starts no further sentence (the one in progress finishes).
 
-Busy, loading and out-of-memory answers are `503`, with `Retry-After` where the engine knows a good wait.
+Busy, loading and out-of-memory answers are `503`, with `Retry-After` where the engine knows a good wait. XTTS
+answers a model it cannot move onto the GPU with `503`, the reason in `error` and `Retry-After:
+$XTTS_OOM_RETRY_AFTER_S`, unless `XTTS_CPU_FALLBACK` (the default) runs the request on the CPU instead.
 
 ### Voices
 
