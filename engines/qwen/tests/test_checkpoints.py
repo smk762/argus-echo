@@ -56,6 +56,8 @@ class FakeModel:
     def __init__(self, source, calls):
         self.source = source
         self.calls = calls
+        # qwen-tts keeps the size on the inner model; the stock fixtures are 0.6B, a checkpoint here counts as 1.7B.
+        self.model = types.SimpleNamespace(tts_model_size="0b6" if "0.6B" in source else "1b7")
 
     def get_supported_speakers(self):
         return ["ryan"]
@@ -63,10 +65,6 @@ class FakeModel:
     def generate_custom_voice(self, **kw):
         self.calls.append(("generate", kw["text"]))
         self.thread = threading.current_thread().name
-        return [np.zeros(10, dtype="<f4")], 24000
-
-    def generate_voice_design(self, text, **kw):
-        self.calls.append(("design", text))
         return [np.zeros(10, dtype="<f4")], 24000
 
     def generate_voice_clone(self, text, **kw):
@@ -438,8 +436,8 @@ class FingerprintTests(CheckpointTestCase):
         models = self.load("voice").json()["weights"]["models"]
         with mock.patch.object(tts_server, "_get_clone_prompt", lambda clone_id: ["prompt"]):
             cases = {
-                "custom_voice": [{"speaker": "ryan"}],
-                "base": [{"voice_clone_id": "voice_clones/x/prompt.pt"}, {"voice_description": "a calm voice"}],
+                "custom_voice": [{"speaker": "ryan"}, {"speaker": "ryan", "voice_description": "a calm voice"}],
+                "base": [{"voice_clone_id": "voice_clones/x/prompt.pt"}],
             }
             for slot, bodies in cases.items():
                 for body in bodies:
@@ -447,16 +445,19 @@ class FingerprintTests(CheckpointTestCase):
                     self.assertEqual(out["model"], slot, body)
                     self.assertEqual(out["weights_fingerprint"], models[slot]["fingerprint"], body)
                     self.assertEqual(out["checkpoint"], "voice" if slot == "custom_voice" else None, body)
-        self.assertEqual([c[0] for c in self.calls], ["generate", "clone", "design"])
+        self.assertEqual([c[0] for c in self.calls], ["generate", "generate", "clone"])
 
-    def test_voice_design_without_base_reports_custom_voice(self):
+    def test_voice_design_on_stock_06b_is_422_and_on_a_17b_checkpoint_speaks(self):
         with mock.patch.object(tts_server, "LOAD_MODELS", "custom_voice"):
-            models = self.load(None).json()["weights"]["models"]
-            out = self._synth(voice_description="a calm voice")
-        self.assertEqual(set(models), {"custom_voice"})
+            self.load(None)
+            r = self.client.post("/synthesise", json={"text": "hello there", "voice_description": "a calm voice"})
+            self.assertEqual(r.status_code, 422, r.text)
+            _write_model(self.root / "big", weights=b"1.7b fine-tune")
+            models = self.load("big").json()["weights"]["models"]
+            out = self._synth(speaker="ryan", voice_description="a calm voice")
         self.assertEqual(out["model"], "custom_voice")
+        self.assertEqual(out["checkpoint"], "big")
         self.assertEqual(out["weights_fingerprint"], models["custom_voice"]["fingerprint"])
-        self.assertIsNone(out["checkpoint"])
 
     def test_stream_headers_name_the_model_and_weights(self):
         _write_model(self.root / "forge" / "run 7", weights=b"fine-tuned")
@@ -471,6 +472,24 @@ class FingerprintTests(CheckpointTestCase):
         self.assertEqual(r.headers["x-echo-model"], "base")
         self.assertEqual(r.headers["x-echo-checkpoint"], "")  # base is stock here
         self.assertEqual(r.headers["x-echo-weights"], models["base"]["fingerprint"])
+
+    def test_a_clone_wins_over_a_voice_description(self):
+        """A request with both is spoken by the clone on Base, on both routes (argus-proof's speech grids refuse a
+        clone spoken by another slot). Holds on 0.6B too: the description is never looked at."""
+        models = self.load(None).json()["weights"]["models"]
+        body = {
+            "text": "hello there",
+            "voice_clone_id": "voice_clones/x/prompt.pt",
+            "voice_description": "a calm voice",
+        }
+        with mock.patch.object(tts_server, "_get_clone_prompt", lambda clone_id: ["prompt"]):
+            r = self.client.post("/synthesise/stream", json=body)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.headers["x-echo-model"], "base")
+            self.assertEqual(r.headers["x-echo-weights"], models["base"]["fingerprint"])
+            out = self._synth(**{k: v for k, v in body.items() if k != "text"})
+        self.assertEqual((out["model"], out["weights_fingerprint"]), ("base", models["base"]["fingerprint"]))
+        self.assertEqual([c[0] for c in self.calls], ["clone", "clone"])
 
     def test_a_load_during_a_stream_is_refused_so_its_headers_stay_true(self):
         _write_model(self.root / "voice")

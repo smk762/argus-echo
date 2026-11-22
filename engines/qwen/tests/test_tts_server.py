@@ -607,26 +607,70 @@ class GenerationErrorTests(unittest.TestCase):
         self.assertEqual(body["error"], "TTS produced no audio")
         self.assertTrue(body["request_id"])
 
-    def test_voice_design_fallback_without_speakers_is_503(self):
+    @staticmethod
+    def _custom(size="1b7"):
+        """A CustomVoice wrapper as qwen-tts has it: the size lives on ``.model.tts_model_size``."""
         custom = mock.Mock()
+        custom.model.tts_model_size = size
+        return custom
+
+    def test_voice_design_without_speakers_is_503(self):
+        custom = self._custom()
         custom.get_supported_speakers.return_value = []
         status, body = self._run(_Models(custom=custom), text="hi", voice_description="a calm voice")
         self.assertEqual(status, 503)
         self.assertIn("no speaker", body["error"])
         custom.generate_custom_voice.assert_not_called()
 
-    def test_voice_design_fallback_uses_the_first_speaker(self):
+    def test_voice_design_steers_the_first_speaker(self):
         import numpy as np
 
-        custom = mock.Mock()
+        custom = self._custom()
         custom.get_supported_speakers.return_value = ["vivian", "ryan"]
         custom.generate_custom_voice.return_value = ([np.zeros(10, dtype="<f4")], 24000)
         with mock.patch.object(tts_server, "_mgr", _Models(custom=custom)), \
                 mock.patch.object(tts_server, "DEFAULT_SPEAKER", ""):
-            req = tts_server.SynthesiseRequest(text="hi", voice_description="a calm voice")
+            req = tts_server.SynthesiseRequest(text="hi", voice_description="a calm voice", emotion="happy")
             audio, rate = asyncio.run(tts_server._generate_audio_leased(req))
         self.assertEqual((len(audio), rate), (10, 24000))
-        self.assertEqual(custom.generate_custom_voice.call_args.kwargs["speaker"], "ryan")
+        kw = custom.generate_custom_voice.call_args.kwargs
+        self.assertEqual(kw["speaker"], "ryan")
+        self.assertEqual(kw["instruct"], f"a calm voice. {tts_server.EMOTION_TO_INSTRUCTION['happy']}")
+
+    def test_voice_design_never_uses_base_even_when_it_is_loaded(self):
+        """#31: qwen-tts refuses generate_voice_design on Base, so every designed voice failed with Base loaded."""
+        import numpy as np
+
+        base = mock.Mock(spec=["generate_voice_clone"])  # no generate_voice_design, as the real Base model
+        custom = self._custom()
+        custom.generate_custom_voice.return_value = ([np.zeros(10, dtype="<f4")], 24000)
+        with mock.patch.object(tts_server, "_mgr", _Models(base=base, custom=custom)), \
+                mock.patch.object(tts_server, "DEFAULT_SPEAKER", "vivian"):
+            req = tts_server.SynthesiseRequest(text="hi", voice_description="a gravelly old sailor")
+            audio, rate = asyncio.run(tts_server._generate_audio_leased(req))
+        self.assertEqual(len(audio), 10)
+        self.assertEqual(custom.generate_custom_voice.call_args.kwargs["instruct"], "a gravelly old sailor")
+        base.generate_voice_clone.assert_not_called()
+
+    def test_voice_design_on_the_06b_model_is_422_not_silently_ignored(self):
+        """qwen-tts drops instruct for the 0.6B CustomVoice model: a description would change nothing."""
+        custom = self._custom("0b6")
+        status, body = self._run(_Models(custom=custom), text="hi", voice_description="a calm voice", speaker="ryan")
+        self.assertEqual(status, 422)
+        self.assertIn("1.7b", body["error"])
+        custom.generate_custom_voice.assert_not_called()
+
+    def test_without_a_size_on_the_model_tts_model_size_decides(self):
+        custom = mock.Mock(spec=["generate_custom_voice", "get_supported_speakers"])
+        for size, ignored in (("0.6b", True), ("1.7b", False)):
+            with mock.patch.object(tts_server, "MODEL_SIZE", size):
+                self.assertIs(tts_server._instruct_ignored(custom), ignored)
+
+    def test_voice_design_without_custom_voice_is_503(self):
+        base = mock.Mock(spec=["generate_voice_clone"])
+        status, body = self._run(_Models(base=base), text="hi", voice_description="a calm voice")
+        self.assertEqual(status, 503)
+        self.assertIn("CustomVoice", body["error"])
 
     def test_internal_exception_text_stays_out_of_the_response(self):
         secret = "/srv/models/private/clone.pt"
