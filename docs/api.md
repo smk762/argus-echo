@@ -325,13 +325,15 @@ client (Home Assistant) reaches it through the `wyoming-whisper` bridge, which p
 
 | Field | Type | Default | Notes |
 | --- | --- | --- | --- |
-| `audio` | file | required | WAV or FLAC (sniffed from the magic bytes; nothing else is decoded), 1 or 2 channels (averaged), 8 to 96 kHz |
-| `language` | string | detected | ISO 639-1 (`en`). A region suffix is dropped (`en-US` → `en`). An unknown code is `422` |
+| `audio` | file | required | WAV or FLAC (sniffed from the magic bytes), 1 or 2 channels (averaged), 8 to 96 kHz; or any other audio ffmpeg can demux with a format in `STT_INPUT_FORMATS` (a browser's webm/opus recording, mp3, ogg, m4a, ...), resampled to 16 kHz mono |
+| `language` | string | detected | ISO 639-1 (`en`). A region suffix is dropped (`en-US` → `en`). An unknown code is `422`. Also accepted as a query parameter (`?language=en`, as agent-composer's sidecar took it); the form field wins |
 | `word_timestamps` | bool | `false` | Adds `words` to every segment |
 
-The upload is read through argus-cortex's `read_upload` and `open_audio`, so the byte cap (`STT_MAX_UPLOAD_MB`,
-default 50), the format, channels, rate and duration (`STT_MAX_SECONDS`, default 600) are checked before a sample
-is decoded. Nothing is stored.
+The upload is read through argus-cortex's `read_upload`, so the byte cap (`STT_MAX_UPLOAD_MB`, default 50) holds
+first. WAV and FLAC then go through `open_audio`, which checks channels, rate and duration (`STT_MAX_SECONDS`,
+default 600) before a sample is decoded. Other formats go through ffmpeg exactly as on `/transcriptions`: it reads
+only from a pipe, may use only a demuxer in `STT_INPUT_FORMATS` (`none`: WAV/FLAC only), and stops past
+`STT_MAX_SECONDS` (`413`). Undecodable audio is `400`. Nothing is stored.
 
 ```json
 {
