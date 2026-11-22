@@ -100,9 +100,15 @@ services:
       XTTS_PRELOAD: ${XTTS_PRELOAD:-0}
       XTTS_KEEP_ALIVE_GPU: ${XTTS_KEEP_ALIVE_GPU:-120}
       XTTS_KEEP_ALIVE_CPU: ${XTTS_KEEP_ALIVE_CPU:-600}
+      XTTS_CPU_FALLBACK: ${XTTS_CPU_FALLBACK:-1}
+      XTTS_OOM_RETRY_AFTER_S: ${XTTS_OOM_RETRY_AFTER_S:-30}
+      # Fine-tuned checkpoints POST /admin/load reads (docs/xtts.md#fine-tuned-checkpoints), mounted read-only.
+      XTTS_CHECKPOINT_ROOT: /checkpoints
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    volumes:
+      - ${XTTS_CHECKPOINT_ROOT:-./checkpoints/xtts}:/checkpoints:ro
     healthcheck:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5).read()"]
@@ -125,12 +131,19 @@ services:
       S3_PUBLIC_URL: ${QWEN_S3_PUBLIC_URL:-}
       TTS_MODEL_SIZE: ${QWEN_MODEL_SIZE:-0.6b}
       TTS_DEVICE: ${QWEN_DEVICE:-cuda:0}
+      TTS_LOAD_MODELS: ${QWEN_LOAD_MODELS:-both}
+      TTS_DEFAULT_SPEAKER: ${QWEN_DEFAULT_SPEAKER:-}
       TTS_PRELOAD: ${QWEN_PRELOAD:-0}
       TTS_KEEP_ALIVE_GPU: ${QWEN_KEEP_ALIVE_GPU:-120}
       TTS_KEEP_ALIVE_CPU: ${QWEN_KEEP_ALIVE_CPU:-600}
+      # Fine-tuned checkpoints POST /admin/load reads (docs/qwen.md#fine-tuned-checkpoints), mounted read-only
+      # from QWEN_CHECKPOINT_ROOT.
+      TTS_CHECKPOINT_ROOT: /checkpoints
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    volumes:
+      - ${QWEN_CHECKPOINT_ROOT:-./checkpoints/qwen}:/checkpoints:ro
     healthcheck:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5).read()"]
@@ -156,6 +169,13 @@ services:
       STT_MAX_SECONDS: ${WHISPER_MAX_SECONDS:-600}
       STT_QUEUE_TIMEOUT_S: ${WHISPER_QUEUE_TIMEOUT_S:-30}
       STT_STREAM_MAX_SESSIONS: ${WHISPER_STREAM_MAX_SESSIONS:-4}
+      # POST /transcriptions (agent-composer's route for kimini-api); docs/api.md
+      STT_VAD_FILTER: ${WHISPER_VAD_FILTER:-1}
+      STT_AUDIO_URL_ALLOWED_HOSTS: ${WHISPER_AUDIO_URL_ALLOWED_HOSTS:-}
+      STT_AUDIO_URL_MAX_REDIRECTS: ${WHISPER_AUDIO_URL_MAX_REDIRECTS:-0}
+      STT_DOWNLOAD_TIMEOUT: ${WHISPER_DOWNLOAD_TIMEOUT:-30}
+      STT_INPUT_FORMATS: ${WHISPER_INPUT_FORMATS:-wav,w64,mp3,ogg,flac,webm,matroska,mp4,m4a,aac,aiff,caf,amr,au}
+      STT_DECODE_TIMEOUT: ${WHISPER_DECODE_TIMEOUT:-120}
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}

@@ -35,6 +35,13 @@ Qwen3TTSModel.from_pretrained(f'Qwen/Qwen3-TTS-12Hz-{size}-CustomVoice')"
 
 COPY tts_server.py .
 
+# The image's identity, reported in /health as `image` (null when unset, e.g. a local build). release.yml passes the
+# release tag and commit; a container can't read its own digest. Last, so a new revision rebuilds only this layer.
+ARG ECHO_VERSION=
+ARG ECHO_REVISION=
+ENV ECHO_VERSION=${ECHO_VERSION} \
+    ECHO_REVISION=${ECHO_REVISION}
+
 EXPOSE 8031
 
 ENV TTS_MODEL_SIZE=${TTS_MODEL_SIZE}

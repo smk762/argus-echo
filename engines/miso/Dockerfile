@@ -41,6 +41,13 @@ ENV MISO_TTS_TOKENIZER=unsloth/Llama-3.2-1B \
     NO_TORCH_COMPILE=1 \
     PYTHONUNBUFFERED=1
 
+# The image's identity, reported in /health as `image` (null when unset, e.g. a local build). release.yml passes the
+# release tag and commit; a container can't read its own digest. Last, so a new revision rebuilds only this layer.
+ARG ECHO_VERSION=
+ARG ECHO_REVISION=
+ENV ECHO_VERSION=${ECHO_VERSION} \
+    ECHO_REVISION=${ECHO_REVISION}
+
 EXPOSE 8031
 
 # Invoke the venv interpreter directly rather than `uv run` — the server deps

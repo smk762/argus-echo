@@ -2,6 +2,87 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-22
+
+### Added
+- Whisper serves `POST /transcriptions`, transcription from a URL or base64, imported from agent-composer's
+  whisper sidecar as `voice-stack/` retires (smk762/agent-composer#81): a JSON body with `audio_url` (fetched
+  under argus-cortex's SSRF policy, capped as it streams, `STT_AUDIO_URL_ALLOWED_HOSTS` for trusted internal
+  hosts, redirects off by default) or `audio_base64`,
+  and composer's `{text, language, duration_seconds, confidence}` back. Silero VAD drops silence before
+  Whisper runs (`STT_VAD_FILTER`, default on, as composer did; `/transcribe` is unchanged), and audio other than
+  WAV/FLAC is decoded with ffmpeg, now in the image, reading only from a pipe and only through a demuxer in
+  `STT_INPUT_FORMATS` (`none`: WAV/FLAC only). Models: `TranscriptionsRequest`, `TranscriptionsResult`.
+- Whisper's `POST /transcribe` decodes any format in `STT_INPUT_FORMATS` through the same ffmpeg path (a browser's
+  webm/opus recording, which agent-composer's rag-chat forwards as is, used to be a `400`), and takes `language` as
+  a query parameter too (`?language=en`, as composer's sidecar did; the form field wins). WAV and FLAC still go
+  through `open_audio` (smk762/agent-composer#81).
+- `gpu-tenant.yaml` gives Qwen a `vram_mb` (4800): Qwen3-TTS 1.7b with CustomVoice only, measured on an 8 GB
+  RTX 4060 (dragon), CUDA context included. Generating stays inside the loaded footprint; evict and unload leave
+  only the ~150 MB CUDA context (#6). Base and 0.6b are still to measure.
+- Compose passes `QWEN_LOAD_MODELS` (`TTS_LOAD_MODELS`, default `both`) and `QWEN_DEFAULT_SPEAKER`
+  (`TTS_DEFAULT_SPEAKER`) through to the Qwen engine; `custom_voice` roughly halves its VRAM when cloning isn't
+  needed.
+- XTTS synthesis requests take an optional `device: "cpu"` (new optional contract field; Miso and Qwen ignore
+  it): the model is used where it is and never promoted to the GPU. `/synthesise` returns `device` and
+  `/synthesise/stream` sends `X-XTTS-Device`. While CPU work holds a lease the model isn't moved; GPU requests
+  that arrive then join it on the CPU. Ported from agent-composer#80 (part of agent-composer#81).
+- XTTS and Qwen load fine-tuned checkpoints (#10): `POST /admin/load {"checkpoint": "<name>"}` (admin bearer)
+  loads a directory under `XTTS_CHECKPOINT_ROOT` / `TTS_CHECKPOINT_ROOT` (compose: `XTTS_CHECKPOINT_ROOT` and
+  `QWEN_CHECKPOINT_ROOT` on the host, mounted read-only at `/checkpoints`), resolved with argus-cortex `safe_join`.
+  `400` for a name that escapes the root, `404` missing, `422` not this engine's format, `409` while a request
+  holds the model, `500` for a failed load (nothing stays loaded; stock is selected). `{"checkpoint": null}` loads
+  stock, and `/admin/unload` returns to stock; the idle unload keeps the checkpoint. A Qwen checkpoint replaces the
+  model its `tts_model_type` names (`base` or `custom_voice`). What a checkpoint directory must hold:
+  docs/xtts.md and docs/qwen.md.
+- `/health` `weights` (XTTS, Qwen): the selected checkpoint (or `null` for stock) and `{name, sha256, bytes}` for
+  every file the last load read, stock included, hashed once per load in its worker thread.
+- `/health` `image` (Miso, XTTS, Qwen): `{version, revision}` baked into each engine image as build args
+  (`ECHO_VERSION`, `ECHO_REVISION`), which the release workflow now passes; `null` for a local build. A container
+  can't read its own digest.
+- Optional `seed` on `SynthesiseRequest` (contract and every engine, `0` to `2**32 - 1`): seeds python, numpy and
+  torch (CPU and CUDA) per request. XTTS and Qwen run a seeded generation alone, so no concurrent request draws
+  from the RNG in between; Qwen's stream seeds sentence *i* with `seed + i`. `/synthesise` echoes `seed`.
+  docs/api.md#reproducibility says per engine and route what it makes reproducible (streams included) and why
+  it is expected rather than guaranteed on CUDA.
+- Per-utterance weights fingerprint (XTTS, Qwen): a sha256 over the sorted `name:sha256` lines of the loaded files
+  (recipe and worked example in docs/api.md#weights-fingerprint), computed once per load. `/synthesise` returns
+  `checkpoint` and `weights_fingerprint`; `/synthesise/stream` sends `X-Echo-Checkpoint` (percent-encoded, empty
+  for stock) and `X-Echo-Weights`, both read under the request's lease (`/admin/load` is `409` until it ends).
+  Qwen reports the slot that spoke it (`model` / `X-Echo-Model`: `base` or `custom_voice`) and that slot's
+  fingerprint, and `/health` `weights` adds `fingerprint` and, on Qwen, `models` (per-slot checkpoint and
+  fingerprint). An evict and re-promote keeps them; an idle reload re-hashes to the same fingerprint. Miso reports
+  no fingerprint.
+- `argus-echo check` reports the image identity and the loaded checkpoint with its file hashes when `/health` has
+  them (read-only: it never calls `/admin/load`). The contract adds `LoadCheckpointRequest`, `Weights`,
+  `WeightFile`, `ImageIdentity`, `SEED_MAX` and `LOAD_PATH`.
+
+### Fixed
+- XTTS: a GPU promotion that fails moves the weights back to the CPU and empties the CUDA cache, so the state
+  never says `cpu` with weights partly on CUDA. A CUDA out-of-memory there runs the request on the CPU
+  (`XTTS_CPU_FALLBACK=1`, default) or answers `503` with the reason and `Retry-After` (`XTTS_OOM_RETRY_AFTER_S`,
+  default 30). It used to surface as a bare 500, because the promotion runs inside the lease, outside the
+  handler's error handling. A preload that hits the same leaves the model on the CPU instead of failing startup.
+  After a promotion runs out of memory, XTTS tries no other for `XTTS_OOM_RETRY_AFTER_S`, so a full GPU no longer
+  costs every request a ~2 GB move toward it and back under the manager's lock. `/admin/wake` still tries at once.
+- XTTS `/analyze-clips` and `/clone-voice` answer a GPU with no room with the same `503`, reason and
+  `Retry-After` as the other routes, not the old `503 GPU OOM` (#35).
+- XTTS, Qwen: a request waiting while a seeded generation holds the sampler waits on a generation thread
+  (`XTTS_GENERATION_THREADS`, `TTS_GENERATION_THREADS`, default 8), not in the pool the rest of the engine's
+  work shares, and gives up with `503` after `XTTS_RNG_WAIT_S` / `TTS_RNG_WAIT_S` (default 60 s). Many waiting
+  requests used to fill that pool and stall clone, latent and upload work for everyone. A seeded XTTS stream waits
+  before its `200`, generates nothing if its client left while it waited, and ends after `XTTS_RNG_WAIT_S` with no
+  reads instead of holding the sampler for the full 300 s stall timeout.
+- XTTS, Qwen: a checkpoint that fails to reload after an idle unload is dropped and stock is selected, as a failed
+  `/admin/load` already did. Every request used to keep retrying the broken directory until an admin stepped in.
+- Qwen: a GPU/CPU move that fails (and frees the models) clears `/health`'s `weights`, which kept reporting a
+  fingerprint for weights no longer loaded.
+- Whisper: at most `STT_MAX_DECODES` (default 2) requests decode at once, across `/transcribe` and
+  `/transcriptions` (whose fetch counts too); the rest queue for `STT_QUEUE_TIMEOUT_S`, then `503`. Nothing used to
+  bound the downloads, base64 bodies and ffmpeg processes in flight. A WAV or FLAC that `open_audio` refuses (a
+  sample rate it doesn't take) is decoded by ffmpeg instead of answering `400`. A test now triggers each argus-cortex fetch-failure message that sorts a failed
+  `audio_url` into `502`/`413`/`400`, so a reworded message fails CI.
+
 ## [0.1.0] - 2026-11-22
 
 ### Added

@@ -131,6 +131,39 @@ class SamplingParamsTest(unittest.TestCase):
             self.assertEqual(kwargs["temperature"], 0.4)
             self.assertEqual(kwargs["topk"], 15)
 
+    def test_seed_is_applied_before_each_generation(self):
+        order = []
+
+        class Gen(_Generator):
+            def generate(self, **kwargs):
+                order.append("generate")
+                return _Audio()
+
+            def generate_stream(self, **kwargs):
+                order.append("generate_stream")
+                yield _Audio()
+
+        with mock.patch.object(srv._mgr, "_generator", Gen()), mock.patch.object(
+            srv, "_resolve_context", return_value=(0, [], {})
+        ), mock.patch("torch.manual_seed", side_effect=lambda s: order.append(("torch", s))), mock.patch(
+            "numpy.random.seed", side_effect=lambda s: order.append(("numpy", s))
+        ), mock.patch.object(srv.random, "seed", side_effect=lambda s: order.append(("random", s))):
+            srv._generate_audio(srv.SynthesiseRequest(text="hello", seed=5))
+            list(srv._generate_stream_chunks(srv.SynthesiseRequest(text="hello", seed=6), threading.Event()))
+            srv._generate_audio(srv.SynthesiseRequest(text="hello"))
+        self.assertEqual(
+            order,
+            [("random", 5), ("numpy", 5), ("torch", 5), "generate",
+             ("random", 6), ("numpy", 6), ("torch", 6), "generate_stream",
+             "generate"],  # unseeded: nothing reseeded
+        )
+
+    def test_seed_must_fit_the_contract_range(self):
+        self.assertEqual(srv.SynthesiseRequest(text="hi", seed=2**32 - 1).seed, 2**32 - 1)
+        for bad in (-1, 2**32, 1.5):
+            with self.assertRaises(ValidationError):
+                srv.SynthesiseRequest(text="hi", seed=bad)
+
 
 if __name__ == "__main__":
     unittest.main()

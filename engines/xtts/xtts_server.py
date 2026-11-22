@@ -17,6 +17,7 @@ engines, so a client can switch engines by changing its URL:
   GET  /speakers           — built-in XTTS studio speakers
   GET  /health             — status + GPU memory
   POST /admin/{evict,unload,wake}
+  POST /admin/load         — load a fine-tuned checkpoint from XTTS_CHECKPOINT_ROOT
 
 GPU memory lifecycle (three-state, like the Qwen sidecar / ModernBERT):
   unloaded → cpu → gpu
@@ -42,11 +43,33 @@ Env vars:
   XTTS_KEEP_ALIVE_CPU  — idle seconds on CPU before full unload (default 600)
   XTTS_TEMPERATURE     — sampling temperature (default 0.7)
   XTTS_STREAM_CHUNK_SIZE — GPT tokens per streamed audio chunk (default 20)
+  XTTS_CPU_FALLBACK    — "1" (default): when the model can't be moved onto the GPU
+                         (CUDA OOM), synthesise on the CPU copy instead; "0": 503
+  XTTS_OOM_RETRY_AFTER_S — Retry-After on that 503 (default 30). A promotion that ran out of memory is not
+                         tried again for this long: requests run on the CPU (or get the 503) without
+                         moving the weights, and only /admin/wake retries sooner
+  XTTS_RNG_WAIT_S      — seconds a generation waits for the sampler while a seeded one holds it before it is
+                         answered 503 (default 60; 0 waits for ever). A seeded stream whose client takes
+                         nothing for this long is ended, so it can't hold the sampler longer
+  XTTS_GENERATION_THREADS — threads that run generations (default 8). Generations wait for the sampler
+                         there, never in the pool every other to_thread call shares
+  XTTS_CHECKPOINT_ROOT — directory of fine-tuned checkpoints POST /admin/load may load
+                         (unset: the route answers 503). See docs/xtts.md.
+  ECHO_VERSION / ECHO_REVISION — the image's release and git revision (build args),
+                         reported in /health as ``image``
+
+  A synth request may send ``device: "cpu"`` (a client does when argus-iris refuses
+  its GPU lease): the model is used where it is (loaded to CPU if it isn't) and is
+  not promoted. While CPU work holds a lease the model is not moved, so other
+  requests join it on the CPU. A GPU promotion that fails moves the weights back to
+  the CPU and frees the cache, so the model stays usable (state ``cpu``).
   S3_ENDPOINT_URL / S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY /
   S3_BUCKET_NAME / S3_PUBLIC_URL
 """
 
 import asyncio
+import contextvars
+import functools
 import gc
 import io
 import json
@@ -59,15 +82,20 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 import contextlib
+import hashlib
+import random
 from contextlib import asynccontextmanager
 from enum import Enum
-from typing import Optional
-from urllib.parse import urlsplit
+from pathlib import Path
+from typing import Literal, Optional
+from urllib.parse import quote, urlsplit
 
 import structlog
 from argus_cortex.auth import bearer
-from starlette.requests import HTTPConnection
+from argus_cortex.fs import PathRefused, safe_join
+from starlette.requests import HTTPConnection, Request
 from fastapi import Depends, FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
@@ -84,6 +112,15 @@ KEEP_ALIVE_GPU: float = float(os.getenv("XTTS_KEEP_ALIVE_GPU", "120"))
 KEEP_ALIVE_CPU: float = float(os.getenv("XTTS_KEEP_ALIVE_CPU", "600"))
 TEMPERATURE: float = float(os.getenv("XTTS_TEMPERATURE", "0.7"))
 STREAM_CHUNK_SIZE: int = int(os.getenv("XTTS_STREAM_CHUNK_SIZE", "20"))
+CPU_FALLBACK: bool = os.getenv("XTTS_CPU_FALLBACK", "1").strip().lower() not in ("0", "false", "no", "off")
+OOM_RETRY_AFTER_S: int = int(os.getenv("XTTS_OOM_RETRY_AFTER_S", "30"))
+RNG_WAIT_S: float = float(os.getenv("XTTS_RNG_WAIT_S", "60"))
+GENERATION_THREADS: int = max(1, int(os.getenv("XTTS_GENERATION_THREADS", "8")))
+# Fine-tuned checkpoints POST /admin/load may load, one directory each (see _resolve_checkpoint).
+CHECKPOINT_ROOT: str = os.getenv("XTTS_CHECKPOINT_ROOT", "").strip()
+# The image's identity, baked in at build time (release.yml); None for a local build.
+ECHO_VERSION: Optional[str] = os.getenv("ECHO_VERSION", "").strip() or None
+ECHO_REVISION: Optional[str] = os.getenv("ECHO_REVISION", "").strip() or None
 
 # Reference-clip preprocessing (applied at clone time, before latents).
 PREPROCESS: bool = os.getenv("XTTS_PREPROCESS", "1") == "1"
@@ -153,6 +190,12 @@ class TTSState(str, Enum):
     ERROR = "error"
 
 
+class GpuUnavailable(RuntimeError):
+    """The model could not be moved onto the GPU (CUDA out of memory). It is back on
+    the CPU, intact; the request runs there (``XTTS_CPU_FALLBACK``) or is answered 503
+    with this reason."""
+
+
 def _drop_cuda_attributes(model) -> None:
     """Drop CUDA tensors held as plain attributes, which ``Module.cpu()`` does not move (#22).
 
@@ -183,6 +226,245 @@ def _release_cuda_cache() -> None:
     torch.cuda.empty_cache()
 
 
+# ── Weights: checkpoints and their hashes ────────────────────────────────────
+
+# What a checkpoint directory must hold: what Xtts.load_checkpoint reads. speakers_xtts.pth is optional (without it
+# the model has no built-in speakers, so a request needs a voice_clone_id).
+CHECKPOINT_REQUIRED = ("config.json", "model.pth", "vocab.json")
+CHECKPOINT_OPTIONAL = ("speakers_xtts.pth",)
+
+
+class CheckpointRefused(Exception):
+    """``POST /admin/load`` can't use the named checkpoint; ``status`` is the HTTP answer."""
+
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _resolve_checkpoint(name: str) -> Path:
+    """The directory of checkpoint *name* under ``XTTS_CHECKPOINT_ROOT``, checked before anything is unloaded.
+
+    503 when no root is configured, 400 for a name that escapes the root (argus-cortex ``safe_join``: ``..``, an
+    absolute path, a symlink out), 404 when there is no such directory, 422 when it isn't an XTTS checkpoint."""
+    if not CHECKPOINT_ROOT:
+        raise CheckpointRefused(503, "XTTS_CHECKPOINT_ROOT is not set: this engine loads no checkpoints")
+    root = Path(CHECKPOINT_ROOT)
+    if not root.is_dir():
+        raise CheckpointRefused(503, f"XTTS_CHECKPOINT_ROOT ({CHECKPOINT_ROOT}) is not a directory")
+    try:
+        path = safe_join(root, name, label="checkpoint")
+    except PathRefused as exc:
+        raise CheckpointRefused(400, str(exc)) from None
+    if not path.exists():
+        raise CheckpointRefused(404, f"no checkpoint {name!r} under XTTS_CHECKPOINT_ROOT")
+    if not path.is_dir():
+        raise CheckpointRefused(422, f"checkpoint {name!r} is not a directory")
+    base = root.resolve()
+    missing = [f for f in CHECKPOINT_REQUIRED if not (path / f).is_file()]
+    if missing:
+        raise CheckpointRefused(
+            422, f"checkpoint {name!r} is not an XTTS checkpoint: missing {', '.join(missing)}"
+        )
+    for f in CHECKPOINT_REQUIRED + CHECKPOINT_OPTIONAL:
+        if (path / f).exists() and not (path / f).resolve().is_relative_to(base):
+            raise CheckpointRefused(400, f"checkpoint {name!r}: {f} links outside XTTS_CHECKPOINT_ROOT")
+    try:
+        config = json.loads((path / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CheckpointRefused(422, f"checkpoint {name!r}: config.json is not JSON ({exc})") from None
+    if not isinstance(config, dict) or config.get("model") != "xtts":
+        raise CheckpointRefused(422, f"checkpoint {name!r}: config.json is not an XTTS config (model != \"xtts\")")
+    return path
+
+
+# sha256 by (resolved path, size, mtime): a reload of unchanged files (after an idle unload) is not hashed again.
+_hash_cache: dict[tuple[str, int, int], str] = {}
+_hash_cache_lock = threading.Lock()
+
+
+def _sha256(path: Path) -> str:
+    st = path.stat()
+    key = (str(path.resolve()), st.st_size, st.st_mtime_ns)
+    with _hash_cache_lock:
+        if key in _hash_cache:
+            return _hash_cache[key]
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    value = digest.hexdigest()
+    with _hash_cache_lock:
+        _hash_cache[key] = value
+    return value
+
+
+def _weight_files(paths: dict[str, Path]) -> list[dict]:
+    """``[{name, sha256, bytes}]`` for the files a load read. Blocking: called in the load's worker thread."""
+    return [
+        {"name": name, "sha256": _sha256(path), "bytes": path.stat().st_size}
+        for name, path in sorted(paths.items())
+    ]
+
+
+def _fingerprint(files: Optional[list[dict]]) -> Optional[str]:
+    """One sha256 for a loaded weight set, recomputable from ``/health``'s ``weights.files`` (docs/api.md, "Weights
+    fingerprint"): one line ``<name>:<sha256>`` per file, the lines sorted byte-wise as UTF-8, each ending in ``\\n``
+    (the last one too), sha256 of those bytes, lowercase hex. Identical to the Qwen engine's."""
+    if files is None:
+        return None
+    lines = sorted((f"{f['name']}:{f['sha256']}\n".encode() for f in files))
+    return hashlib.sha256(b"".join(lines)).hexdigest()
+
+
+# ── Seeded generation ────────────────────────────────────────────────────────
+
+SEED_MAX = 2**32 - 1  # numpy's legacy seed range, and every engine's contract bound
+
+
+class RngBusy(Exception):
+    """A generation waited ``XTTS_RNG_WAIT_S`` for the sampler while a seeded one held it: answered 503."""
+
+
+class _RngGate:
+    """Who may draw from torch's process-wide RNG while a generation samples.
+
+    Unseeded generations share it (they run side by side, as before seeds existed). A seeded one runs alone: it
+    waits for those in flight, new ones wait for it, and it seeds at the start, so nothing else draws between its
+    seed and its last sample. Blocking (threading): enter it from a generation thread (_GENERATION_POOL), never the
+    event loop or the shared to_thread pool. Waiting seeded generations go first, so a stream of unseeded ones
+    can't starve them. A wait longer than *timeout* raises RngBusy. Entering and leaving needn't happen on the same
+    thread (a stream enters before its response starts and its producer thread leaves)."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._shared = 0
+        self._exclusive = False
+        self._waiting = 0
+
+    def enter_shared(self, timeout: Optional[float] = None) -> None:
+        with self._cond:
+            if not self._cond.wait_for(lambda: not self._exclusive and not self._waiting, timeout):
+                raise RngBusy(f"waited {timeout:g}s for a seeded generation to finish")
+            self._shared += 1
+
+    def leave_shared(self) -> None:
+        with self._cond:
+            self._shared -= 1
+            self._cond.notify_all()
+
+    def enter_exclusive(self, timeout: Optional[float] = None) -> None:
+        with self._cond:
+            self._waiting += 1
+            try:
+                entered = self._cond.wait_for(lambda: not self._exclusive and not self._shared, timeout)
+            finally:
+                self._waiting -= 1
+            if not entered:
+                self._cond.notify_all()  # unseeded generations held back by this one may go
+                raise RngBusy(f"waited {timeout:g}s for the generations in flight to finish")
+            self._exclusive = True
+
+    def leave_exclusive(self) -> None:
+        with self._cond:
+            self._exclusive = False
+            self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def shared(self, timeout: Optional[float] = None):
+        self.enter_shared(timeout)
+        try:
+            yield
+        finally:
+            self.leave_shared()
+
+    @contextlib.contextmanager
+    def exclusive(self, timeout: Optional[float] = None):
+        self.enter_exclusive(timeout)
+        try:
+            yield
+        finally:
+            self.leave_exclusive()
+
+
+_rng_gate = _RngGate()
+# Generations run here, not in the default executor: one waiting for the gate holds a thread, and a full default
+# pool would stall every other to_thread call (latents, clone work, WAV encoding, S3 uploads).
+_GENERATION_POOL = ThreadPoolExecutor(max_workers=GENERATION_THREADS, thread_name_prefix="xtts-gen")
+
+
+def _rng_timeout() -> Optional[float]:
+    return RNG_WAIT_S if RNG_WAIT_S > 0 else None
+
+
+def _seed_rngs(seed: int) -> None:
+    """Seed every RNG generation can draw from: python's, numpy's and torch's (``manual_seed`` seeds the CPU
+    generator and every CUDA device's)."""
+    random.seed(seed)
+    with contextlib.suppress(ImportError):
+        import numpy as np
+
+        np.random.seed(seed)
+    import torch
+
+    torch.manual_seed(seed)
+
+
+def _enter_sampling(seed: Optional[int]):
+    """Enter the gate for one generation (in a generation thread): seeded and alone, or unseeded and shared.
+    Returns the call that leaves it. RngBusy after ``XTTS_RNG_WAIT_S``. See _RngGate."""
+    if seed is None:
+        _rng_gate.enter_shared(_rng_timeout())
+        return _rng_gate.leave_shared
+    _rng_gate.enter_exclusive(_rng_timeout())
+    try:
+        _seed_rngs(seed)
+    except BaseException:
+        _rng_gate.leave_exclusive()
+        raise
+    return _rng_gate.leave_exclusive
+
+
+@contextlib.contextmanager
+def _sampling(seed: Optional[int]):
+    """Around one generation (in its generation thread). See _enter_sampling."""
+    leave = _enter_sampling(seed)
+    try:
+        yield
+    finally:
+        leave()
+
+
+async def _in_generation_thread(fn, *args):
+    """``fn(*args)`` on a generation thread (as asyncio.to_thread, context included, but not the shared pool)."""
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    return await loop.run_in_executor(_GENERATION_POOL, functools.partial(ctx.run, fn, *args))
+
+
+async def _enter_sampling_async(seed: Optional[int]):
+    """_enter_sampling from the event loop, waiting on a generation thread. A caller cancelled while it waits
+    leaves the gate as soon as the wait ends, so a gate entered for nobody is never held."""
+    fut = asyncio.get_running_loop().run_in_executor(_GENERATION_POOL, _enter_sampling, seed)
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+
+        def _leave(f) -> None:
+            if not f.cancelled() and f.exception() is None:
+                f.result()()
+
+        fut.add_done_callback(_leave)
+        raise
+
+
+def _rng_busy_response(exc: RngBusy) -> JSONResponse:
+    logger.warning("xtts_rng_busy", reason=str(exc))
+    return JSONResponse(
+        status_code=503, content={"error": f"busy: {exc}"}, headers={"Retry-After": "5"}
+    )
+
+
 class XTTSModelManager:
     """Three-state lifecycle: unloaded → cpu → gpu (mirrors the Qwen sidecar)."""
 
@@ -201,10 +483,46 @@ class XTTSModelManager:
         # state itself, awaited through asyncio.shield: a cancelled caller (client
         # gone, timeout) can't strand the state in LOADING or naming the old device.
         self._transition: Optional[asyncio.Task] = None
+        # The weights a load reads: None for the stock model, else (name, directory) of a checkpoint that
+        # /admin/load selected. /admin/load and /admin/unload change it, and so does a load of it that fails (the
+        # stock weights are selected again, so a broken checkpoint isn't retried by every request); an idle unload
+        # keeps it, so the next load reads the same weights.
+        self._checkpoint: Optional[tuple[str, Path]] = None
+        # After a promotion runs out of memory, no request tries another until this (time.monotonic()) passes: each
+        # would move ~2 GB toward the GPU and back under _lock. /admin/wake (ensure_gpu) still tries.
+        self._gpu_refused_until: float = 0.0
+        self._gpu_refused_reason: str = ""
+        # [{name, sha256, bytes}] of the files the last load of the selected weights read; None until one has.
+        # Their fingerprint (_fingerprint), computed with them. Evicting to the CPU and promoting again moves the same
+        # weights, so it keeps both; only a load (re)sets them.
+        self._weight_files: Optional[list[dict]] = None
+        self._weights_fingerprint: Optional[str] = None
+
+    def _set_weight_files(self, files: Optional[list[dict]]) -> None:
+        self._weight_files = files
+        self._weights_fingerprint = _fingerprint(files)
 
     @property
     def state(self) -> TTSState:
         return self._state
+
+    @property
+    def weights(self) -> dict:
+        """``/health``'s ``weights``: the selected checkpoint (None = stock), the files its last load hashed and their
+        fingerprint."""
+        return {
+            "checkpoint": self._checkpoint[0] if self._checkpoint else None,
+            "fingerprint": self._weights_fingerprint,
+            "files": self._weight_files,
+        }
+
+    def identity(self) -> dict:
+        """Which weights a request generates with: call it while holding a lease, so it names the weights that lease
+        holds (``/admin/load`` is refused while any lease is held, so they can't change before the request ends)."""
+        return {
+            "checkpoint": self._checkpoint[0] if self._checkpoint else None,
+            "weights_fingerprint": self._weights_fingerprint,
+        }
 
     @property
     def model(self):
@@ -214,12 +532,9 @@ class XTTSModelManager:
     def is_ready(self) -> bool:
         return self._state in (TTSState.CPU, TTSState.GPU)
 
-    def _load_to_cpu(self) -> None:
-        from TTS.tts.configs.xtts_config import XttsConfig
-        from TTS.tts.models.xtts import Xtts
+    def _stock_paths(self) -> tuple[str, Optional[str], str]:
+        """``(checkpoint_dir, checkpoint_path, config_path)`` of the stock model, downloaded if it isn't cached."""
         from TTS.utils.manage import ModelManager
-
-        logger.info("loading_xtts", model=XTTS_MODEL, target="cpu")
 
         # Download (no-op if cached). coqui-tts may return the checkpoint
         # file itself; load_checkpoint rejects a file passed as checkpoint_dir.
@@ -233,6 +548,22 @@ class XTTSModelManager:
             checkpoint_dir = model_path
         if config_path is None:
             config_path = os.path.join(checkpoint_dir, "config.json")
+        return checkpoint_dir, checkpoint_path, os.fspath(config_path)
+
+    def _load_to_cpu(self) -> None:
+        from TTS.tts.configs.xtts_config import XttsConfig
+        from TTS.tts.models.xtts import Xtts
+
+        checkpoint = self._checkpoint
+        self._set_weight_files(None)  # until this load hashes what it read
+        if checkpoint is None:
+            logger.info("loading_xtts", model=XTTS_MODEL, target="cpu")
+            checkpoint_dir, checkpoint_path, config_path = self._stock_paths()
+        else:
+            logger.info("loading_xtts_checkpoint", checkpoint=checkpoint[0], target="cpu")
+            checkpoint_dir = os.fspath(checkpoint[1])
+            checkpoint_path = os.path.join(checkpoint_dir, "model.pth")
+            config_path = os.path.join(checkpoint_dir, "config.json")
 
         config = XttsConfig()
         config.load_json(str(config_path))
@@ -244,9 +575,20 @@ class XTTSModelManager:
             use_deepspeed=USE_DEEPSPEED,
         )
         model.eval()
+        # The files load_checkpoint read, hashed here (the load's worker thread) once per load, never per request.
+        # A hash that fails fails the load: nothing is assigned, so no model runs unreported.
+        read = {
+            "config.json": Path(config_path),
+            "model.pth": Path(checkpoint_path or os.path.join(checkpoint_dir, "model.pth")),
+        }
+        for name in ("vocab.json",) + CHECKPOINT_OPTIONAL:
+            if os.path.isfile(os.path.join(checkpoint_dir, name)):
+                read[name] = Path(checkpoint_dir, name)
+        files = _weight_files(read)
         self._config = config
         self._model = model
-        logger.info("xtts_loaded_cpu")
+        self._set_weight_files(files)
+        logger.info("xtts_loaded_cpu", checkpoint=checkpoint[0] if checkpoint else None, files=len(files))
 
     def _move_to_device(self, device: str) -> None:
         import torch
@@ -257,15 +599,39 @@ class XTTSModelManager:
             self._model.cpu()
             _drop_cuda_attributes(self._model)
             _release_cuda_cache()
-        else:
+            return
+        try:
             self._model.to(torch.device(device))
+        except BaseException as exc:
+            # A failed .to() leaves some weights on the GPU: put them all back, or every
+            # later request finds a model split across devices while the state says cpu.
+            self._model.cpu()
+            _drop_cuda_attributes(self._model)
+            _release_cuda_cache()
+            if isinstance(exc, Exception) and _is_oom(exc):
+                free = _free_vram_mb()
+                raise GpuUnavailable(
+                    f"CUDA out of memory moving XTTS onto {device}"
+                    + (f" ({free} MiB free)" if free is not None else "")
+                ) from exc
+            raise
 
     async def _do_load(self) -> None:
+        """Load the selected weights to the CPU. A checkpoint that fails to load (from /admin/load, or a lazy reload
+        after an idle unload) is dropped: the stock weights are selected, so the next request loads them rather than
+        retrying the broken directory. /health and every response then name stock (checkpoint null)."""
         try:
             await asyncio.to_thread(self._load_to_cpu)
         except BaseException as exc:
             self._state = TTSState.ERROR
             self._error = str(exc) or type(exc).__name__
+            if self._checkpoint is not None:
+                logger.error(
+                    "xtts_checkpoint_dropped", checkpoint=self._checkpoint[0], reason="load failed", error=self._error
+                )
+                self._error = f"checkpoint {self._checkpoint[0]}: {self._error}"
+                self._checkpoint = None
+                self._set_weight_files(None)
             logger.error("xtts_load_failed", error=self._error)
             raise
         self._state = TTSState.CPU
@@ -299,9 +665,10 @@ class XTTSModelManager:
             with contextlib.suppress(Exception):  # only waiting for the orphaned task; its own handler records any failure
                 await asyncio.shield(task)
 
-    async def _ensure_gpu_locked(self) -> None:
+    async def _ensure_gpu_locked(self, retry_now: bool = False) -> None:
         """Promote to GPU (loading first if needed). Caller holds ``_lock``.
-        Raises unless the model is then resident, so a lease never gets None."""
+        Raises unless the model is then resident, so a lease never gets None. Within ``XTTS_OOM_RETRY_AFTER_S`` of
+        a promotion that ran out of memory it raises GpuUnavailable without trying, unless *retry_now*."""
         await self._await_transition()
         if self._state == TTSState.GPU and self._model is not None:
             return
@@ -312,8 +679,16 @@ class XTTSModelManager:
 
         if self._state == TTSState.CPU:
             if DEVICE.startswith("cuda"):
+                if not retry_now and time.monotonic() < self._gpu_refused_until:
+                    raise GpuUnavailable(f"{self._gpu_refused_reason} (not retried for {OOM_RETRY_AFTER_S}s)")
                 logger.info("xtts_promoting_to_gpu", device=DEVICE)
-                await self._run_transition(self._do_move(DEVICE, TTSState.GPU))
+                try:
+                    await self._run_transition(self._do_move(DEVICE, TTSState.GPU))
+                except GpuUnavailable as exc:
+                    self._gpu_refused_until = time.monotonic() + OOM_RETRY_AFTER_S
+                    self._gpu_refused_reason = str(exc)
+                    raise
+                self._gpu_refused_until = 0.0
                 logger.info("xtts_on_gpu")
             else:
                 self._state = TTSState.GPU  # CPU-only: treat as ready
@@ -321,13 +696,45 @@ class XTTSModelManager:
         if self._state != TTSState.GPU or self._model is None:
             raise RuntimeError(f"xtts model not ready (state {self._state.value})")
 
+    async def _ensure_loaded_locked(self) -> None:
+        """Load to CPU if nothing is resident; a model already on the GPU stays there.
+        Caller holds ``_lock``."""
+        await self._await_transition()
+        if self._state in (TTSState.UNLOADED, TTSState.ERROR):
+            self._state = TTSState.LOADING
+            await self._run_transition(self._do_load())
+        if self._state not in (TTSState.CPU, TTSState.GPU) or self._model is None:
+            raise RuntimeError(f"xtts model not ready (state {self._state.value})")
+
+    def _cpu_work_in_flight(self) -> bool:
+        """Leases are held on a model on the CPU of a GPU deployment: moving it would break that work."""
+        return DEVICE.startswith("cuda") and self._state == TTSState.CPU and self._active > 0
+
+    def _arm_evict_if_unleased(self) -> None:
+        """After a failed acquire or promotion: a model left loaded with nothing in flight still gets its idle
+        timer, so a refused request doesn't keep it in RAM for good."""
+        if self._active == 0 and self.is_ready:
+            self._last_used = time.time()
+            self._arm_evict()
+
     async def ensure_gpu(self) -> None:
         """Guarantee the model is on GPU and reset the idle timer.
 
         This takes no lease, so it only suits callers that don't then use the
-        model (preload, /admin/wake). Inference must go through ``lease()``."""
+        model (preload, /admin/wake). Inference must go through ``lease()``.
+        While CPU work holds a lease the model stays on the CPU (it is loaded, not
+        moved); the next GPU request after that work promotes it. Raises
+        :class:`GpuUnavailable` when the promotion runs out of memory."""
         async with self._lock:
-            await self._ensure_gpu_locked()
+            try:
+                if self._cpu_work_in_flight():
+                    logger.info("xtts_gpu_deferred_cpu_work_in_flight", active=self._active)
+                    await self._ensure_loaded_locked()
+                else:
+                    await self._ensure_gpu_locked(retry_now=True)  # an explicit wake tries even in the cooldown
+            except BaseException:
+                self._arm_evict_if_unleased()
+                raise
             self._last_used = time.time()
             if self._active == 0:
                 self._arm_evict()
@@ -336,14 +743,39 @@ class XTTSModelManager:
     def active(self) -> int:
         return self._active
 
-    async def acquire(self) -> None:
-        """Promote to GPU and take a lease: until the matching ``release()``
-        the model is neither demoted nor unloaded."""
+    async def acquire(self, device: Optional[str] = None) -> str:
+        """Take a lease: until the matching ``release()`` the model is neither
+        moved nor unloaded. Returns where it runs (``cpu`` or ``XTTS_DEVICE``).
+
+        By default the model is promoted to the GPU. ``device="cpu"`` uses it where
+        it is, loading to CPU if needed (a model already on the GPU runs there: it
+        holds that VRAM either way). A promotion that runs out of memory runs on the
+        CPU (``XTTS_CPU_FALLBACK``) or raises :class:`GpuUnavailable`. While CPU work
+        holds a lease the model can't move, so other requests join it there."""
         async with self._lock:
-            await self._ensure_gpu_locked()
+            try:
+                if not DEVICE.startswith("cuda"):
+                    await self._ensure_gpu_locked()  # CPU-only deployment: "gpu" is the CPU
+                elif device == "cpu":
+                    await self._ensure_loaded_locked()
+                elif self._cpu_work_in_flight():
+                    logger.info("xtts_gpu_deferred_cpu_work_in_flight", active=self._active)
+                    await self._ensure_loaded_locked()
+                else:
+                    try:
+                        await self._ensure_gpu_locked()
+                    except GpuUnavailable as exc:
+                        if not CPU_FALLBACK:
+                            raise
+                        logger.warning("xtts_gpu_unavailable_running_on_cpu", reason=str(exc))
+                        await self._ensure_loaded_locked()
+            except BaseException:
+                self._arm_evict_if_unleased()
+                raise
             self._active += 1
             self._last_used = time.time()
             self._cancel_evict()
+            return "cpu" if DEVICE.startswith("cuda") and self._state == TTSState.CPU else DEVICE
 
     def release(self) -> None:
         """Drop a lease (event-loop thread only). The idle timer starts from
@@ -354,10 +786,11 @@ class XTTSModelManager:
             self._arm_evict()
 
     @asynccontextmanager
-    async def lease(self):
-        await self.acquire()
+    async def lease(self, device: Optional[str] = None):
+        """``acquire()``/``release()`` around the body; yields where the model runs."""
+        ran_on = await self.acquire(device)
         try:
-            yield self._model
+            yield ran_on
         finally:
             self.release()
 
@@ -387,9 +820,11 @@ class XTTSModelManager:
             self._arm_evict()
         return True
 
-    async def unload(self, force: bool = False) -> bool:
+    async def unload(self, force: bool = False, to_stock: bool = False) -> bool:
         """Drop the model entirely. Skipped (False) while a lease is held,
-        unless ``force`` (app shutdown)."""
+        unless ``force`` (app shutdown). ``to_stock`` (``/admin/unload``) also
+        drops a loaded checkpoint, so the next load reads the stock weights;
+        the idle unload keeps it."""
         async with self._lock:
             if self._active > 0 and not force:
                 logger.info("xtts_unload_deferred", active=self._active)
@@ -397,13 +832,44 @@ class XTTSModelManager:
             # An orphaned load's thread would otherwise assign the model after this frees it.
             await self._await_transition()
             self._cancel_evict()
-            if self._model is not None:
-                del self._model
-                self._model = None
-            self._config = None
-            _release_cuda_cache()
+            self._free_locked()
+            if to_stock and self._checkpoint is not None:
+                logger.info("xtts_checkpoint_dropped", checkpoint=self._checkpoint[0])
+                self._checkpoint = None
+                self._set_weight_files(None)
             self._state = TTSState.UNLOADED
             logger.info("xtts_fully_unloaded")
+            return True
+
+    def _free_locked(self) -> None:
+        """Drop the model and return its memory. Caller holds ``_lock``; does not set the state."""
+        if self._model is not None:
+            del self._model
+            self._model = None
+        self._config = None
+        _release_cuda_cache()
+
+    async def load_weights(self, checkpoint: Optional[tuple[str, Path]]) -> bool:
+        """``/admin/load``: replace whatever is loaded by *checkpoint* (``(name, directory)``; None = stock), loaded
+        to the CPU now and hashed. False while a lease is held (busy): nothing changes.
+
+        It waits for a load or move in progress, frees the old model, then loads the new one as a shielded
+        transition, so a cancelled caller can't strand it half-way. A load that fails leaves nothing loaded and the
+        stock weights selected (_do_load; the state says ``error``; the next request loads stock), and raises."""
+        async with self._lock:
+            if self._active > 0:
+                logger.info("xtts_load_refused_busy", active=self._active)
+                return False
+            await self._await_transition()
+            self._cancel_evict()
+            self._free_locked()
+            self._checkpoint = checkpoint
+            self._set_weight_files(None)
+            self._state = TTSState.LOADING
+            await self._run_transition(self._do_load())
+            self._last_used = time.time()
+            if self._active == 0:
+                self._arm_evict()
             return True
 
     def _cancel_evict(self) -> None:
@@ -702,12 +1168,29 @@ def _list_speakers() -> list[str]:
 async def lifespan(app: FastAPI):
     _require_s3_credentials()  # fail at startup, not on the first upload
     if PRELOAD:
-        await _mgr.ensure_gpu()
+        try:
+            await _mgr.ensure_gpu()
+        except GpuUnavailable as exc:
+            # No room on the GPU now is no reason to crash-loop: the model is on the CPU and the
+            # first request promotes it (or runs there, per XTTS_CPU_FALLBACK).
+            logger.warning("xtts_preload_gpu_unavailable", reason=str(exc))
     yield
     await _mgr.unload(force=True)
 
 
 app = FastAPI(title="Voice Stack — XTTS-v2", version="1.0.0", lifespan=lifespan)
+
+
+@app.exception_handler(GpuUnavailable)
+async def _gpu_unavailable(_request, exc: GpuUnavailable) -> JSONResponse:
+    """No room on the GPU and no CPU fallback: busy, with the reason, never a bare 500. The promotion runs inside
+    the lease, before any handler's try, so this handler answers it on every route."""
+    logger.warning("xtts_gpu_unavailable", reason=str(exc))
+    return JSONResponse(
+        status_code=503,
+        content={"error": str(exc), "detail": str(exc), "gpu": _gpu_memory_info()},
+        headers={"Retry-After": str(OOM_RETRY_AFTER_S)},
+    )
 
 
 # ── Request models ────────────────────────────────────────────────────────────
@@ -722,21 +1205,27 @@ class SynthesiseRequest(BaseModel):
     emotion: str = "neutral"                  # unused by XTTS; accepted for compat
     language: str = Field(default="en")
     speed: Optional[float] = None
+    # "cpu": don't promote to the GPU (a client sends it when argus-iris refuses its GPU lease).
+    device: Optional[Literal["cpu"]] = None
+    # Seeds the sampler for this request (python, numpy, torch CPU and CUDA). Same seed, text, voice, device and
+    # weights: the same audio, within the limits docs/api.md states.
+    seed: Optional[int] = Field(default=None, ge=0, le=SEED_MAX)
 
 
 # ── Synthesis helpers ──────────────────────────────────────────────────────────
 
 
-def _run_inference(text: str, language: str, gpt, spk, speed: float):
-    out = _mgr.model.inference(
-        text,
-        language,
-        gpt,
-        spk,
-        temperature=TEMPERATURE,
-        speed=speed,
-        enable_text_splitting=True,
-    )
+def _run_inference(text: str, language: str, gpt, spk, speed: float, seed: Optional[int] = None):
+    with _sampling(seed):
+        out = _mgr.model.inference(
+            text,
+            language,
+            gpt,
+            spk,
+            temperature=TEMPERATURE,
+            speed=speed,
+            enable_text_splitting=True,
+        )
     return out["wav"]
 
 
@@ -750,10 +1239,13 @@ async def synthesise(req: SynthesiseRequest):
         return JSONResponse(status_code=503, content={"error": "Model still loading"})
 
     t_req = time.monotonic()
-    # The lease keeps the model on GPU from latent resolution to the end of
-    # inference; the idle eviction can't move it mid-synthesis.
-    async with _mgr.lease():
+    # The lease keeps the model where it is (GPU, or CPU for device "cpu" or a
+    # fallback) from latent resolution to the end of inference; the idle eviction
+    # can't move it mid-synthesis. A promotion with no room raises GpuUnavailable
+    # (the app's 503 handler) unless XTTS_CPU_FALLBACK runs this on the CPU.
+    async with _mgr.lease(req.device) as ran_on:
         t_ready = time.monotonic()
+        identity = _mgr.identity()  # the weights this lease holds; /admin/load is 409 until it ends
 
         try:
             language = _normalise_language(req.language)
@@ -766,7 +1258,9 @@ async def synthesise(req: SynthesiseRequest):
 
         t_gen0 = time.monotonic()
         try:
-            wav = await asyncio.to_thread(_run_inference, req.text, language, gpt, spk, speed)
+            wav = await _in_generation_thread(_run_inference, req.text, language, gpt, spk, speed, req.seed)
+        except RngBusy as exc:
+            return _rng_busy_response(exc)
         except RuntimeError as exc:
             refused = _gpu_error_response(exc, "xtts_gpu_oom")
             if refused is not None:
@@ -804,6 +1298,7 @@ async def synthesise(req: SynthesiseRequest):
         upload_s=round(t_uploaded - t_encoded, 2),
         total_s=round(t_uploaded - t_req, 2),
         rtf=round((t_gen1 - t_gen0) / duration, 2) if duration else None,
+        device=ran_on,
     )
 
     return {
@@ -811,6 +1306,10 @@ async def synthesise(req: SynthesiseRequest):
         "duration": duration,
         "duration_seconds": round(duration, 3),
         "format": "wav",
+        "device": ran_on,
+        "seed": req.seed,
+        "checkpoint": identity["checkpoint"],
+        "weights_fingerprint": identity["weights_fingerprint"],
     }
 
 
@@ -818,7 +1317,7 @@ async def synthesise(req: SynthesiseRequest):
 
 
 @app.post("/synthesise/stream")
-async def synthesise_stream(req: SynthesiseRequest):
+async def synthesise_stream(req: SynthesiseRequest, request: Request = None):
     """Stream raw 24 kHz mono float32 PCM as it is generated (XTTS
     inference_stream). The client concatenates chunks; the trailing
     `X-Sample-Rate`/`X-Audio-Format` headers describe the byte layout."""
@@ -832,9 +1331,11 @@ async def synthesise_stream(req: SynthesiseRequest):
     # demoted or unloaded between the 422 check and the stream starting (which
     # would mean a reload, or a failure after the 200 headers went out). It is
     # handed to the producer thread, which releases it when it is done.
-    await _mgr.acquire()
+    ran_on = await _mgr.acquire(req.device)
     handed_off = False
+    leave_gate = None
     try:
+        identity = _mgr.identity()  # the weights this lease holds; /admin/load is 409 until the stream ends
         # Resolve (and validate) the voice up front so a bad clone id is a 422,
         # not a truncated 200 stream.
         try:
@@ -844,6 +1345,23 @@ async def synthesise_stream(req: SynthesiseRequest):
             return JSONResponse(status_code=422, content={"error": str(exc)})
         device = next(_mgr.model.parameters()).device
         gpt, spk = _device_tensor(gpt, device), _device_tensor(spk, device)
+
+        # inference_stream samples lazily, chunk by chunk: a seeded stream keeps the sampler to itself until its last
+        # chunk (see _RngGate). Entered here, on a generation thread, before the 200: a wait past XTTS_RNG_WAIT_S is
+        # a 503, not an empty stream. The producer thread leaves it.
+        try:
+            leave_gate = await _enter_sampling_async(req.seed)
+        except RngBusy as exc:
+            return _rng_busy_response(exc)
+        if request is not None and await request.is_disconnected():
+            # Gone while it waited: don't take the sampler (and the GPU) for nobody.
+            logger.info("xtts_stream_client_gone_before_start")
+            return Response(status_code=499)
+        # A seeded stream holds the sampler: a client that takes nothing for XTTS_RNG_WAIT_S ends it, so it can't
+        # keep every other generation waiting for the full stall timeout.
+        stall_timeout = _STREAM_STALL_TIMEOUT_S
+        if req.seed is not None and _rng_timeout() is not None:
+            stall_timeout = min(stall_timeout, RNG_WAIT_S)
 
         # Chunks travel on an asyncio.Queue (filled via call_soon_threadsafe), so
         # the consumer awaits without holding an executor thread; ``slots`` bounds
@@ -861,7 +1379,7 @@ async def synthesise_stream(req: SynthesiseRequest):
                 return False
 
         def _put(item: bytes) -> bool:
-            deadline = time.monotonic() + _STREAM_STALL_TIMEOUT_S
+            deadline = time.monotonic() + stall_timeout
             while not stop.is_set():
                 if slots.acquire(timeout=_STREAM_PUT_POLL_S):
                     return _deliver(item)
@@ -882,6 +1400,8 @@ async def synthesise_stream(req: SynthesiseRequest):
 
             stream = None
             try:
+                if stop.is_set():
+                    return  # the client left before generation started
                 stream = _mgr.model.inference_stream(
                     req.text,
                     language,
@@ -907,6 +1427,7 @@ async def synthesise_stream(req: SynthesiseRequest):
                 if close is not None:
                     with contextlib.suppress(Exception):  # closing an abandoned stream generator is best-effort
                         close()
+                leave_gate()
                 # The end-of-stream sentinel bypasses ``slots``: it is always
                 # delivered, so a consumer can never wait forever.
                 _deliver(None)
@@ -919,6 +1440,8 @@ async def synthesise_stream(req: SynthesiseRequest):
         handed_off = True
     finally:
         if not handed_off:
+            if leave_gate is not None:
+                leave_gate()
             _mgr.release()
 
     async def event_stream():
@@ -939,6 +1462,9 @@ async def synthesise_stream(req: SynthesiseRequest):
             "X-Sample-Rate": str(SAMPLE_RATE),
             "X-Audio-Format": "pcm_f32le",
             "X-Channels": "1",
+            "X-XTTS-Device": ran_on,
+            "X-Echo-Checkpoint": quote(identity["checkpoint"] or ""),  # percent-encoded; empty for stock
+            "X-Echo-Weights": identity["weights_fingerprint"] or "",
         },
     )
 
@@ -1367,6 +1893,8 @@ async def analyze_clips(audio: list[UploadFile] = File(...)):
         names = [clip.filename or f"clip-{i + 1}" for i, clip in enumerate(clips)]
         async with _mgr.lease():
             result = await asyncio.to_thread(_analyze_clips, raw_paths, names)
+    except GpuUnavailable:
+        raise  # the app's handler: 503 with Retry-After
     except RuntimeError as exc:
         refused = _gpu_error_response(exc, "xtts_analyze_gpu_oom")
         if refused is not None:
@@ -1471,6 +1999,8 @@ async def clone_voice(
                 gpt_cond_latent, speaker_embedding = await asyncio.to_thread(
                     _conditioning_latents, latent_paths
                 )
+        except GpuUnavailable:
+            raise  # the app's handler: 503 with Retry-After
         except RuntimeError as exc:
             refused = _gpu_error_response(exc, "xtts_clone_gpu_oom")
             if refused is not None:
@@ -1850,6 +2380,8 @@ async def health():
         "keep_alive_gpu": KEEP_ALIVE_GPU,
         "keep_alive_cpu": KEEP_ALIVE_CPU,
         "gpu": _resident_gpu(),
+        "weights": _mgr.weights,
+        "image": _image(),
     }
     if _gpu_fault is not None:
         # A fatal CUDA error: fail the container healthcheck so the worker is recycled.
@@ -1944,14 +2476,67 @@ async def admin_evict():
 
 @app.post("/admin/unload", dependencies=[Depends(_require_admin)])
 async def admin_unload():
-    """Fully unload the model from memory (GPU + CPU)."""
+    """Fully unload the model from memory (GPU + CPU). A loaded checkpoint is dropped too: the next load is stock."""
     was_loaded = _mgr.state in (TTSState.CPU, TTSState.GPU)
-    if not await _mgr.unload():
+    if not await _mgr.unload(to_stock=True):
         return JSONResponse(
             status_code=409,
             content={"status": "busy", "active": _mgr.active, "model_state": _mgr.state.value},
         )
-    return {"status": "unloaded", "unloaded": was_loaded, "model_state": _mgr.state.value, "gpu": _resident_gpu()}
+    return {
+        "status": "unloaded",
+        "unloaded": was_loaded,
+        "model_state": _mgr.state.value,
+        "gpu": _resident_gpu(),
+        "weights": _mgr.weights,
+    }
+
+
+class LoadRequest(BaseModel):
+    # A directory name under XTTS_CHECKPOINT_ROOT (may be nested: "forge/run-7"); null loads the stock weights.
+    checkpoint: Optional[str] = Field(...)
+
+
+def _image() -> dict:
+    """``/health``'s ``image``: the release and git revision baked in at build time (null for a local build). A
+    container can't see its own image digest; whoever deployed it (compose, iris) knows that."""
+    return {"version": ECHO_VERSION, "revision": ECHO_REVISION}
+
+
+@app.post("/admin/load", dependencies=[Depends(_require_admin)])
+async def admin_load(req: LoadRequest):
+    """Load a fine-tuned checkpoint from ``XTTS_CHECKPOINT_ROOT`` (or the stock weights, for ``null``) onto the CPU,
+    replacing the loaded model, and hash its files. The next request promotes it to the GPU as usual.
+
+    400 a name that escapes the root, 404 no such checkpoint, 422 not an XTTS checkpoint, 409 busy (a request holds
+    the model; nothing changes), 503 no checkpoint root configured, 500 the load failed (nothing is loaded and the
+    stock weights are selected)."""
+    selected = None
+    if req.checkpoint is not None:
+        try:
+            selected = (req.checkpoint, _resolve_checkpoint(req.checkpoint))
+        except CheckpointRefused as exc:
+            logger.warning("xtts_checkpoint_refused", checkpoint=req.checkpoint, status=exc.status, error=str(exc))
+            return JSONResponse(status_code=exc.status, content={"error": str(exc)})
+    try:
+        loaded = await _mgr.load_weights(selected)
+    except Exception as exc:
+        logger.error("xtts_checkpoint_load_failed", checkpoint=req.checkpoint, error=str(exc), exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"loading {req.checkpoint or 'the stock weights'} failed: {exc}",
+                "model_state": _mgr.state.value,
+                "weights": _mgr.weights,
+            },
+        )
+    if not loaded:
+        return JSONResponse(
+            status_code=409,
+            content={"status": "busy", "active": _mgr.active, "model_state": _mgr.state.value},
+        )
+    logger.info("xtts_checkpoint_loaded", checkpoint=req.checkpoint)
+    return {"status": "loaded", "model_state": _mgr.state.value, "weights": _mgr.weights, "gpu": _resident_gpu()}
 
 
 @app.post("/admin/wake", dependencies=[Depends(_require_admin)])

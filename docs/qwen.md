@@ -23,6 +23,8 @@ Differences from the other engines:
   `name`).
 - `voice_description`, `instruction` and `emotion` are used (CustomVoice); the other engines ignore them.
 - `speed` is accepted and ignored.
+- `seed` seeds `/synthesise` once; `/synthesise/stream` seeds sentence *i* (from 0) with `seed + i`, so each
+  sentence is reproducible on its own. See [api.md#reproducibility](api.md#reproducibility).
 
 ## Clones
 
@@ -62,8 +64,8 @@ use the first index in `order`). The response has the XTTS shape (`clips`, `orde
 | --- | --- | --- |
 | `TTS_MODEL_SIZE` | `0.6b` | `0.6b` or `1.7b` (compose: `QWEN_MODEL_SIZE`, also the image build arg) |
 | `TTS_DEVICE` | `cuda:0` | `cuda:N` or `cpu` |
-| `TTS_LOAD_MODELS` | `both` | `both`, `custom_voice` or `base` |
-| `TTS_DEFAULT_SPEAKER` | empty | Speaker for requests that name none |
+| `TTS_LOAD_MODELS` | `both` | `both`, `custom_voice` or `base` (compose: `QWEN_LOAD_MODELS`) |
+| `TTS_DEFAULT_SPEAKER` | empty | Speaker for requests that name none (compose: `QWEN_DEFAULT_SPEAKER`) |
 | `TTS_PRELOAD` | `0` | `1` loads at startup |
 | `TTS_KEEP_ALIVE_GPU` | `120` | Idle seconds on the GPU before moving to CPU. `-1` = never, `0` = at once |
 | `TTS_KEEP_ALIVE_CPU` | `600` | Idle seconds on CPU before unloading. `-1` = never, `0` = at once |
@@ -72,6 +74,8 @@ use the first index in `order`). The response has the XTTS shape (`clips`, `orde
 | `TTS_MAX_CLIPS` | `16` | Most clips per `/analyze-clips`; more is `413` |
 | `TTS_CLIP_MAX_BYTES` | `16777216` | Largest clip for `/clone-voice` and `/analyze-clips` (16 MiB); larger is `413` |
 | `TTS_ANALYZE_THRESHOLD` | `60` | `/analyze-clips` score below which a clip is not recommended |
+| `TTS_CHECKPOINT_ROOT` | empty | Directory of fine-tuned checkpoints `POST /admin/load` may load; empty, the route answers `503`. Compose sets `/checkpoints` and mounts the host's `QWEN_CHECKPOINT_ROOT` (default `./checkpoints/qwen`) there read-only. See [below](#fine-tuned-checkpoints) |
+| `ECHO_VERSION`, `ECHO_REVISION` | empty | The release and git commit, set at image build time (build args); `/health` reports them as `image` |
 | `ARGUS_ADMIN_TOKEN`, `ARGUS_ADMIN_INSECURE` | empty | See [api.md#security](api.md#security) |
 
 Storage is S3 only: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_BUCKET_NAME` (compose:
@@ -79,6 +83,34 @@ Storage is S3 only: `S3_ENDPOINT_URL`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY
 `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` have no default: the server refuses to start without both, and
 likewise when `S3_ENDPOINT_URL` is not an http(s) URL (an empty one used to fail each `/synthesise` after
 rendering) or `S3_BUCKET_NAME` is empty.
+
+## Fine-tuned checkpoints
+
+`POST /admin/load {"checkpoint": "<name>"}` loads a fine-tune from `TTS_CHECKPOINT_ROOT/<name>`; `/admin/unload`
+goes back to stock. Statuses, what happens to requests meanwhile, and how long a checkpoint stays selected:
+[api.md](api.md#fine-tuned-checkpoints).
+
+A checkpoint is a Hugging Face model directory that `Qwen3TTSModel.from_pretrained` loads, as the Qwen3-TTS
+fine-tuning scripts write it (a copy of the model they started from, with the trained weights and `config.json`
+written over it):
+
+| File | Required | What |
+| --- | --- | --- |
+| `config.json` | yes | `"model_type": "qwen3_tts"`, and `tts_model_type` `base` or `custom_voice` (which model it replaces, below). `voice_design` is refused: this engine doesn't serve that model |
+| `model.safetensors` or `model.safetensors.index.json` (+ shards) | yes | The weights |
+| `generation_config.json` | yes | Sampling defaults (`from_pretrained` reads it) |
+| `tokenizer_config.json` and the tokenizer files it names (`vocab.json`, `merges.txt`, ...) | yes | The text tokenizer the processor loads |
+| `speech_tokenizer/` (`config.json`, weights) | yes | The 12 Hz codec (`from_pretrained` loads it from here) |
+
+The checkpoint replaces the model of its `tts_model_type`: a `custom_voice` fine-tune (a new built-in speaker, used
+with `speaker`) replaces CustomVoice, a `base` one replaces Base (cloning). The other model loads stock as
+`TTS_LOAD_MODELS` says; the checkpoint's own model loads whatever `TTS_LOAD_MODELS` is. The checkpoint loads onto
+`TTS_DEVICE` with SDPA attention in bfloat16, as the stock models do.
+
+`/health` `weights.files` lists the sha256 of every file at the top of each loaded model's directory and in its
+`speech_tokenizer/` (dotfiles skipped), prefixed with the slot: `custom_voice/model.safetensors`,
+`base/speech_tokenizer/model.safetensors`, and so on. Both slots are listed, the stock one included, so the whole
+loaded state is pinned. The stock files are read from the Hugging Face cache the image baked. `weights.models` gives each slot's checkpoint and fingerprint; `/synthesise` (`model`, `checkpoint`, `weights_fingerprint`) and `/synthesise/stream` (`X-Echo-Model`, `X-Echo-Checkpoint`, `X-Echo-Weights`) report the slot that spoke each utterance and its fingerprint. See [api.md#weights-fingerprint](api.md#weights-fingerprint).
 
 ## Home Assistant
 

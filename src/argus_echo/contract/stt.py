@@ -9,16 +9,20 @@ The Whisper engine (``engines/whisper/``) serves it. The full reference, with ev
   binary frames, cuts it into utterances with voice activity detection, and sends :class:`StreamPartial` while an
   utterance is open and a :class:`StreamFinal` when it ends. The client may open with a :class:`StreamStart` and
   sends :class:`StreamEnd` to flush the last utterance.
+- ``POST /transcriptions`` transcribes from a URL or base64 (imported from agent-composer's whisper sidecar): a
+  :class:`TranscriptionsRequest` (``audio_url`` fetched by the engine under an SSRF policy, or ``audio_base64``)
+  answered by a :class:`TranscriptionsResult`.
 """
 
 from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 TRANSCRIBE_PATH = "/transcribe"
 STREAM_PATH = "/transcribe/stream"
+TRANSCRIPTIONS_PATH = "/transcriptions"
 
 #: The PCM layout ``/transcribe/stream`` takes: 16 kHz mono little-endian int16, the rate Whisper runs at.
 STREAM_SAMPLE_RATE = 16000
@@ -67,6 +71,46 @@ class Transcription(BaseModel):
     )
     duration: float = Field(ge=0, description="Length of the audio in seconds.")
     segments: list[Segment] = Field(default_factory=list)
+
+
+# ── POST /transcriptions (agent-composer's route) ────────────────────────────
+
+
+class TranscriptionsRequest(BaseModel):
+    """The JSON body of ``POST /transcriptions``: exactly one of ``audio_url`` and ``audio_base64``.
+
+    The engine ignores unknown fields, as composer's sidecar did. Both given is a ``422``, neither a ``400``."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    audio_url: str | None = Field(
+        None,
+        description="An http(s) URL the engine downloads. Every address its host resolves to must be public "
+        "unless the host is in ``STT_AUDIO_URL_ALLOWED_HOSTS``; redirects are not followed by default.",
+    )
+    audio_base64: str | None = Field(
+        None, description="The audio, standard base64; a ``data:...;base64,`` prefix is accepted."
+    )
+    language: str | None = Field(
+        None, description="As :attr:`TranscribeOptions.language` (``en-US`` becomes ``en``); detected when absent."
+    )
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> TranscriptionsRequest:
+        if bool(self.audio_url) == bool(self.audio_base64):
+            raise ValueError("give exactly one of audio_url and audio_base64")
+        return self
+
+
+class TranscriptionsResult(BaseModel):
+    """The answer of ``POST /transcriptions`` (composer's shape, not :class:`Transcription`)."""
+
+    text: str = Field(description="The whole transcript. Empty for silence.")
+    language: str = Field(description="The language used: the one asked for, or the detected one.")
+    duration_seconds: float = Field(ge=0, description="Length of the audio in seconds.")
+    confidence: float = Field(
+        ge=0, le=1, description="Whisper's language-detection probability; 1.0 when the language was given."
+    )
 
 
 # ── Streaming messages (JSON text frames) ────────────────────────────────────

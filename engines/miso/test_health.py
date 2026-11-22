@@ -2,6 +2,7 @@
 No model loads: the lifespan does not run without `with TestClient(...)`."""
 
 import unittest
+from unittest import mock
 
 from argus_cortex.gpu_wire import ResidentHealth
 from fastapi.testclient import TestClient
@@ -16,6 +17,12 @@ class HealthTest(unittest.TestCase):
         body = r.json()
         ResidentHealth.model_validate(body)
         self.assertEqual(body["capabilities"], ["tts"])
+        self.assertEqual(body["image"], {"version": None, "revision": None})
+
+    def test_health_reports_the_image_identity(self):
+        with mock.patch.object(srv, "ECHO_VERSION", "0.2.0"), mock.patch.object(srv, "ECHO_REVISION", "abc123"):
+            body = TestClient(srv.app).get("/health").json()
+        self.assertEqual(body["image"], {"version": "0.2.0", "revision": "abc123"})
 
 
 if __name__ == "__main__":

@@ -88,6 +88,44 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  github-release:
+    # The GitHub Release is the last step, so it only appears once the version is
+    # actually on PyPI. Its notes are this version's CHANGELOG.md section. A cortex dispatch skips it, because it
+    # skips publish-pypi. Ported from argus-proof (echo v0.1.0's Release was made by hand).
+    runs-on: ubuntu-latest
+    needs: publish-pypi
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v head="## [${version}]" 'index($0, head) == 1 {found = 1; next} found && /^## \[/ {exit} found' \
+            CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no section for ${version}"
+            exit 1
+          fi
+      - name: Create or update the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          prerelease=""
+          case "$tag" in *-*|*rc*|*a[0-9]*|*b[0-9]*) prerelease="--prerelease" ;; esac
+          if gh release view "$tag" >/dev/null 2>&1; then
+            # Re-run of the workflow: refresh notes and assets rather than failing.
+            gh release edit "$tag" --notes-file notes.md
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* --verify-tag --title "$tag" --notes-file notes.md $prerelease
+          fi
+
   release-tag:
     # The tag the image jobs build: the pushed one, or on a cortex dispatch the
     # newest final release. A pre-release never moved `latest`, so a dispatch
@@ -164,6 +202,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # The engine reports these in /health as `image` (the OCI labels above aren't visible from inside the
+          # container, and nothing inside can know the digest). Engines without the ARGs ignore them.
+          build-args: |
+            ECHO_VERSION=${{ steps.meta.outputs.version }}
+            ECHO_REVISION=${{ needs.release-tag.outputs.sha }}
           # A dispatch rebuilds an unchanged context, so a cached install layer
           # would keep the old argus-cortex.
           no-cache: ${{ github.event_name == 'repository_dispatch' }}

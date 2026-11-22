@@ -74,8 +74,16 @@ and transcriptions run one at a time, so the footprint stays at the working set 
 | `STT_STREAM_MAX_UTTERANCE_S` | `30` | Longest utterance |
 | `STT_STREAM_PARTIAL_S` | `1.0` | Seconds of speech between partials; `0` sends none |
 | `STT_VAD_THRESHOLD` | `0.5` | Silero speech probability |
+| `STT_VAD_FILTER` | `1` | `/transcriptions` only: faster-whisper's Silero VAD filter (drops silence before Whisper runs) (`/transcribe` never) |
+| `STT_AUDIO_URL_ALLOWED_HOSTS` | empty | `/transcriptions`: `host` or `host:port` entries (comma-separated) whose `audio_url` may resolve to a private address, e.g. `minio:9000` |
+| `STT_AUDIO_URL_MAX_REDIRECTS` | `0` | Redirects an `audio_url` fetch follows; each hop is checked again |
+| `STT_DOWNLOAD_TIMEOUT` | `30` | Seconds for a whole `audio_url` fetch |
+| `STT_INPUT_FORMATS` | plain audio containers | ffmpeg demuxers `/transcriptions` may use for audio that isn't WAV/FLAC (comma-separated; never a playlist demuxer); `none`: WAV/FLAC only |
+| `STT_DECODE_TIMEOUT` | `120` | Seconds for one ffmpeg decode |
 
-compose maps `WHISPER_*` onto these (see `.env.example`).
+compose maps `WHISPER_*` onto these (see `.env.example`). The `/transcriptions` settings keep agent-composer's
+names (its sidecar used the same `STT_*` prefix), except the byte cap: composer's `STT_MAX_AUDIO_BYTES` is
+`STT_MAX_UPLOAD_MB` here, shared with `/transcribe`.
 
 ## Home Assistant
 

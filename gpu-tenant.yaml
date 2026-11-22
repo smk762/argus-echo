@@ -35,9 +35,19 @@ residents:
     warm_path: /admin/wake
     admin_auth: true
 
+  # Qwen3-TTS 1.7b, CustomVoice only (QWEN_LOAD_MODELS=custom_voice): measured on dragon's RTX 4060 (8 GB), CUDA
+  # context included: 4.8 GB of device memory loaded, and a generation stays inside it (torch: 4.0 GB allocated,
+  # 4.5 GB reserved); 4.4 GB just after /admin/wake. /admin/evict and /admin/unload leave only the CUDA context
+  # (~150 MB).
+  # What this figure covers. Compose's default is 0.6b with `both` (Base too, for cloning): two 0.6B models, fewer
+  # weights than one 1.7B, so expected inside 4800 but NOT MEASURED (#6). 1.7b with `both` loads two 1.7B models,
+  # roughly twice this: raise vram_mb (about 9000) in the deployment's copy before running it, or iris will place
+  # other tenants in memory Qwen uses. So does a checkpoint loaded with /admin/load into a slot QWEN_LOAD_MODELS
+  # leaves out (a base checkpoint on a custom_voice deployment loads both models).
   - name: qwen
     adapter: argus-http
     container: argus-echo-qwen
+    vram_mb: 4800
     health_path: /health
     unload_path: /admin/unload
     evict_path: /admin/evict

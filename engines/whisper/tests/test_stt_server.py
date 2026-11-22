@@ -5,6 +5,8 @@ import io
 import json
 import os
 import sys
+import shutil
+import subprocess
 import unittest
 from unittest import mock
 
@@ -42,8 +44,10 @@ class FakeBackend:
     def free(self):
         self.events.append("free")
 
-    def transcribe(self, samples, sample_rate, language, word_timestamps):
-        self.calls.append({"n": len(samples), "rate": sample_rate, "language": language, "words": word_timestamps})
+    def transcribe(self, samples, sample_rate, language, word_timestamps, vad_filter=False):
+        self.calls.append(
+            {"n": len(samples), "rate": sample_rate, "language": language, "words": word_timestamps, "vad": vad_filter}
+        )
         dur = len(samples) / sample_rate
         seg = {"start": 0.0, "end": round(dur, 3), "text": f"heard {len(samples)} samples"}
         if word_timestamps:
@@ -73,6 +77,7 @@ class EngineTest(unittest.TestCase):
             mock.patch.object(stt_server, "backend_factory", FakeBackend),
             mock.patch.object(stt_server, "mgr", stt_server.ModelManager()),
             mock.patch.object(stt_server, "_slots", asyncio.Semaphore(1)),
+            mock.patch.object(stt_server, "_intake", asyncio.Semaphore(stt_server.MAX_DECODES)),
         ]
         for p in patches:
             p.start()
@@ -119,7 +124,9 @@ class TranscribeTest(EngineTest):
     def test_stereo_is_averaged_to_mono_and_the_rate_kept(self):
         r = self.post(wav(seconds=0.5, rate=48000, channels=2))
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertEqual(self.backend.calls[0], {"n": 24000, "rate": 48000, "language": None, "words": False})
+        self.assertEqual(
+            self.backend.calls[0], {"n": 24000, "rate": 48000, "language": None, "words": False, "vad": False}
+        )
 
     def test_flac_and_float_wav_are_read(self):
         for data in (wav(fmt="FLAC", subtype="PCM_16"), wav(subtype="FLOAT")):
@@ -129,6 +136,45 @@ class TranscribeTest(EngineTest):
         r = self.post(b"ID3\x04\x00\x00" + b"\x00" * 200)
         self.assertEqual(r.status_code, 400)
         self.assertEqual(FakeBackend.instances, [])
+
+    def test_other_formats_are_decoded_by_ffmpeg(self):
+        # agent-composer's sidecar decoded anything; rag-chat forwards the browser's webm/opus recording as is.
+        decoded = np.zeros(16000, dtype=np.float32)
+        with mock.patch.object(stt_server, "ffmpeg_decode", return_value=decoded) as dec:
+            r = self.post(b"\x1aE\xdf\xa3" + b"\x00" * 200)  # an EBML (webm) header
+        self.assertEqual(r.status_code, 200, r.text)
+        dec.assert_called_once()
+        self.assertEqual(self.backend.calls[0]["n"], 16000)
+        self.assertEqual(self.backend.calls[0]["rate"], 16000)
+
+    def test_wav_does_not_go_through_ffmpeg(self):
+        with mock.patch.object(stt_server, "ffmpeg_decode") as dec:
+            self.assertEqual(self.post().status_code, 200)
+        dec.assert_not_called()
+
+    def test_input_formats_none_means_wav_or_flac_only(self):
+        with mock.patch.object(stt_server, "INPUT_FORMATS", ""), mock.patch.object(stt_server, "ffmpeg_decode") as dec:
+            r = self.post(b"\x1aE\xdf\xa3" + b"\x00" * 200)
+        self.assertEqual(r.status_code, 400)
+        dec.assert_not_called()
+        self.assertEqual(FakeBackend.instances, [])
+
+    def test_language_as_a_query_parameter(self):
+        # agent-composer's sidecar took ?language=, and rag-chat sends it there.
+        files = {"audio": ("clip.wav", wav(), "audio/wav")}
+        r = self.client.post("/transcribe?language=de-DE", files=files)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.backend.calls[0]["language"], "de")
+
+    def test_the_form_field_wins_over_the_query_parameter(self):
+        files = {"audio": ("clip.wav", wav(), "audio/wav")}
+        r = self.client.post("/transcribe?language=de", files=files, data={"language": "fr"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self.backend.calls[0]["language"], "fr")
+
+    def test_an_unknown_query_language_is_422(self):
+        files = {"audio": ("clip.wav", wav(), "audio/wav")}
+        self.assertEqual(self.client.post("/transcribe?language=klingon", files=files).status_code, 422)
 
     def test_upload_over_the_cap_is_413_and_never_loads(self):
         with mock.patch.object(stt_server, "MAX_UPLOAD_BYTES", 1000):
@@ -148,6 +194,23 @@ class TranscribeTest(EngineTest):
             r = self.post()
         self.assertEqual(r.status_code, 503)
         self.assertIn("Retry-After", r.headers)
+
+    def test_a_full_decode_intake_is_503_and_decodes_nothing(self):
+        # Shared with /transcriptions: at most STT_MAX_DECODES decodes (maybe ffmpeg processes) at once.
+        with mock.patch.object(stt_server, "_intake", asyncio.Semaphore(0)), mock.patch.object(
+            stt_server, "QUEUE_TIMEOUT_S", 0.01
+        ), mock.patch.object(stt_server, "decode_audio_bytes") as dec:
+            r = self.post()
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("Retry-After", r.headers)
+        self.assertIn("decode", r.json()["error"])
+        dec.assert_not_called()
+        self.assertEqual(FakeBackend.instances, [])
+
+    def test_the_decode_slot_is_given_back(self):
+        with mock.patch.object(stt_server, "_intake", asyncio.Semaphore(1)):
+            self.assertEqual(self.post(b"not audio at all").status_code, 400)
+            self.assertEqual(self.post().status_code, 200)
 
     def test_model_load_failure_is_503(self):
         class Broken(FakeBackend):
@@ -358,3 +421,17 @@ class StreamTest(EngineTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+class RealFfmpegTranscribeTest(EngineTest):
+    def test_a_browser_webm_opus_recording_is_transcribed(self):
+        webm = subprocess.run(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=220:duration=1",
+             "-ar", "48000", "-c:a", "libopus", "-f", "webm", "pipe:1"],
+            capture_output=True, check=True,
+        ).stdout  # fmt: skip
+        r = self.client.post("/transcribe", files={"audio": ("rec.webm", webm, "audio/webm")})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertAlmostEqual(self.backend.calls[0]["n"], 16000, delta=1600)
+        self.assertEqual(self.backend.calls[0]["rate"], 16000)
