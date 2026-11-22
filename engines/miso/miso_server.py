@@ -114,6 +114,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import socket
 import tempfile
@@ -135,6 +136,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = structlog.get_logger("miso_server")
+
+# The image's identity, baked in at build time (release.yml); None for a local build. /health reports it as `image`.
+ECHO_VERSION: Optional[str] = os.getenv("ECHO_VERSION", "").strip() or None
+ECHO_REVISION: Optional[str] = os.getenv("ECHO_REVISION", "").strip() or None
+SEED_MAX = 2**32 - 1  # numpy's legacy seed range, and every engine's contract bound
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -1673,6 +1679,22 @@ class SynthesiseRequest(BaseModel):
     # Previous utterance(s), oldest first, placed after the clone's reference.
     # Omitted → behaviour is unchanged.
     context: Optional[list[ContextSegment]] = None
+    # Seeds the sampler (python, numpy, torch CPU and CUDA) before generation. Generation runs one at a time under
+    # the GPU lock, so nothing else draws from the RNG in between. See docs/api.md for what it makes reproducible.
+    seed: Optional[int] = Field(default=None, ge=0, le=SEED_MAX)
+
+
+def _seed_rngs(seed: Optional[int]) -> None:
+    """Seed every RNG generation can draw from (``torch.manual_seed`` seeds the CPU generator and every CUDA
+    device's). Called in the generation thread, under the GPU lock. No-op for None."""
+    if seed is None:
+        return
+    import numpy as np
+    import torch
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
 
 def _to_numpy_audio(audio):
@@ -1688,6 +1710,7 @@ def _generate_audio(req: SynthesiseRequest, prepared=None):
     and out. Caller holds the generation lock. ``prepared`` is a precomputed
     _prepare_generation()."""
     speaker, context, temperature, topk, max_audio_ms = prepared or _prepare_generation(req)
+    _seed_rngs(req.seed)
     audio = _mgr.generator.generate(
         text=req.text,
         speaker=speaker,
@@ -1707,6 +1730,7 @@ def _generate_stream_chunks(req: SynthesiseRequest, stop, prepared=None):
     lock for the entire iteration. ``stop`` is a threading.Event used to abort
     early (e.g. client disconnect)."""
     speaker, context, temperature, topk, max_audio_ms = prepared or _prepare_generation(req)
+    _seed_rngs(req.seed)
     fader = _EdgeFader()
     raw_samples = 0
     for audio in _mgr.generator.generate_stream(
@@ -1834,6 +1858,7 @@ async def synthesise(req: SynthesiseRequest):
         "duration": duration,
         "duration_seconds": round(duration, 3),
         "format": "wav",
+        "seed": req.seed,
     }
 
 
@@ -2675,6 +2700,8 @@ async def health():
         "error": _mgr.error,
         "rss_mb": _rss_mb(),
         "gpu": _gpu_memory_info(),
+        # The release and revision baked in at build time; a container can't see its own image digest.
+        "image": {"version": ECHO_VERSION, "revision": ECHO_REVISION},
     }
     if _is_stuck(busy):
         # Held past any possible generation: fail the container healthcheck.
