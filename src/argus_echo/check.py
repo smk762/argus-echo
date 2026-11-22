@@ -149,7 +149,7 @@ def _check_tts(
 def _check_transcribe(client: httpx.Client, report: Report, clip: Path | None, timeout: float) -> None:
     name = f"POST {TRANSCRIBE_PATH}"
     if clip is None:
-        data, filename = files("argus_echo").joinpath("data", BUNDLED_CLIP).read_bytes(), BUNDLED_CLIP
+        data, filename = files("argus_echo").joinpath("assets", BUNDLED_CLIP).read_bytes(), BUNDLED_CLIP
     else:
         try:
             data, filename = clip.read_bytes(), clip.name
