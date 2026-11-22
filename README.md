@@ -74,6 +74,7 @@ Clone a real person's voice only with their consent. Details: [docs/api.md#secur
 | [docs/xtts.md](docs/xtts.md) | XTTS-v2 settings and licence |
 | [docs/qwen.md](docs/qwen.md) | Qwen3-TTS settings and differences |
 | [docs/whisper.md](docs/whisper.md) | Speech to text: model choice, licences, VRAM, settings |
+| [docs/new-engine.md](docs/new-engine.md) | Checklist for adding an engine (server, image, tests, wiring) |
 | [docs/voice-cloning.md](docs/voice-cloning.md) | What makes a good reference on each engine; Home Assistant |
 
 ## Layout
