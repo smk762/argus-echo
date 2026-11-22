@@ -265,6 +265,34 @@ def test_a_failed_load_leaves_nothing_loaded_and_stock_selected(client, coqui, m
     assert mgr.weights == {"checkpoint": None, "fingerprint": None, "files": None}
 
 
+def test_a_lazy_reload_that_fails_falls_back_to_stock(client, coqui, mgr, monkeypatch):
+    """A checkpoint that can't be reloaded after an idle unload is dropped, so requests don't all keep failing."""
+    _write_checkpoint(coqui.root / "voice")
+    assert client.post("/admin/load", json={"checkpoint": "voice"}, headers=AUTH).status_code == 200
+    real = _FakeXtts.load_checkpoint
+
+    def broken(self, config, checkpoint_dir=None, **kwargs):
+        if str(checkpoint_dir).endswith("voice"):
+            raise RuntimeError("model.pth: unexpected EOF")
+        return real(self, config, checkpoint_dir=checkpoint_dir, **kwargs)
+
+    monkeypatch.setattr(_FakeXtts, "load_checkpoint", broken)
+
+    async def idle_then_requests():
+        assert await mgr.unload()  # what the eviction loop calls; the selection is kept
+        with pytest.raises(RuntimeError, match="unexpected EOF"):
+            async with mgr.lease():
+                pass
+        assert mgr.state == xs.TTSState.ERROR
+        assert mgr.weights == {"checkpoint": None, "fingerprint": None, "files": None}
+        async with mgr.lease():  # the next request loads stock
+            pass
+
+    asyncio.run(idle_then_requests())
+    assert _FakeXtts.loads[-1] == str(coqui.stock)
+    assert mgr.weights["checkpoint"] is None and mgr.weights["fingerprint"] is not None
+
+
 def test_a_load_waits_for_a_transition_in_flight(coqui, mgr):
     _write_checkpoint(coqui.root / "voice")
 
@@ -333,6 +361,7 @@ class _Model:
 
     def inference(self, *args, **kwargs):
         self.torch_calls.append("inference")
+        self.thread = threading.current_thread().name
         return {"wav": np.zeros(240, dtype=np.float32)}
 
     def inference_stream(self, *args, **kwargs):
@@ -416,6 +445,69 @@ def test_a_seeded_generation_runs_alone(torch_calls):
     for t in (t1, t2, t3):
         t.join(5)
     assert events == ["shared in", "shared out", "exclusive in", "exclusive out", "shared in", "shared out"]
+
+
+def test_a_gate_wait_past_its_timeout_is_rng_busy_and_lets_others_go(torch_calls):
+    gate = xs._RngGate()
+    gate.enter_exclusive()
+    with pytest.raises(xs.RngBusy):
+        gate.enter_shared(0.05)
+    gate.leave_exclusive()
+
+    gate.enter_shared()
+    with pytest.raises(xs.RngBusy):
+        gate.enter_exclusive(0.05)  # a seeded one that gave up no longer holds unseeded ones back
+    gate.enter_shared(0.05)
+    gate.leave_shared()
+    gate.leave_shared()
+    with gate.exclusive(0.05):
+        pass
+
+
+def test_generations_wait_on_their_own_threads_and_a_long_wait_is_503(speaking, mgr, torch_calls, monkeypatch):
+    """A request waiting for the sampler holds a generation thread, never one of the shared to_thread pool, and
+    gives up after XTTS_RNG_WAIT_S with a 503."""
+    assert speaking.post("/synthesise", json={"text": "hi", "speaker": "A"}).status_code == 200
+    assert mgr.model.thread.startswith("xtts-gen")
+
+    monkeypatch.setattr(xs, "RNG_WAIT_S", 0.05)
+    xs._rng_gate.enter_exclusive()  # a seeded stream holds the sampler
+    try:
+        for path in ("/synthesise", "/synthesise/stream"):
+            r = speaking.post(path, json={"text": "hi", "speaker": "A"})
+            assert r.status_code == 503, (path, r.text)
+            assert r.headers["Retry-After"] == "5" and r.json()["error"].startswith("busy:")
+    finally:
+        xs._rng_gate.leave_exclusive()
+    assert torch_calls == ["inference"]
+    assert mgr.active == 0  # the refused requests gave their leases back
+    assert xs._rng_gate._shared == 0 and not xs._rng_gate._exclusive and not xs._rng_gate._waiting
+
+
+def test_a_stream_leaves_the_gate_when_it_ends(speaking, torch_calls):
+    for seed in (None, 3):
+        r = speaking.post("/synthesise/stream", json={"text": "hi", "speaker": "A", "seed": seed})
+        assert r.status_code == 200 and len(r.content) == 32
+    deadline = time.monotonic() + 5
+    while (xs._rng_gate._shared or xs._rng_gate._exclusive) and time.monotonic() < deadline:
+        time.sleep(0.01)  # the producer thread leaves after its last chunk
+    assert xs._rng_gate._shared == 0 and not xs._rng_gate._exclusive
+
+
+def test_a_stream_whose_client_left_while_it_waited_generates_nothing(speaking, mgr, torch_calls):
+    class Gone:
+        async def is_disconnected(self):
+            return True
+
+    async def run():
+        await mgr.acquire()  # the model loaded, as a real request would find it
+        mgr.release()
+        r = await xs.synthesise_stream(xs.SynthesiseRequest(text="hi", speaker="A", seed=1), Gone())
+        assert r.status_code == 499
+
+    asyncio.run(run())
+    assert torch_calls == [("manual_seed", 1)]  # entered the gate, then never sampled
+    assert mgr.active == 0 and not xs._rng_gate._exclusive
 
 
 # ── weights fingerprint ──────────────────────────────────────────────────────

@@ -95,9 +95,34 @@ def test_oom_on_promotion_puts_the_model_back_and_runs_on_cpu(cpu_mgr, cuda_call
         assert cpu_mgr.fake.calls == ["cuda:0", "cpu"]  # the failed move was undone
         assert cpu_mgr.fake.cached_prefix_emb is None
         assert cuda_calls == ["clear_cublas", "empty_cache"]
-        cpu_mgr.fake.oom = False  # room again: the next request promotes
+        cpu_mgr.fake.oom = False  # room again, but within XTTS_OOM_RETRY_AFTER_S: no second attempt
+        async with cpu_mgr.lease() as ran_on:
+            assert ran_on == "cpu"
+        assert cpu_mgr.fake.calls == ["cuda:0", "cpu"]
+        cpu_mgr._gpu_refused_until = 0.0  # the cooldown is over: the next request promotes
         async with cpu_mgr.lease() as ran_on:
             assert ran_on == "cuda:0" and cpu_mgr.state == xs.TTSState.GPU
+
+    asyncio.run(run())
+
+
+def test_a_refused_promotion_is_not_retried_by_every_request(cpu_mgr, monkeypatch):
+    """While the GPU stays full, requests don't each move ~2 GB toward it and back under the lock."""
+    cpu_mgr.fake.oom = True
+
+    async def run():
+        for _ in range(5):
+            async with cpu_mgr.lease() as ran_on:
+                assert ran_on == "cpu"
+        assert cpu_mgr.fake.calls == ["cuda:0", "cpu"]  # one attempt, undone once
+        monkeypatch.setattr(xs, "CPU_FALLBACK", False)
+        with pytest.raises(xs.GpuUnavailable, match=r"not retried for 30s"):
+            await cpu_mgr.acquire()  # without the fallback: the 503 at once, nothing moved
+        assert cpu_mgr.fake.calls == ["cuda:0", "cpu"]
+        cpu_mgr.fake.oom = False
+        await cpu_mgr.ensure_gpu()  # /admin/wake tries even in the cooldown
+        assert cpu_mgr.state == xs.TTSState.GPU
+        assert cpu_mgr._gpu_refused_until == 0.0
 
     asyncio.run(run())
 

@@ -77,6 +77,7 @@ class EngineTest(unittest.TestCase):
             mock.patch.object(stt_server, "backend_factory", FakeBackend),
             mock.patch.object(stt_server, "mgr", stt_server.ModelManager()),
             mock.patch.object(stt_server, "_slots", asyncio.Semaphore(1)),
+            mock.patch.object(stt_server, "_intake", asyncio.Semaphore(stt_server.MAX_DECODES)),
         ]
         for p in patches:
             p.start()
@@ -193,6 +194,23 @@ class TranscribeTest(EngineTest):
             r = self.post()
         self.assertEqual(r.status_code, 503)
         self.assertIn("Retry-After", r.headers)
+
+    def test_a_full_decode_intake_is_503_and_decodes_nothing(self):
+        # Shared with /transcriptions: at most STT_MAX_DECODES decodes (maybe ffmpeg processes) at once.
+        with mock.patch.object(stt_server, "_intake", asyncio.Semaphore(0)), mock.patch.object(
+            stt_server, "QUEUE_TIMEOUT_S", 0.01
+        ), mock.patch.object(stt_server, "decode_audio_bytes") as dec:
+            r = self.post()
+        self.assertEqual(r.status_code, 503)
+        self.assertIn("Retry-After", r.headers)
+        self.assertIn("decode", r.json()["error"])
+        dec.assert_not_called()
+        self.assertEqual(FakeBackend.instances, [])
+
+    def test_the_decode_slot_is_given_back(self):
+        with mock.patch.object(stt_server, "_intake", asyncio.Semaphore(1)):
+            self.assertEqual(self.post(b"not audio at all").status_code, 400)
+            self.assertEqual(self.post().status_code, 200)
 
     def test_model_load_failure_is_503(self):
         class Broken(FakeBackend):

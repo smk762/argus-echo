@@ -53,8 +53,10 @@ Env vars:
   STT_AUDIO_URL_MAX_REDIRECTS — redirects an audio_url fetch follows, each re-checked (default 0: none)
   STT_DOWNLOAD_TIMEOUT  — seconds for a whole audio_url fetch (default 30)
   STT_DECODE_TIMEOUT    — seconds for one ffmpeg decode (default 120)
-  STT_INPUT_FORMATS     — ffmpeg demuxers /transcribe and /transcriptions may decode non-WAV/FLAC audio with (comma list; default
-                          plain audio containers, no playlists). "none" accepts WAV/FLAC only
+  STT_MAX_DECODES       — requests (/transcribe, /transcriptions) that may decode at once (default 2); the rest
+                          wait up to STT_QUEUE_TIMEOUT_S, then 503. Bounds the bytes held and the ffmpeg processes run
+  STT_INPUT_FORMATS     — ffmpeg demuxers /transcribe and /transcriptions may decode non-WAV/FLAC audio with (comma
+                          list; default plain audio containers, no playlists). "none" accepts WAV/FLAC only
 """
 
 from __future__ import annotations
@@ -112,6 +114,7 @@ KEEP_ALIVE_GPU = _env_float("STT_KEEP_ALIVE_GPU", 300)
 KEEP_ALIVE_CPU = _env_float("STT_KEEP_ALIVE_CPU", 600)
 CONCURRENCY = max(1, _env_int("STT_CONCURRENCY", 1))
 QUEUE_TIMEOUT_S = _env_float("STT_QUEUE_TIMEOUT_S", 30)
+MAX_DECODES = max(1, _env_int("STT_MAX_DECODES", 2))
 MAX_UPLOAD_BYTES = int(_env_float("STT_MAX_UPLOAD_MB", 50) * 1024 * 1024)
 MAX_SECONDS = _env_float("STT_MAX_SECONDS", 600)
 STREAM_MAX_SESSIONS = max(1, _env_int("STT_STREAM_MAX_SESSIONS", 4))
@@ -413,6 +416,19 @@ class ModelManager:
 
 mgr = ModelManager()
 _slots = asyncio.Semaphore(CONCURRENCY)
+# Decoding (and /transcriptions' fetch), before a request takes a _slots permit: each holds up to MAX_UPLOAD_BYTES of
+# audio, its decoded samples and maybe an ffmpeg process, so they are bounded too.
+_intake = asyncio.Semaphore(MAX_DECODES)
+DECODE_BUSY = "busy: every decode slot is taken"
+
+
+async def take_intake() -> bool:
+    """Wait (up to QUEUE_TIMEOUT_S) for an _intake permit. False when none came: answer 503."""
+    try:
+        await asyncio.wait_for(_intake.acquire(), timeout=QUEUE_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        return False
+    return True
 
 
 class Busy(Exception):
@@ -478,6 +494,14 @@ async def transcribe(
         return _error(503, "model loading", retry_after=10)
     try:
         data = await read_upload(audio, MAX_UPLOAD_BYTES, what="audio")
+    except TooLarge as exc:
+        return _error(413, str(exc))
+    except BadInput as exc:
+        return _error(400, str(exc))
+    # At most MAX_DECODES decodes at once, across both routes (see _intake).
+    if not await take_intake():
+        return _error(503, DECODE_BUSY, retry_after=5)
+    try:
         # WAV/FLAC through open_audio; anything else (a browser's webm/opus recording, mp3, ...) through ffmpeg,
         # reading only from a pipe and only with a demuxer in STT_INPUT_FORMATS, as /transcriptions does.
         samples, rate = await asyncio.to_thread(decode_audio_bytes, data)
@@ -485,6 +509,8 @@ async def transcribe(
         return _error(413, str(exc))
     except BadInput as exc:
         return _error(400, str(exc))
+    finally:
+        _intake.release()
     del data
     try:
         return await run_transcription(samples, rate, lang, word_timestamps)
@@ -505,6 +531,8 @@ AUDIO_URL_FAILED = "Could not download audio_url"
 audio_url_resolver: Optional[Callable[[str, int], list[str]]] = None
 audio_url_transport: Any = None
 # argus_cortex.net's UrlRefused reasons for a fetch that was allowed but failed (502); every other refusal is a 400.
+# cortex gives no structured reason, so these match its messages: test_transcriptions.py's
+# CortexReasonsTest triggers each one through the real afetch, so a reworded message fails CI, not production.
 _UPSTREAM_FAILURES = (
     "could not fetch",
     "could not connect",
@@ -601,11 +629,23 @@ def ffmpeg_decode(data: bytes) -> np.ndarray:
 
 
 def decode_audio_bytes(data: bytes) -> tuple[np.ndarray, int]:
-    """WAV/FLAC through open_audio (as /transcribe); anything else through ffmpeg when INPUT_FORMATS allows it."""
+    """WAV/FLAC through open_audio (as /transcribe); anything else through ffmpeg when INPUT_FORMATS allows it.
+
+    A WAV or FLAC that open_audio refuses (a sample rate outside ALLOWED_RATES, say 12 kHz) goes to ffmpeg
+    too when INPUT_FORMATS allows it, as agent-composer's sidecar decoded it. TooLarge (over the duration cap) is
+    final: ffmpeg would stop at the same cap."""
     if len(data) > MAX_UPLOAD_BYTES:
         raise TooLarge("audio", MAX_UPLOAD_BYTES)
     if _is_wav_or_flac(data) or not INPUT_FORMATS:
-        clip = open_audio(data, max_seconds=MAX_SECONDS, allowed_rates=ALLOWED_RATES, max_bytes=MAX_UPLOAD_BYTES, mono=True)
+        try:
+            clip = open_audio(
+                data, max_seconds=MAX_SECONDS, allowed_rates=ALLOWED_RATES, max_bytes=MAX_UPLOAD_BYTES, mono=True
+            )
+        except BadInput as exc:
+            if not (INPUT_FORMATS and _is_wav_or_flac(data)):
+                raise
+            logger.info("stt_open_audio_refused_trying_ffmpeg", reason=str(exc)[:200])
+            return ffmpeg_decode(data), SAMPLE_RATE
         return clip.samples, clip.sample_rate
     return ffmpeg_decode(data), SAMPLE_RATE
 
@@ -636,6 +676,10 @@ async def transcriptions(request: Request):
     if mgr.state == State.LOADING:
         return _error(503, "model loading", retry_after=10)
 
+    # At most MAX_DECODES requests fetch and decode at once (each holds its audio, its samples and maybe an ffmpeg
+    # process); the rest wait like a transcription slot does, then 503.
+    if not await take_intake():
+        return _error(503, DECODE_BUSY, retry_after=5)
     try:
         if req.audio_url:
             data = await fetch_audio_url(req.audio_url)
@@ -649,6 +693,8 @@ async def transcriptions(request: Request):
         return _error(413, str(exc))
     except BadInput as exc:
         return _error(400, str(exc))
+    finally:
+        _intake.release()
     del data
     try:
         result = await run_transcription(samples, rate, lang, False, vad_filter=VAD_FILTER)

@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -61,6 +62,7 @@ class FakeModel:
 
     def generate_custom_voice(self, **kw):
         self.calls.append(("generate", kw["text"]))
+        self.thread = threading.current_thread().name
         return [np.zeros(10, dtype="<f4")], 24000
 
     def generate_voice_design(self, text, **kw):
@@ -248,6 +250,46 @@ class AdminLoadTests(CheckpointTestCase):
         self.assertEqual(self.mgr.state, TTSState.ERROR)
         self.assertEqual(self.mgr.weights, {"checkpoint": None, "fingerprint": None, "files": None, "models": None})
 
+    def test_a_lazy_reload_that_fails_falls_back_to_stock(self):
+        """A checkpoint that can't be reloaded after an idle unload is dropped, so requests don't all keep failing."""
+        _write_model(self.root / "voice")
+        self.assertEqual(self.load("voice").status_code, 200)
+        fake = sys.modules["qwen_tts"].Qwen3TTSModel
+        real = fake.from_pretrained
+
+        def from_pretrained(source, **kw):
+            if source.endswith("voice"):
+                raise RuntimeError("model.safetensors: unexpected EOF")
+            return real(source, **kw)
+
+        asyncio.run(self.mgr.unload())  # the idle unload keeps the selection
+        with mock.patch.object(fake, "from_pretrained", from_pretrained):
+            with self.assertRaisesRegex(RuntimeError, "unexpected EOF"):
+                self.lease_once()
+            self.assertEqual(self.mgr.state, TTSState.ERROR)
+            self.assertEqual(
+                self.mgr.weights, {"checkpoint": None, "fingerprint": None, "files": None, "models": None}
+            )
+            self.lease_once()  # the next request loads stock
+        self.assertEqual(self.loads[-2:], list(self.stock))
+        self.assertIsNone(self.mgr.weights["checkpoint"])
+        self.assertIsNotNone(self.mgr.weights["fingerprint"])
+
+    def test_a_failed_move_reports_no_weights(self):
+        """A move that fails frees the models: /health must not keep a fingerprint for weights that aren't loaded."""
+        self.lease_once()
+        self.assertIsNotNone(self.mgr.weights["fingerprint"])
+
+        def broken(device):
+            raise RuntimeError("CUDA error: unspecified launch failure")
+
+        with mock.patch.object(self.mgr, "_move_to_device", broken), mock.patch.object(tts_server, "DEVICE", "cuda:0"):
+            with self.assertRaises(RuntimeError):
+                asyncio.run(self.mgr.demote_to_cpu())
+        self.assertEqual(self.mgr.state, TTSState.ERROR)
+        self.assertIsNone(self.mgr.base_model)
+        self.assertEqual(self.mgr.weights, {"checkpoint": None, "fingerprint": None, "files": None, "models": None})
+
     def test_hashes_are_computed_once_per_load_not_per_request(self):
         _write_model(self.root / "voice")
         opened = []
@@ -311,6 +353,37 @@ class SeedTests(CheckpointTestCase):
             self.assertEqual(self.client.post("/synthesise", json={"text": "hi", "seed": seed}).status_code, 422)
         self.assertEqual(self.calls, [])
         self.assertEqual(self.loads, [])
+
+    def test_generations_wait_on_their_own_threads_and_a_long_wait_is_503(self):
+        """A request waiting for the sampler holds a generation thread, never one of the shared to_thread pool, and
+        gives up after TTS_RNG_WAIT_S with a 503."""
+        r = self.client.post("/synthesise", json={"text": "hello there", "speaker": "ryan"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(self.mgr.custom_model.thread.startswith("tts-gen"))
+
+        held = tts_server._rng_gate.exclusive()
+        held.__enter__()  # a seeded generation holds the sampler
+        try:
+            with mock.patch.object(tts_server, "RNG_WAIT_S", 0.05):
+                for path in ("/synthesise", "/synthesise/stream"):
+                    r = self.client.post(path, json={"text": "hello there", "speaker": "ryan"})
+                    self.assertEqual(r.status_code, 503, (path, r.text))
+                    self.assertEqual(r.headers["Retry-After"], "5")
+                    self.assertTrue(r.json()["error"].startswith("busy:"))
+        finally:
+            held.__exit__(None, None, None)
+        self.assertEqual(self.mgr._in_use, 0)  # the refused requests gave their leases back
+        gate = tts_server._rng_gate
+        self.assertEqual((gate._shared, gate._exclusive, gate._waiting), (0, False, 0))
+
+    def test_a_seeded_wait_that_times_out_lets_unseeded_ones_go(self):
+        gate = tts_server._RngGate()
+        with gate.shared():
+            with self.assertRaises(tts_server.RngBusy):
+                with gate.exclusive(0.05):
+                    pass
+            with gate.shared(0.05):  # no longer held back by the seeded one that gave up
+                pass
 
     def test_seed_wraps_at_the_top_of_its_range(self):
         render = tts_server._seeded(lambda text: text, tts_server.SEED_MAX)
