@@ -361,8 +361,9 @@ Whisper writes numbers as digits (`7.30`, `12%`): normalise both sides before sc
 
 ### `POST /transcriptions`
 
-agent-composer's whisper sidecar route, kept so kimini-api moves to echo unchanged (smk762/agent-composer#81). New
-callers should use `/transcribe`. JSON body (unknown fields are ignored, nulls are fine):
+Transcription from a URL or base64, imported from agent-composer's whisper sidecar as `voice-stack/` retires
+(smk762/agent-composer#81). For a clip the caller already holds, `/transcribe` (multipart) is simpler. JSON body
+(unknown fields are ignored, nulls are fine):
 
 | Field | Type | Notes |
 | --- | --- | --- |
@@ -389,7 +390,8 @@ Ogg/Opus, FLAC, WebM/Matroska, MP4/M4A, AAC, AIFF, CAF, AMR, AU; no playlists), 
 `STT_MAX_SECONDS`. `STT_INPUT_FORMATS=none` accepts WAV and FLAC only.
 
 Unlike `/transcribe`, it runs faster-whisper's Silero VAD filter, which drops silence before Whisper runs
-(`STT_VAD_FILTER`, default `1`), as composer's sidecar did: Whisper is prone to inventing text for silence, and kimini-api's audio is unedited.
+(`STT_VAD_FILTER`, default `1`), as composer's sidecar did: Whisper is prone to inventing text for silence, and
+audio fetched from a URL is often unedited.
 `/transcribe` keeps it off so its segment times cover the whole clip; set `STT_VAD_FILTER=0` for the same here.
 
 `audio_url` is fetched with argus-cortex's `afetch`:

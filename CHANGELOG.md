@@ -2,10 +2,13 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-22
+
 ### Added
-- Whisper serves agent-composer's `POST /transcriptions` (smk762/agent-composer#81), so kimini-api can move off
-  composer's whisper sidecar: a JSON body with `audio_url` (fetched under argus-cortex's SSRF policy, capped as it
-  streams, `STT_AUDIO_URL_ALLOWED_HOSTS` for trusted internal hosts, redirects off by default) or `audio_base64`,
+- Whisper serves `POST /transcriptions`, transcription from a URL or base64, imported from agent-composer's
+  whisper sidecar as `voice-stack/` retires (smk762/agent-composer#81): a JSON body with `audio_url` (fetched
+  under argus-cortex's SSRF policy, capped as it streams, `STT_AUDIO_URL_ALLOWED_HOSTS` for trusted internal
+  hosts, redirects off by default) or `audio_base64`,
   and composer's `{text, language, duration_seconds, confidence}` back. Silero VAD drops silence before
   Whisper runs (`STT_VAD_FILTER`, default on, as composer did; `/transcribe` is unchanged), and audio other than
   WAV/FLAC is decoded with ffmpeg, now in the image, reading only from a pipe and only through a demuxer in
