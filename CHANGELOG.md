@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-22
+
 ### Added
 - Miso `/clone-voice` fills an empty `reference_text` from the STT engine named by `MISO_STT_URL` (#13): each
   stored clip goes to `POST /transcribe` (with the new `language` form field) within `MISO_STT_TIMEOUT_S`
