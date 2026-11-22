@@ -7,6 +7,11 @@ from moshi.utils import quantize
 
 
 def patch_bitsandbytes_import_for_unquantized_layers() -> None:
+    # moshi <= 0.2.2 sent every linear layer through quantize.linear / multi_linear, which imported
+    # bitsandbytes even for unquantized weights. Later moshi swaps in QLinear modules only where a layer is
+    # quantized and has no such functions, so there is nothing to patch.
+    if not (hasattr(quantize, "linear") and hasattr(quantize, "multi_linear")):
+        return
     original_linear = quantize.linear
     original_multi_linear = quantize.multi_linear
 
