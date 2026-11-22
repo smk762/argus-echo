@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-22
+
 ### Security
 - XTTS and Qwen clone archives carry `prompt.safetensors`, as Miso's have since #20. `GET /clones/{id}/download`
   writes it and `POST /clones/import` reads it with safetensors only. An uploaded archive used to reach
@@ -19,6 +21,10 @@
   2.6.0, qwen-tts 0.1.1, transformers 4.57.3), which #30's reproducibility measurement ran, so the audio doesn't
   change. torch is pinned without its `+cu124` label, so the `*_TORCH_INDEX_URL` build args still pick CPU or
   CUDA. `tests/test_repo_rules.py` fails an unconstrained install.
+- docs/api.md says which clone id `/synthesise` takes (the full `voice_clone_id`,
+  `voice_clones/<companion_id>/prompt.pt`; the bare id is a `422`), that a `voice_clone_id` wins over Qwen's
+  `voice_description` (spoken by `base`), and lists `/health` `engine`'s exact values (`miso`, `xtts-v2`,
+  `qwen-tts`, `whisper`), which each engine's health test now pins.
 
 ### Added
 - `/health` `image.runtime` on every engine (#32): the versions of python, torch, CUDA and cuDNN (torch engines)
