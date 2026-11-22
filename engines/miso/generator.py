@@ -246,7 +246,11 @@ class Generator:
 
         def _decode(buf: List[torch.Tensor]) -> torch.Tensor:
             codes = torch.stack(buf).permute(1, 2, 0)  # (1, K, n_frames)
-            return self._audio_tokenizer.decode(codes).squeeze(0).squeeze(0)
+            # One frame per call: moshi CUDA-graphs Mimi's streaming decoder, and a graph replays only the shape it
+            # was captured with, so a first chunk, a full chunk and a short last chunk can't share it. The streaming
+            # context carries the conv state across calls, so per-frame decodes concatenate gaplessly.
+            frames = [self._audio_tokenizer.decode(codes[:, :, i : i + 1]) for i in range(codes.shape[-1])]
+            return torch.cat(frames, dim=-1).squeeze(0).squeeze(0)
 
         # Streaming context keeps the decoder's conv state continuous across
         # the per-chunk decode calls so concatenated chunks are gapless.

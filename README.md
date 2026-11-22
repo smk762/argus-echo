@@ -86,7 +86,7 @@ engines/<engine>/     each engine's server, Dockerfile and tests (its own Python
 src/argus_echo/       the contracts in Python (contract/tts.py, contract/stt.py), and `argus-echo check`
 ```
 
-The engines don't import `argus_echo`: their dependencies conflict (Miso pins torch 2.4), so they share the
+The engines don't import `argus_echo`: their dependencies conflict (Miso pins torch 2.9 for moshi), so they share the
 contract, not code.
 
 ## Develop
