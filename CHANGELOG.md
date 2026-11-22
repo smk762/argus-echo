@@ -9,6 +9,17 @@
 - Compose passes `QWEN_LOAD_MODELS` (`TTS_LOAD_MODELS`, default `both`) and `QWEN_DEFAULT_SPEAKER`
   (`TTS_DEFAULT_SPEAKER`) through to the Qwen engine; `custom_voice` roughly halves its VRAM when cloning isn't
   needed.
+- XTTS synthesis requests take an optional `device: "cpu"` (new optional contract field; Miso and Qwen ignore
+  it): the model is used where it is and never promoted to the GPU. `/synthesise` returns `device` and
+  `/synthesise/stream` sends `X-XTTS-Device`. While CPU work holds a lease the model isn't moved; GPU requests
+  that arrive then join it on the CPU. Ported from agent-composer#80 (part of agent-composer#81).
+
+### Fixed
+- XTTS: a GPU promotion that fails moves the weights back to the CPU and empties the CUDA cache, so the state
+  never says `cpu` with weights partly on CUDA. A CUDA out-of-memory there runs the request on the CPU
+  (`XTTS_CPU_FALLBACK=1`, default) or answers `503` with the reason and `Retry-After` (`XTTS_OOM_RETRY_AFTER_S`,
+  default 30). It used to surface as a bare 500, because the promotion runs inside the lease, outside the
+  handler's error handling. A preload that hits the same leaves the model on the CPU instead of failing startup.
 
 ## [0.1.0] - 2026-11-22
 

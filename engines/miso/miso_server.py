@@ -1666,6 +1666,7 @@ class SynthesiseRequest(BaseModel):
     emotion: str = "neutral"                  # unused by Miso; accepted for compat
     language: str = Field(default="en")
     speed: Optional[float] = None             # unused by Miso; accepted for compat
+    device: Optional[str] = None             # XTTS-only ("cpu"); unused by Miso, accepted for compat
     # None → clone meta.json (when present) → MISO_TEMPERATURE / MISO_TOPK.
     temperature: Optional[float] = Field(default=None, allow_inf_nan=False)
     topk: Optional[int] = None

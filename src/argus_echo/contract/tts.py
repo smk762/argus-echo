@@ -16,6 +16,7 @@ with every route and status code, is ``docs/api.md``.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -31,8 +32,9 @@ class SynthesiseRequest(BaseModel):
     """The body of ``POST /synthesise`` and ``POST /synthesise/stream``.
 
     These fields are accepted by every engine. An engine ignores the ones it has no use for rather than refusing
-    them (Miso and XTTS ignore ``voice_description``, ``instruction`` and ``emotion``), so one request works
-    everywhere. Engine-specific fields (Miso's ``temperature``, ``topk`` and ``context``) pass through as extras.
+    them (Miso and XTTS ignore ``voice_description``, ``instruction`` and ``emotion``; Miso and Qwen ignore
+    ``device``), so one request works everywhere. Engine-specific fields (Miso's ``temperature``, ``topk`` and
+    ``context``) pass through as extras.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -45,6 +47,13 @@ class SynthesiseRequest(BaseModel):
     instruction: str | None = Field(None, description="Qwen3-TTS: delivery instruction for a built-in speaker.")
     emotion: str = Field("neutral", description="Qwen3-TTS: delivery hint.")
     speed: float | None = Field(None, description="Speaking-rate multiplier. XTTS applies it; Miso and Qwen ignore it.")
+    device: Literal["cpu"] | None = Field(
+        None,
+        description=(
+            'XTTS: "cpu" runs without promoting the model to the GPU (a client sends it when argus-iris refuses its '
+            "GPU lease). Miso and Qwen ignore it."
+        ),
+    )
 
 
 class StreamFormat(BaseModel):

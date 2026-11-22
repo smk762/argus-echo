@@ -429,8 +429,8 @@ def test_cancelled_first_load_does_not_stick_in_loading(real_mgr, monkeypatch):
         assert m.active == 0 and not m._lock.locked()
         release.set()
         await _until(lambda: m.state == xs.TTSState.CPU)
-        async with m.lease() as model:
-            assert model is m.fake
+        async with m.lease() as ran_on:
+            assert m.model is m.fake and ran_on == "cuda:0"
             assert m.state == xs.TTSState.GPU
 
     asyncio.run(run())
@@ -445,8 +445,8 @@ def test_lease_during_orphaned_load_waits_for_the_model(real_mgr, monkeypatch):
         await _cancel_during(started, m.acquire)
 
         async def use():
-            async with m.lease() as model:
-                return model
+            async with m.lease():
+                return m.model
 
         t = asyncio.create_task(use())
         await asyncio.sleep(0.05)
