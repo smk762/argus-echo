@@ -53,6 +53,7 @@ import contextlib
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import AsyncIterator, Optional
+from urllib.parse import urlsplit
 
 import structlog
 from argus_cortex.auth import bearer
@@ -172,6 +173,39 @@ class TTSState(str, Enum):
     ERROR = "error"
 
 
+def _release_cuda_cache() -> None:
+    """Return the allocator's free blocks to the driver once the models are off the GPU (#22).
+
+    cuBLAS keeps a workspace per stream inside the caching allocator, and while it lives ``empty_cache()`` cannot
+    release the segment it sits in (a few hundred MB). Clearing the workspaces first lets the whole cache go; cuBLAS
+    allocates a new one on the next matmul. What stays is the CUDA context itself, which only ending the process frees.
+    """
+    import torch
+
+    if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        return
+    gc.collect()
+    clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+    if clear is not None:
+        clear()
+    torch.cuda.empty_cache()
+
+
+def _move_speech_tokenizer(model, target) -> None:
+    """Move the codec qwen-tts attaches as ``model.speech_tokenizer`` (#22).
+
+    It is a ``Qwen3TTSTokenizer``, a plain object wrapping its own nn.Module, loaded with the same device_map, so
+    ``Module.to()`` on the TTS model never reaches it: a demote to the CPU left one codec per loaded model on the GPU.
+    Its cached ``.device`` is synced too, as the tokenizer places its inputs there.
+    """
+    tokenizer = getattr(model, "speech_tokenizer", None)
+    module = getattr(tokenizer, "model", None)
+    if module is None or not callable(getattr(module, "to", None)):
+        return
+    module.to(target)
+    tokenizer.device = getattr(module, "device", target)
+
+
 class TTSModelManager:
     """Three-state lifecycle: unloaded → gpu → cpu.
 
@@ -274,9 +308,10 @@ class TTSModelManager:
                 wrapper.device = getattr(inner, "device", target)
             elif hasattr(wrapper, "to") and callable(wrapper.to):
                 wrapper.to(target)
+            _move_speech_tokenizer(inner if inner is not None else wrapper, target)
 
         if device == "cpu":
-            torch.cuda.empty_cache()
+            _release_cuda_cache()
 
     async def _run_load(self) -> None:
         try:
@@ -439,10 +474,7 @@ class TTSModelManager:
             if model is not None:
                 del model
                 setattr(self, attr, None)
-        gc.collect()
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        _release_cuda_cache()
 
     def _unload_locked(self) -> None:
         self._free_models()
@@ -517,10 +549,16 @@ _clone_cache_lock = threading.Lock()
 
 
 def _require_s3_credentials() -> None:
-    """Raise unless both S3 credentials are configured. Called at startup, and
-    again before the first client is built for anything that skips the lifespan."""
+    """Raise unless S3 is usable: both credentials, an http(s) endpoint and a bucket. Called at startup, and again
+    before the first client is built for anything that skips the lifespan. An empty S3_ENDPOINT_URL used to pass
+    here and fail every /synthesise after the audio was rendered (``ValueError: Invalid endpoint``, #22)."""
     if not (S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY):
         raise RuntimeError("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be set; there are no defaults")
+    endpoint = urlsplit(S3_ENDPOINT_URL.strip())
+    if endpoint.scheme not in ("http", "https") or not endpoint.netloc:
+        raise RuntimeError(f"S3_ENDPOINT_URL must be an http(s) URL, got {S3_ENDPOINT_URL!r}")
+    if not S3_BUCKET_NAME.strip():
+        raise RuntimeError("S3_BUCKET_NAME must be set")
 
 
 def _get_s3_client():
@@ -1956,11 +1994,15 @@ def _resident_gpu() -> dict:
     """``gpu`` block for /health and the admin responses."""
     torch = sys.modules.get("torch")
     try:
-        mem = _gpu_memory_info() if torch is not None and torch.cuda.is_initialized() else None
+        context = torch is not None and torch.cuda.is_initialized()
+        mem = _gpu_memory_info() if context else None
     except Exception:
-        mem = None
+        context, mem = False, None
     return {
         **(mem or {}),
+        # The process holds a CUDA context (a few hundred MB that torch can't see or free; only a restart returns it).
+        # With the model off the GPU, reserved_mb is ~0 and the context is what iris measures as left (#22).
+        "cuda_context": context,
         "loaded": _mgr.state in (TTSState.CPU, TTSState.GPU),
         "model_state": _mgr.state.value,
         "idle_s": _idle_s(),

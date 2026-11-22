@@ -113,6 +113,12 @@ Each engine loads its model on first use and leaves the GPU after an idle period
 | `POST /admin/unload` | Free GPU and RAM |
 | `POST /admin/wake` | Load onto the GPU now |
 
+**What stays on the GPU.** Evicting or unloading moves every weight off the GPU and returns torch's allocator cache
+to the driver, so `gpu.reserved_mb` falls to about 0. What remains is the process's CUDA context, a few hundred MB
+(about 320 MB on an RTX 3090 for XTTS or Qwen) that torch can neither see nor free: only ending the process returns
+it. `gpu.cuda_context` (XTTS, Qwen) says whether the process holds one. iris measures what each process holds on its
+own, and its `restart_residual_mb` rule restarts a resident that is unloaded but still holds that much.
+
 ## Security
 
 - `/admin/*` needs `Authorization: Bearer <ARGUS_ADMIN_TOKEN>` (argus-cortex's `bearer`). With the token unset

@@ -36,6 +36,8 @@ it **UNENFORCED** until something checks it. When a rule bites, add a check rath
 | An STT upload decoded before its byte, format and duration caps (it goes through `argus_cortex.limits.open_audio`) | `engines/whisper/tests/test_stt_server.py` (`test_upload_over_the_cap_is_413_and_never_loads`, `test_not_wav_or_flac_is_400`, `test_audio_over_the_duration_cap_is_413`) |
 | An STT stream holding the model lease while it waits for audio | **UNENFORCED** (by design in `_stream`; needs a test that an idle open stream lets keep-alive evict) |
 | `gpu-tenant.yaml` that iris would refuse | CI `engines` / `gpu-tenant` job |
+| A demote to the CPU that leaves model weights or allocator cache on the GPU (qwen-tts's speech tokenizer, cuBLAS's workspace) | `engines/qwen/tests/test_gpu_residue.py`, `engines/xtts/tests/test_gpu_residue.py` (fakes; the real-GPU figures are in #22's PR) |
+| An engine that starts with an S3 configuration it can't use (empty or non-http endpoint, no bucket, no credentials) | `test_gpu_residue.py` `S3EndpointRefusedAtStartupTest` / `test_an_empty_or_unusable_endpoint_is_refused_at_startup` |
 
 ## Layout
 

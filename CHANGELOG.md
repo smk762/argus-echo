@@ -25,6 +25,13 @@
 - `gpu-tenant.yaml` for argus-iris; docs for the shared contract, each engine, and voice cloning.
 
 ### Changed
+- Evicting Qwen to the CPU left its speech tokenizer (the codec, one per loaded model) on the GPU: qwen-tts attaches it
+  as a plain attribute, which `Module.to()` never reaches. It now moves with the model, and Qwen and XTTS clear
+  cuBLAS's workspaces before `empty_cache()`, so an evicted engine holds only its CUDA context. Measured on an RTX
+  3090: Qwen 0.6B CustomVoice evicted 776 → 322 MB, XTTS 336 → 314 MB. `/health`'s `gpu.cuda_context` says whether
+  a context is held (#22).
+- XTTS and Qwen refuse to start when `S3_ENDPOINT_URL` is not an http(s) URL or `S3_BUCKET_NAME` is empty, instead
+  of failing each `/synthesise` after rendering (#22).
 - Miso's `/synthesise` and `/synthesise/stream` answer `422` for a `language` other than `en` (or a region of it,
   `en-US`, `en_GB`) instead of mispronouncing it (#6).
 - Miso clone archives (`GET /clones/{id}/download`, `POST /clones/import`) carry the prompt as
