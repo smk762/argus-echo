@@ -341,10 +341,11 @@ client (Home Assistant) reaches it through the `wyoming-whisper` bridge, which p
 
 The upload is read through argus-cortex's `read_upload`, so the byte cap (`STT_MAX_UPLOAD_MB`, default 50) holds
 first. WAV and FLAC then go through `open_audio`, which checks channels, rate and duration (`STT_MAX_SECONDS`,
-default 600) before a sample is decoded. Other formats go through ffmpeg exactly as on `/transcriptions`: it reads
-only from a pipe, may use only a demuxer in `STT_INPUT_FORMATS` (`none`: WAV/FLAC only), and stops past
-`STT_MAX_SECONDS` (`413`). Undecodable audio is `400`. At most `STT_MAX_DECODES` requests (default 2, shared with
-`/transcriptions`) decode at once; the rest wait up to `STT_QUEUE_TIMEOUT_S`, then get `503`. Nothing is stored.
+default 600) before a sample is decoded. Other formats go through ffmpeg exactly as on `/transcriptions` (below):
+it reads only the audio (a pipe, or a private temp file for MP4/M4A), may use only a demuxer in `STT_INPUT_FORMATS`
+(`none`: WAV/FLAC only), and stops past `STT_MAX_SECONDS` (`413`). Undecodable audio is `400`. At most
+`STT_MAX_DECODES` requests (default 2, shared with `/transcriptions`) decode at once; the rest wait up to
+`STT_QUEUE_TIMEOUT_S`, then get `503`. Nothing is stored.
 
 ```json
 {
@@ -399,11 +400,14 @@ download, the format and the duration (`STT_MAX_SECONDS`) are checked as on `/tr
 `STT_MAX_DECODES` requests (default 2) fetch and decode at once; the rest wait up to `STT_QUEUE_TIMEOUT_S`, then get
 `503`. WAV and FLAC go through argus-cortex's `open_audio`; one it refuses (a sample rate outside the ones it
 takes, such as 12 kHz) goes to ffmpeg as well, unless `STT_INPUT_FORMATS=none`. Anything else is decoded by the
-ffmpeg CLI (in the image): the bytes go in on a pipe,
-`-protocol_whitelist pipe` stops anything inside them (a playlist, a reference) from opening a file or the network,
-`-format_whitelist` allows only the demuxers in `STT_INPUT_FORMATS` (plain audio containers by default: WAV, MP3,
-Ogg/Opus, FLAC, WebM/Matroska, MP4/M4A, AAC, AIFF, CAF, AMR, AU; no playlists), and output stops just past
-`STT_MAX_SECONDS`. `STT_INPUT_FORMATS=none` accepts WAV and FLAC only.
+ffmpeg CLI (in the image): the bytes go in on a pipe, and `-protocol_whitelist pipe` stops anything inside them (a
+playlist, a reference) from opening a file or the network. MP4/M4A/MOV is the exception, because its index often
+comes after the audio (ffmpeg's and most recorders' default without faststart) and the demuxer must seek back to it,
+which a pipe can't do: those bytes are written to a private temporary file (0600, in a 0700 directory, deleted
+afterwards) that ffmpeg opens with `-protocol_whitelist file` and `-enable_drefs 0`, so an MP4's external data
+references are never followed. `-format_whitelist` allows only the demuxers in `STT_INPUT_FORMATS` (plain audio
+containers by default: WAV, MP3, Ogg/Opus, FLAC, WebM/Matroska, MP4/M4A, AAC, AIFF, CAF, AMR, AU; no playlists),
+and output stops just past `STT_MAX_SECONDS`. `STT_INPUT_FORMATS=none` accepts WAV and FLAC only.
 
 Unlike `/transcribe`, it runs faster-whisper's Silero VAD filter, which drops silence before Whisper runs
 (`STT_VAD_FILTER`, default `1`), as composer's sidecar did: Whisper is prone to inventing text for silence, and
