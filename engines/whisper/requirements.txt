@@ -1,0 +1,12 @@
+# argus-echo's Whisper engine. The Dockerfile installs these; engines.yml tests the server with a fake model.
+faster-whisper==1.2.1
+ctranslate2==4.9.0
+# CUDA 12 cuBLAS and cuDNN 9 for CTranslate2, from wheels (no CUDA base image needed).
+nvidia-cublas-cu12>=12.4,<13
+nvidia-cudnn-cu12>=9.1,<10
+fastapi
+uvicorn[standard]
+python-multipart
+structlog
+numpy
+argus-cortex[server,audio,gpu]>=0.12,<0.14

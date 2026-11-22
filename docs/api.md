@@ -1,9 +1,10 @@
-# The echo contract
+# The echo contracts
 
-Every engine is its own HTTP server with the same routes and request fields, so a client can switch engines by
-changing a URL. The Python statement of the shared parts is
-[src/argus_echo/contract.py](../src/argus_echo/contract.py), and `argus-echo check <url>` tests a running engine
-against it.
+Echo has one contract per capability: **text to speech** (`tts`, below) and **speech to text** (`stt`,
+[at the end](#speech-to-text)). Every engine of a capability is its own HTTP server with the same routes and
+request fields, so a client can switch engines by changing a URL. The Python statement is
+[src/argus_echo/contract/](../src/argus_echo/contract/) (`tts.py`, `stt.py`), and `argus-echo check <url>` tests a
+running engine against the capabilities its `/health` names.
 
 Per-engine detail: [Miso](miso-api.md) (the most complete reference; most of it holds for every engine),
 [XTTS-v2](xtts.md), [Qwen3-TTS](qwen.md).
@@ -26,7 +27,7 @@ Per-engine detail: [Miso](miso-api.md) (the most complete reference; most of it 
 | GET | `/media/{key}` | local backend only | no | no |
 
 Every engine listens on `8031` inside its container. [compose.yaml](../compose.yaml) publishes Miso on `8140`,
-XTTS on `8141` and Qwen on `8142`.
+XTTS on `8141`, Qwen on `8142` and Whisper (speech to text) on `8144`.
 
 ## Synthesis
 
@@ -108,3 +109,83 @@ Each engine loads its model on first use and leaves the GPU after an idle period
   front that authenticates callers and owns the `companion_id` namespace.
 - A clone of a real person's voice needs their consent. argus-mask's Voices page records it
   (`argus_cortex.consent`); calling `/clone-voice` directly records nothing.
+
+## Speech to text
+
+The `stt` contract, served by the **whisper** engine (published on `8144`). Its Python statement is
+[src/argus_echo/contract/stt.py](../src/argus_echo/contract/stt.py). An engine names what it serves in
+`GET /health` as `capabilities` (`["stt"]` here); an engine that names nothing is a TTS engine, and
+`argus-echo check` runs only the matching checks. Model choice and settings: [whisper.md](whisper.md).
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| POST | `/transcribe` | One clip in, one transcript out |
+| WS | `/transcribe/stream` | Live PCM in, partial and final transcripts out |
+| GET | `/health` | `ResidentHealth` plus `engine`, `model`, `revision`, `device`, `capabilities`, `streams` |
+| POST | `/admin/{evict,unload,wake}` | As above; evict moves the weights to host RAM |
+
+### `POST /transcribe`
+
+`multipart/form-data`:
+
+| Field | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `audio` | file | required | WAV or FLAC (sniffed from the magic bytes; nothing else is decoded), 1 or 2 channels (averaged), 8 to 96 kHz |
+| `language` | string | detected | ISO 639-1 (`en`). A region suffix is dropped (`en-US` → `en`). An unknown code is `422` |
+| `word_timestamps` | bool | `false` | Adds `words` to every segment |
+
+The upload is read through argus-cortex's `read_upload` and `open_audio`, so the byte cap (`STT_MAX_UPLOAD_MB`,
+default 50), the format, channels, rate and duration (`STT_MAX_SECONDS`, default 600) are checked before a sample
+is decoded. Nothing is stored.
+
+```json
+{
+  "text": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+  "language": "en",
+  "language_probability": 0.96,
+  "duration": 11.0,
+  "segments": [
+    {"start": 0.0, "end": 10.38, "text": "And so, my fellow Americans, ...",
+     "words": [{"start": 0.0, "end": 0.24, "word": " And", "probability": 0.9}]}
+  ]
+}
+```
+
+`language_probability` is null when the language was given. `words` is present only with `word_timestamps`. `text`
+is empty for silence. Times are seconds from the start of the clip.
+
+| Status | When |
+| --- | --- |
+| `400` | Not WAV or FLAC, unreadable, too many channels, a rate outside the list |
+| `413` | Over the byte cap or the duration cap |
+| `422` | Unknown `language` |
+| `503` | Loading, out of GPU memory, or every slot busy for `STT_QUEUE_TIMEOUT_S` (default 30); with `Retry-After` |
+
+Transcriptions run one at a time (`STT_CONCURRENCY`); later requests queue for up to `STT_QUEUE_TIMEOUT_S`.
+Whisper writes numbers as digits (`7.30`, `12%`): normalise both sides before scoring a transcript against a script.
+
+### `WS /transcribe/stream`
+
+For live speech. The server cuts the stream into utterances with voice activity detection (Silero VAD, the
+model faster-whisper ships, on the CPU) and transcribes each one.
+
+1. The server sends `{"type": "ready", "sample_rate": 16000, "audio_format": "pcm_s16le", "channels": 1,
+   "min_silence_ms": 600, "max_utterance_s": 30}`.
+2. The client may send `{"type": "start", "language": "en", "word_timestamps": false}` before any audio.
+3. The client sends audio as binary frames: 16 kHz mono little-endian int16, at most 1 MiB a frame, split
+   anywhere (an odd byte is carried to the next frame).
+4. While an utterance is open the server sends `{"type": "partial", "start", "text"}` every
+   `STT_STREAM_PARTIAL_S` (default 1.0) seconds of speech; each replaces the last.
+5. After `STT_STREAM_MIN_SILENCE_MS` of silence (default 600), or `STT_STREAM_MAX_UTTERANCE_S` of speech (default
+   30), it sends `{"type": "final", "start", "end", ...}` with the `POST /transcribe` fields. Every time is seconds
+   from the start of the stream; an utterance starts 200 ms before the detected onset, and `end` includes the
+   silence that closed it.
+6. `{"type": "end"}` flushes the open utterance (its final) and closes the socket.
+
+A bad control message, a bad `language` or an oversized frame gets `{"type": "error", "error"}` and a close.
+At most `STT_STREAM_MAX_SESSIONS` (default 4) streams are open at once; the next gets an error and close code
+`1013`. The model lease is held per transcription, not per stream, so an idle stream does not keep the model on
+the GPU. Silence alone loads nothing.
+
+`/transcribe` and `/transcribe/stream` are unauthenticated, like the TTS routes: keep the port on a trusted
+network.
