@@ -608,8 +608,9 @@ def _is_wav_or_flac(data: bytes) -> bool:
 
 
 def _is_iso_bmff(data: bytes) -> bool:
-    """MP4, M4A, MOV, 3GP: an ISO base media file starts with a box whose type, at byte 4, is ``ftyp``."""
-    return data[4:8] == b"ftyp"
+    """MP4, M4A, MOV, 3GP: an ISO base media file starts with a box whose type, at byte 4, is ``ftyp``; an older
+    QuickTime .mov may start with ``wide``, ``free``, ``skip``, ``mdat`` or ``moov`` instead."""
+    return data[4:8] in (b"ftyp", b"wide", b"free", b"skip", b"mdat", b"moov")
 
 
 def ffmpeg_decode(data: bytes) -> np.ndarray:

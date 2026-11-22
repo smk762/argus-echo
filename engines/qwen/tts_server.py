@@ -1199,7 +1199,7 @@ def _instruct_ignored(custom) -> bool:
     Read from the loaded model, so a 1.7B custom_voice checkpoint counts as 1.7B; TTS_MODEL_SIZE otherwise."""
     size = getattr(getattr(custom, "model", None), "tts_model_size", None)
     if isinstance(size, str):
-        return size in "0b6"  # qwen-tts's own test (generate_custom_voice)
+        return size == "0b6"  # what qwen-tts tests (generate_custom_voice), without its substring match
     return MODEL_SIZE == "0.6b"
 
 
