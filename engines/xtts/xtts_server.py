@@ -63,6 +63,7 @@ import contextlib
 from contextlib import asynccontextmanager
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlsplit
 
 import structlog
 from argus_cortex.auth import bearer
@@ -152,6 +153,36 @@ class TTSState(str, Enum):
     ERROR = "error"
 
 
+def _drop_cuda_attributes(model) -> None:
+    """Drop CUDA tensors held as plain attributes, which ``Module.cpu()`` does not move (#22).
+
+    coqui-tts's GPT2InferenceModel keeps the last conditioning prefix as ``cached_prefix_emb``; every generation
+    sets it again, so dropping it after a demote costs nothing.
+    """
+    for module in model.modules():
+        cached = getattr(module, "cached_prefix_emb", None)
+        if cached is not None and getattr(cached, "is_cuda", False):
+            module.cached_prefix_emb = None
+
+
+def _release_cuda_cache() -> None:
+    """Return the allocator's free blocks to the driver once the model is off the GPU (#22).
+
+    cuBLAS keeps a workspace per stream inside the caching allocator, and while it lives ``empty_cache()`` cannot
+    release the segment it sits in. Clearing the workspaces first lets the whole cache go; cuBLAS allocates a new
+    one on the next matmul. What stays is the CUDA context itself, which only ending the process frees.
+    """
+    import torch
+
+    if not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        return
+    gc.collect()
+    clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+    if clear is not None:
+        clear()
+    torch.cuda.empty_cache()
+
+
 class XTTSModelManager:
     """Three-state lifecycle: unloaded → cpu → gpu (mirrors the Qwen sidecar)."""
 
@@ -224,8 +255,8 @@ class XTTSModelManager:
             return
         if device == "cpu":
             self._model.cpu()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _drop_cuda_attributes(self._model)
+            _release_cuda_cache()
         else:
             self._model.to(torch.device(device))
 
@@ -370,10 +401,7 @@ class XTTSModelManager:
                 del self._model
                 self._model = None
             self._config = None
-            gc.collect()
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            _release_cuda_cache()
             self._state = TTSState.UNLOADED
             logger.info("xtts_fully_unloaded")
             return True
@@ -443,10 +471,16 @@ def _get_vad_model():
 
 
 def _require_s3_credentials() -> None:
-    """Raise unless both S3 credentials are configured. Called at startup, and
-    again before the first client is built for anything that skips the lifespan."""
+    """Raise unless S3 is usable: both credentials, an http(s) endpoint and a bucket. Called at startup, and again
+    before the first client is built for anything that skips the lifespan. An empty S3_ENDPOINT_URL used to pass
+    here and fail every /synthesise after the audio was rendered (``ValueError: Invalid endpoint``, #22)."""
     if not (S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY):
         raise RuntimeError("S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY must be set; there are no defaults")
+    endpoint = urlsplit(S3_ENDPOINT_URL.strip())
+    if endpoint.scheme not in ("http", "https") or not endpoint.netloc:
+        raise RuntimeError(f"S3_ENDPOINT_URL must be an http(s) URL, got {S3_ENDPOINT_URL!r}")
+    if not S3_BUCKET_NAME.strip():
+        raise RuntimeError("S3_BUCKET_NAME must be set")
 
 
 def _get_s3_client():
@@ -1871,11 +1905,15 @@ def _resident_gpu() -> dict:
     """``gpu`` block for /health and the admin responses."""
     torch = sys.modules.get("torch")
     try:
-        mem = _gpu_memory_info() if torch is not None and torch.cuda.is_initialized() else None
+        context = torch is not None and torch.cuda.is_initialized()
+        mem = _gpu_memory_info() if context else None
     except Exception:
-        mem = None
+        context, mem = False, None
     return {
         **(mem or {}),
+        # The process holds a CUDA context (a few hundred MB that torch can't see or free; only a restart returns it).
+        # With the model off the GPU, reserved_mb is ~0 and the context is what iris measures as left (#22).
+        "cuda_context": context,
         "loaded": _mgr.state in (TTSState.CPU, TTSState.GPU),
         "model_state": _mgr.state.value,
         "idle_s": _idle_s(),
