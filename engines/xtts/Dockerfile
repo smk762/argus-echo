@@ -19,10 +19,14 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     apt-get install -y --no-install-recommends \
         espeak-ng libsndfile1 ffmpeg git build-essential
 
+# Every package's exact version (#32): both installs below are constrained by it, so a revision implies its
+# library stack. See the file's header for how it was made and how to change it.
+COPY constraints.txt /tmp/constraints.txt
+
 # torch + torchaudio with CUDA support (build arg selects wheel index).
 ARG XTTS_TORCH_INDEX_URL=https://download.pytorch.org/whl/cu124
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch torchaudio --index-url "${XTTS_TORCH_INDEX_URL}"
+    pip install -c /tmp/constraints.txt torch torchaudio --index-url "${XTTS_TORCH_INDEX_URL}"
 
 # FastAPI runtime + the maintained Coqui fork (`coqui-tts`, not the archived
 # `TTS`). boto3 for MinIO uploads; soundfile for WAV encode.
@@ -37,7 +41,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # HVAC hum seeded from the VAD gaps). The silero-vad wheel bundles its model, so
 # no network/torch.hub fetch is needed at runtime.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install fastapi "uvicorn[standard]" structlog python-multipart \
+    pip install -c /tmp/constraints.txt fastapi "uvicorn[standard]" structlog python-multipart \
         coqui-tts "transformers==4.57.5" boto3 soundfile \
         silero-vad pyloudnorm noisereduce "argus-cortex[server]>=0.8,<0.10"
 

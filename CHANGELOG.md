@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+- The XTTS, Qwen and Miso images pin every package to an exact version (#32), so a revision implies its library
+  stack: `engines/xtts/constraints.txt` and `engines/qwen/constraints.txt` constrain every `pip install`, and
+  `engines/miso/server-constraints.txt` the server packages Miso adds on top of `uv.lock`. The versions are the
+  ones the published 0.1.0 images contain (XTTS: torch 2.6.0, coqui-tts 0.28.0, transformers 4.57.5; Qwen: torch
+  2.6.0, qwen-tts 0.1.1, transformers 4.57.3), which #30's reproducibility measurement ran, so the audio doesn't
+  change. torch is pinned without its `+cu124` label, so the `*_TORCH_INDEX_URL` build args still pick CPU or
+  CUDA. `tests/test_repo_rules.py` fails an unconstrained install.
+
 ### Added
 - `QWEN_TAG` picks the Qwen image's tag on its own (default `ECHO_TAG`). The published image bakes 0.6b, so a host
   running 1.7b builds it locally under its own tag while `ECHO_TAG` keeps pulling the published images for the

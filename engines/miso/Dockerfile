@@ -22,11 +22,12 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 # Resolve the environment from the repo's pyproject/uv.lock first (better layer
 # caching), then add the server runtime deps.
-COPY pyproject.toml uv.lock .python-version ./
+COPY pyproject.toml uv.lock .python-version server-constraints.txt ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --python 3.11 --no-install-project
+# server-constraints.txt pins what these add beyond uv.lock (#32), so a revision implies its whole stack.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install setuptools fastapi "uvicorn[standard]" python-multipart structlog \
+    uv pip install -c server-constraints.txt setuptools fastapi "uvicorn[standard]" python-multipart structlog \
         boto3 silero-vad pyloudnorm noisereduce httpx
 
 # App code (generator.py carries the low-RAM meta-load + ungated-tokenizer patch).
