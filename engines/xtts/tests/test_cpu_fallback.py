@@ -251,6 +251,9 @@ class _CpuMgr:
     state = xs.TTSState.CPU
     _last_used = 0.0
 
+    def identity(self):
+        return {"checkpoint": None, "weights_fingerprint": None}
+
     def __init__(self, model=None):
         self.seen = []
         self.active = 0

@@ -442,7 +442,7 @@ class SynthesiseFileIoTests(unittest.TestCase):
 
             return wrapper
 
-        async def fake_generate(req):
+        async def fake_generate(req, identity=None):
             nonlocal loop_thread
             loop_thread = threading.get_ident()
             return np.zeros(2400, dtype="<f4"), 24000

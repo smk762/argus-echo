@@ -60,6 +60,7 @@ Request (`application/json`):
 | `temperature` | number | `null` | Clamped to 0.1–1.5. Order of precedence: request, then the clone's `meta.json`, then `MISO_TEMPERATURE` |
 | `topk` | integer | `null` | Clamped to 1–200. Same precedence, falling back to `MISO_TOPK` |
 | `context` | array | `null` | Previous utterances for continuity, oldest first. See [Context](#context) |
+| `seed` | integer | `null` | `0` to `4294967295`. Seeds the sampler before generation (python, numpy, torch CPU and CUDA). Without a clone it also fixes the otherwise random voice. See [api.md](api.md#reproducibility) |
 | `language` | string | `"en"` | `en`, or a region of it (`en-US`, `en_GB`). Anything else is `422`: Miso speaks English only |
 | `voice_description`, `instruction`, `emotion`, `speed` | — | — | Accepted for XTTS compatibility and ignored |
 
@@ -70,7 +71,8 @@ Response `200`:
   "audio_url": "http://host:8140/media/generated/voice/<uuid>.wav",
   "duration": 2.48,
   "duration_seconds": 2.48,
-  "format": "wav"
+  "format": "wav",
+  "seed": null
 }
 ```
 

@@ -13,6 +13,35 @@
   it): the model is used where it is and never promoted to the GPU. `/synthesise` returns `device` and
   `/synthesise/stream` sends `X-XTTS-Device`. While CPU work holds a lease the model isn't moved; GPU requests
   that arrive then join it on the CPU. Ported from agent-composer#80 (part of agent-composer#81).
+- XTTS and Qwen load fine-tuned checkpoints (#10): `POST /admin/load {"checkpoint": "<name>"}` (admin bearer)
+  loads a directory under `XTTS_CHECKPOINT_ROOT` / `TTS_CHECKPOINT_ROOT` (compose: `XTTS_CHECKPOINT_ROOT` and
+  `QWEN_CHECKPOINT_ROOT` on the host, mounted read-only at `/checkpoints`), resolved with argus-cortex `safe_join`.
+  `400` for a name that escapes the root, `404` missing, `422` not this engine's format, `409` while a request
+  holds the model, `500` for a failed load (nothing stays loaded; stock is selected). `{"checkpoint": null}` loads
+  stock, and `/admin/unload` returns to stock; the idle unload keeps the checkpoint. A Qwen checkpoint replaces the
+  model its `tts_model_type` names (`base` or `custom_voice`). What a checkpoint directory must hold:
+  docs/xtts.md and docs/qwen.md.
+- `/health` `weights` (XTTS, Qwen): the selected checkpoint (or `null` for stock) and `{name, sha256, bytes}` for
+  every file the last load read, stock included, hashed once per load in its worker thread.
+- `/health` `image` (Miso, XTTS, Qwen): `{version, revision}` baked into each engine image as build args
+  (`ECHO_VERSION`, `ECHO_REVISION`), which the release workflow now passes; `null` for a local build. A container
+  can't read its own digest.
+- Optional `seed` on `SynthesiseRequest` (contract and every engine, `0` to `2**32 - 1`): seeds python, numpy and
+  torch (CPU and CUDA) per request. XTTS and Qwen run a seeded generation alone, so no concurrent request draws
+  from the RNG in between; Qwen's stream seeds sentence *i* with `seed + i`. `/synthesise` echoes `seed`.
+  docs/api.md#reproducibility says per engine and route what it makes reproducible (streams included) and why
+  it is expected rather than guaranteed on CUDA.
+- Per-utterance weights fingerprint (XTTS, Qwen): a sha256 over the sorted `name:sha256` lines of the loaded files
+  (recipe and worked example in docs/api.md#weights-fingerprint), computed once per load. `/synthesise` returns
+  `checkpoint` and `weights_fingerprint`; `/synthesise/stream` sends `X-Echo-Checkpoint` (percent-encoded, empty
+  for stock) and `X-Echo-Weights`, both read under the request's lease (`/admin/load` is `409` until it ends).
+  Qwen reports the slot that spoke it (`model` / `X-Echo-Model`: `base` or `custom_voice`) and that slot's
+  fingerprint, and `/health` `weights` adds `fingerprint` and, on Qwen, `models` (per-slot checkpoint and
+  fingerprint). An evict and re-promote keeps them; an idle reload re-hashes to the same fingerprint. Miso reports
+  no fingerprint.
+- `argus-echo check` reports the image identity and the loaded checkpoint with its file hashes when `/health` has
+  them (read-only: it never calls `/admin/load`). The contract adds `LoadCheckpointRequest`, `Weights`,
+  `WeightFile`, `ImageIdentity`, `SEED_MAX` and `LOAD_PATH`.
 
 ### Fixed
 - XTTS: a GPU promotion that fails moves the weights back to the CPU and empties the CUDA cache, so the state
