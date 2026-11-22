@@ -9,7 +9,7 @@ The Whisper engine (``engines/whisper/``) serves it. The full reference, with ev
   binary frames, cuts it into utterances with voice activity detection, and sends :class:`StreamPartial` while an
   utterance is open and a :class:`StreamFinal` when it ends. The client may open with a :class:`StreamStart` and
   sends :class:`StreamEnd` to flush the last utterance.
-- ``POST /transcriptions`` is agent-composer's JSON route, kept so kimini-api moves to echo unchanged: a
+- ``POST /transcriptions`` transcribes from a URL or base64 (imported from agent-composer's whisper sidecar): a
   :class:`TranscriptionsRequest` (``audio_url`` fetched by the engine under an SSRF policy, or ``audio_base64``)
   answered by a :class:`TranscriptionsResult`.
 """

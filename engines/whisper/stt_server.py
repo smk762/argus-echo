@@ -5,7 +5,7 @@ Serves the ``stt`` contract (docs/api.md, "Speech to text"):
 
   POST /transcribe          — multipart WAV/FLAC in, {text, language, duration, segments} out
   POST /transcriptions      — JSON {audio_url | audio_base64, language} in, {text, language, duration_seconds,
-                              confidence} out (agent-composer's whisper sidecar route, for kimini-api)
+                              confidence} out (imported from agent-composer's whisper sidecar)
   WS   /transcribe/stream   — 16 kHz s16le PCM in, partial and final transcripts out, cut by Silero VAD
   GET  /health              — argus-cortex ResidentHealth + engine fields, capabilities ["stt"]
   POST /admin/{evict,unload,wake}
@@ -494,7 +494,7 @@ async def transcribe(
         return failure
 
 
-# ── POST /transcriptions (agent-composer's JSON route, for kimini-api) ───────
+# ── POST /transcriptions (from a URL or base64; agent-composer's JSON route) ──
 
 AUDIO_URL_REJECTED = "audio_url is not an allowed http(s) URL"
 AUDIO_URL_FAILED = "Could not download audio_url"
@@ -609,7 +609,7 @@ def decode_audio_bytes(data: bytes) -> tuple[np.ndarray, int]:
 
 @app.post("/transcriptions")
 async def transcriptions(request: Request):
-    """agent-composer's whisper sidecar route, so kimini-api moves to echo unchanged: a JSON body with ``audio_url``
+    """Transcribe from a URL or base64 (agent-composer's whisper sidecar route, imported): a JSON body with ``audio_url``
     (fetched here) or ``audio_base64``, and ``{text, language, duration_seconds, confidence}`` back."""
     try:
         body = await read_body(request, _max_body_bytes(), what="request body")
