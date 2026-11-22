@@ -239,6 +239,10 @@ voice_clones/<companion_id>/prompt.pt   # torch dict: ref_audio, ref_text, speak
 voice_clones/<companion_id>/meta.json   # the metadata above
 ```
 
+Only the server writes `prompt.pt` (from `/clone-voice`, or re-serialised from a
+validated import), so stored clones keep that format. Archives that leave or enter
+the engine use `prompt.safetensors` instead; see below.
+
 To pin sampling for a voice, add `"temperature"` and/or `"topk"` to its
 `meta.json`. Request fields still take precedence; invalid values are ignored.
 
@@ -249,7 +253,18 @@ Response `200`: `{"clones": [<meta.json>, ...]}`, newest first. `500` if storage
 ## GET /clones/{companion_id}/download
 
 Response `200`: `application/zip` named `<companion_id>.zip`, holding
-`prompt.pt` and, if present, `meta.json`. `404` if the clone does not exist.
+`prompt.safetensors` and, if present, `meta.json`. `404` if the clone does not exist.
+Clones stored by earlier versions are converted on the way out.
+
+The clone archive format:
+
+| Member | Contents |
+| --- | --- |
+| `prompt.safetensors` | Tensors: `ref_audio` (float32, 1-D, at `sample_rate`). The safetensors `__metadata__` header holds the scalar fields as strings: `speaker` (integer), `sample_rate` (positive integer), `ref_text` (the transcript), plus `engine` (`miso`), `format` (`miso-clone`) and `format_version` (`1`) |
+| `meta.json` | The clone's metadata (`name`, `companion_id`, `temperature`, `topk`, ...), as listed by `/clones` |
+
+Archives made before this format held `prompt.pt` (a torch pickle) and can no
+longer be imported; see below.
 
 ## DELETE /clones/{companion_id}
 
@@ -260,28 +275,35 @@ Response `200`: `{"status": "deleted", "companion_id": "<as given>"}`. `404` if 
 
 ## POST /clones/import
 
-Imports a zip made by `/clones/{id}/download` (or by the XTTS engine, if it
-holds a Miso `prompt.pt`).
+Imports a zip made by `/clones/{id}/download`.
 
 Request: `multipart/form-data`:
 
 | Field | Required | Notes |
 | --- | --- | --- |
-| `archive` | yes | The zip. Must contain a `prompt.pt` (up to 64 MB) with a `ref_audio` tensor; `meta.json` is optional |
+| `archive` | yes | The zip. Must contain a `prompt.safetensors` (up to 64 MB) with a `ref_audio` tensor; `meta.json` (up to 1 MB) is optional |
 | `companion_id` | no | Id to store under. Default: the archive's `companion_id`, then `voice_name`, then its name. Always slugified |
 | `voice_name` | no | Display name override |
 | `replace` | no | `true` overwrites a clone already stored under the target id. Default `false` |
 
-`prompt.pt` is loaded with `torch.load(weights_only=True)`, so archives cannot
-run code.
+`prompt.safetensors` is parsed with `safetensors.torch.load`, which reads a JSON
+header and raw tensor bytes, so an archive cannot run code. Nothing uploaded is
+ever unpickled: an archive that holds only a legacy `prompt.pt` is refused
+without being read (`torch.load(weights_only=True)` is CVE-2025-32434 on Miso's
+torch 2.4, and later torch releases keep finding unpickler bypasses). Re-export
+such a clone from an engine running this version, whose download produces
+`prompt.safetensors`. A missing `ref_text` in the metadata falls back to
+`meta.json`'s `ref_text`; a missing `speaker` or `sample_rate` takes the engine
+default.
 
 Response `200`: the new metadata (with `"imported": true`) plus `duration`.
 `413` if the archive is over `MISO_MAX_ARCHIVE_MB` (64 MB by default), or the
 body over that + 1 MB (refused before it is written to disk). `409` if the
 target id already has a clone and `replace` is not `true`. `422`
-for a bad zip, a missing or invalid `prompt.pt` (including a malformed
-`speaker` or `sample_rate`, or an empty `ref_audio`), or a `prompt.pt` or
-`meta.json` that is too large.
+for a bad zip, a missing or malformed `prompt.safetensors` (including a
+non-integer `speaker`, a non-positive or non-integer `sample_rate`, non-string
+metadata, or a missing or empty `ref_audio`), an archive with only a legacy
+`prompt.pt`, or a `prompt.safetensors` or `meta.json` that is too large.
 
 ## GET /speakers
 

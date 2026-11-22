@@ -54,7 +54,9 @@ and consent in depth; this page is what each engine does with what you send.
   used by passing `voice_clone_id`. **Clones don't move between engines**: each engine's `prompt.pt` is its own
   format.
 - On Miso and XTTS, `GET /clones/<id>/download` backs a clone up as a zip and `POST /clones/import` restores it to
-  the same engine.
+  the same engine. Miso's archive carries the prompt as `prompt.safetensors`; it refuses older archives that hold a
+  `prompt.pt` (unpickling an upload can run code), so re-download a clone from a current Miso engine before moving
+  it. See [miso-api.md](miso-api.md#get-clonescompanion_iddownload).
 - Clone a real person's voice only with their consent; see [api.md#security](api.md#security).
 
 ## Home Assistant
