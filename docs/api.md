@@ -14,13 +14,13 @@ Per-engine detail: [Miso](miso-api.md) (the most complete reference; most of it 
 | Method | Path | Miso | XTTS-v2 | Qwen3-TTS |
 | --- | --- | --- | --- | --- |
 | POST | `/synthesise` | yes | yes | yes |
-| POST | `/synthesise/stream` | yes | yes | yes, as one chunk at the end |
+| POST | `/synthesise/stream` | yes | yes | yes, one sentence at a time |
 | POST | `/clone-voice` | yes | yes | yes |
-| POST | `/analyze-clips` | yes | yes | no |
-| GET | `/clones` | yes | yes | no |
-| GET | `/clones/{companion_id}/download` | yes | yes | no |
-| DELETE | `/clones/{companion_id}` | yes | yes | no |
-| POST | `/clones/import` | yes | yes | no |
+| POST | `/analyze-clips` | yes | yes | yes |
+| GET | `/clones` | yes | yes | yes |
+| GET | `/clones/{companion_id}/download` | yes | yes | yes |
+| DELETE | `/clones/{companion_id}` | yes | yes | yes |
+| POST | `/clones/import` | yes | yes | yes |
 | GET | `/speakers` | yes | yes | yes |
 | GET | `/health` | yes | yes | yes |
 | POST | `/admin/{evict,unload,wake}` | yes | yes | yes |
@@ -42,7 +42,7 @@ XTTS on `8141`, Qwen on `8142` and Whisper (speech to text) on `8144`.
 | `voice_description` | string | `null` | Qwen only: describe a voice to design. Ignored elsewhere |
 | `instruction` | string | `null` | Qwen only: delivery instruction for a built-in speaker. Ignored elsewhere |
 | `emotion` | string | `"neutral"` | Qwen only. Ignored elsewhere |
-| `speed` | number | `null` | Accepted, applied by no engine yet |
+| `speed` | number | `null` | XTTS only: speaking-rate multiplier passed to inference (`1.0` when unset or not positive). Miso and Qwen accept it and ignore it |
 | `temperature`, `topk`, `context` | | | Miso only; see [miso-api.md](miso-api.md) |
 
 An engine ignores fields it has no use for instead of refusing them, so one request body works on all three.
@@ -59,8 +59,10 @@ An engine ignores fields it has no use for instead of refusing them, so one requ
 
 Read the format from the headers rather than assuming it. Errors found before audio starts (validation, model
 loading, out of memory, busy) are normal JSON errors; once the `200` is sent, a failure can only end the stream
-early. How soon audio starts differs: Miso and XTTS stream within a sentence, while Qwen renders the whole clip and
-sends it at the end.
+early. How soon audio starts differs: Miso and XTTS stream within a sentence, while Qwen splits the text into
+sentences and sends each one as soon as it is rendered (the first byte comes after the first sentence). Qwen
+renders that first sentence before answering `200`, so an error in it is still a JSON error. When the client
+disconnects, XTTS stops at the next chunk and Qwen starts no further sentence (the one in progress finishes).
 
 Busy, loading and out-of-memory answers are `503`, with `Retry-After` where the engine knows a good wait.
 
@@ -79,8 +81,10 @@ On XTTS and Qwen, `GET /speakers` loads the model if it is not loaded.
 Miso needs it) and `companion_id` (`^[A-Za-z0-9_-]{1,64}$`). A clone is stored at
 `voice_clones/<companion_id>/prompt.pt` with a `meta.json`, and used by passing its id as `voice_clone_id`.
 **Clones are engine-specific**: each engine's `prompt.pt` is its own format, which is why each engine gets its
-own bucket. `POST /clones/import` (Miso, XTTS) answers `409` when the target id already has a clone, unless the
-form field `replace=true` is sent. See [voice-cloning.md](voice-cloning.md) for what makes a good reference.
+own bucket. `POST /clones/import` answers `409` when the target id already has a clone, unless the form field
+`replace=true` is sent, and `422` for an archive that is not this engine's format. Qwen checks both the archive's
+`meta.json` `engine` and the `prompt.pt` itself; see [qwen.md](qwen.md#clones). See
+[voice-cloning.md](voice-cloning.md) for what makes a good reference.
 
 ## Health and lifecycle
 

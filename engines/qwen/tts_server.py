@@ -153,7 +153,7 @@ _ENGINE = "qwen-tts"
 _COMPANION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _COMPANION_ID_ERROR = "companion_id must be 1-64 characters of A-Z, a-z, 0-9, '_' or '-'"
 
-# A Qwen prompt.pt is a few hundred KB (a speaker embedding plus, in ICL mode,
+# A Qwen prompt.pt is tens of KB (a speaker embedding plus, in ICL mode,
 # the reference's codec tokens); these caps leave ample room.
 _MAX_PROMPT_BYTES = 16 * 1024 * 1024
 _MAX_META_BYTES = 64 * 1024
