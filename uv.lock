@@ -35,14 +35,14 @@ wheels = [
 
 [[package]]
 name = "argus-cortex"
-version = "0.9.0"
+version = "0.15.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7b/08/09878f8551c7b8405c1633c3d4881d46e26980f6415d0715e46650bac224/argus_cortex-0.9.0.tar.gz", hash = "sha256:5b66648633b3920f3d0b9a3c8c6e3b8cc3c6b75cd1166be8aacb23253e673885", size = 191747, upload-time = "2026-11-16T17:19:59.329Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/6c/19/f57acd7c54ab5045c80c1a843c26fbcd7482e2446045a075bfbd49bd743e/argus_cortex-0.15.0.tar.gz", hash = "sha256:2af68111d82dcafc8bb7d92870424106a7462921dc6e6e8b81d6249f47d40ba3", size = 354554, upload-time = "2026-11-23T09:02:16.213Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f6/7f/22982995c8244e6e05cdfc049d73bf62c8817275d3668863c192a8adb3cc/argus_cortex-0.9.0-py3-none-any.whl", hash = "sha256:69f270748837415544ce3f2f3d0342acce270c70ca2ba644572797c37d5e2adc", size = 115068, upload-time = "2026-11-16T17:19:57.912Z" },
+    { url = "https://files.pythonhosted.org/packages/27/5b/2079bb088aa9c13e87e94fb462852fe83c1e229cdd7e0746beaa1fcb98d7/argus_cortex-0.15.0-py3-none-any.whl", hash = "sha256:ec23662383bcb6440263c04b5df4b23cf4ea260990a3839627a695e7acf03326", size = 137948, upload-time = "2026-11-23T09:02:14.654Z" },
 ]
 
 [[package]]
@@ -64,7 +64,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "argus-cortex", specifier = ">=0.9,<0.10" },
+    { name = "argus-cortex", specifier = ">=0.15,<0.16" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pydantic", specifier = ">=2.6" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
