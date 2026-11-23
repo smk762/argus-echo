@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # FastAPI + runtime deps; argus-cortex for the admin bearer check.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -c /tmp/constraints.txt fastapi "uvicorn[standard]" structlog python-multipart \
-        "argus-cortex[server]>=0.8,<0.10"
+        "argus-cortex[server]>=0.14,<0.15"
 
 # TTS-specific packages
 RUN --mount=type=cache,target=/root/.cache/pip \
