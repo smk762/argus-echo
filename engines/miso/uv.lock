@@ -120,14 +120,10 @@ wheels = [
 
 [[package]]
 name = "argus-cortex"
-version = "0.8.0"
-source = { registry = "https://pypi.org/simple" }
+version = "0.14.1.dev5+g0a5306bf2"
+source = { git = "https://github.com/smk762/argus-cortex.git?rev=0a5306bf2c3ebd49bb269cc6e7c08044e5d6502b#0a5306bf2c3ebd49bb269cc6e7c08044e5d6502b" }
 dependencies = [
     { name = "pydantic" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/f2/3a/31193a0d5ea43aae655d52c803597ef60c5f94dd3934d65b84c1f636650a/argus_cortex-0.8.0.tar.gz", hash = "sha256:85c82d50219f3bf00e0d7dfe9838f4da86ceeefe2b0eca479a7b2a53a0003d9b", size = 183014, upload-time = "2026-11-16T15:38:05.96Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/44/17/5c985db1566aba4a9f0b3a9d1704123e5c78a1377f6ec3e15f51e7fd3306/argus_cortex-0.8.0-py3-none-any.whl", hash = "sha256:d981ac7de96c5985f5b032dbc85981e4fcd54d1e3e227fc7ea3b15d540543d57", size = 107214, upload-time = "2026-11-16T15:38:04.604Z" },
 ]
 
 [package.optional-dependencies]
@@ -752,7 +748,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "argus-cortex", extras = ["server"], specifier = ">=0.8,<0.9" },
+    { name = "argus-cortex", extras = ["server"], git = "https://github.com/smk762/argus-cortex.git?rev=0a5306bf2c3ebd49bb269cc6e7c08044e5d6502b" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'", specifier = "==0.49.2" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.34,<1.0" },
