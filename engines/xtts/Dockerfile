@@ -43,7 +43,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -c /tmp/constraints.txt fastapi "uvicorn[standard]" structlog python-multipart \
         coqui-tts "transformers==4.57.5" boto3 soundfile safetensors \
-        silero-vad pyloudnorm noisereduce "argus-cortex[server]>=0.14,<0.15"
+        silero-vad pyloudnorm noisereduce "argus-cortex[server,remote,yaml]>=0.15,<0.16"
 
 # Accept the Coqui Public Model License non-interactively so the model can be
 # fetched at build time and at runtime without a TTY prompt.
