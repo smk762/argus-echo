@@ -16,6 +16,7 @@ import httpx
 import numpy as np
 import soundfile as sf
 import torch
+from argus_cortex.peers import PeerRefused
 from fastapi.testclient import TestClient
 
 import miso_server as srv
@@ -614,6 +615,32 @@ class ListClonesTest(_LocalStorageCase):
         self.storage.put("voice_clones/c/meta.json", json.dumps({"companion_id": "c", "created_at": "2026"}).encode())
         self.storage.put("voice_clones/d/meta.json", json.dumps({"companion_id": "d", "created_at": 9}).encode())
         self.assertEqual([c["companion_id"] for c in srv._list_clones()], ["d", "a", "c"])
+
+
+class SttPeerTest(unittest.TestCase):
+    """Where Miso finds the speech-to-text engine: its own variables first, then the suite-wide name
+    (argus_cortex.peers). The suite file is off in tests (conftest.py), so only these variables are read."""
+
+    NAMES = ("MISO_STT_URL", "MISO_WHISPER_URL", "ARGUS_WHISPER_URL")
+
+    def _resolve(self, **env: str) -> str:
+        with mock.patch.dict(os.environ, {**dict.fromkeys(self.NAMES, ""), **env}):
+            return srv._stt_url()
+
+    def test_own_variable_then_the_old_name_then_the_suite_wide_one(self):
+        every = {"MISO_STT_URL": "http://own:1/", "MISO_WHISPER_URL": "http://old:2", "ARGUS_WHISPER_URL": "http://suite:3"}
+        self.assertEqual(self._resolve(**every), "http://own:1")  # no trailing slash
+        self.assertEqual(self._resolve(**{**every, "MISO_STT_URL": ""}), "http://old:2")
+        self.assertEqual(self._resolve(ARGUS_WHISPER_URL="http://suite:3"), "http://suite:3")
+
+    def test_unset_or_off_is_no_transcription(self):
+        self.assertEqual(self._resolve(), "")
+        self.assertEqual(self._resolve(MISO_STT_URL="off", ARGUS_WHISPER_URL="http://suite:3"), "")
+
+    def test_a_malformed_url_is_refused_not_read_as_unset(self):
+        with self.assertRaises(PeerRefused) as raised:
+            self._resolve(MISO_STT_URL="whisper:8031")
+        self.assertNotIn("whisper:8031", str(raised.exception))  # the variable is named, never the value
 
 
 if __name__ == "__main__":

@@ -343,6 +343,12 @@ Response `200`:
 }
 ```
 
+The body also carries `capabilities`, `image` and argus-cortex's `ServiceHealth` fields (`service`, `version`,
+`started_at`, `checks`, `build`, `peer` and the rest), described in
+[api.md](api.md#health-and-lifecycle).
+
+- `status`: `ok`, or `degraded` (still `200`) while `model_state` is `error`.
+
 - `model_state`: `unloaded`, `loading`, `cpu`, `gpu` or `error`. In `error`,
   `error` holds the last load failure; the next request tries to load again.
 - `busy`: `true` while a request holds the GPU lock, else `false` (the
@@ -350,7 +356,7 @@ Response `200`:
 - `active`: the request holding the GPU lock, or `null`.
 - `idle_s`: seconds since the last request, only in the `gpu` and `cpu` states.
 - `503 {"status": "loading"}` while the model loads.
-- `503` with `"status": "stuck"` and `stuck_after_s` when the GPU lock has been
+- `503` with `"status": "stuck"`, the fields above and `stuck_after_s` when the GPU lock has been
   held longer than any generation could take (`MISO_STUCK_AFTER_S`). With
   `MISO_STUCK_EXIT=1` (default) the process exits with code 70 soon after, so a
   container restart policy brings it back.

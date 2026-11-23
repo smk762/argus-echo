@@ -76,6 +76,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: >-
-          uv run --no-project --python 3.12 --with "argus-cortex[yaml]>=0.15,<0.16"
+          uv run --no-project --python 3.12 --with "argus-cortex[yaml]>=0.16.1,<0.17"
           python -c "from argus_cortex.gpu_wire import load_tenant_manifest as load;
           m = load('gpu-tenant.yaml'); print(m.tenant, [r.name for r in m.residents])"

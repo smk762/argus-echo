@@ -45,6 +45,21 @@ reports its container, calling its `/admin/*` routes with the admin token the en
 with one broker must share one `ARGUS_ADMIN_TOKEN`. Unset, nothing registers; a broker that is down never stops an
 engine starting.
 
+Values every Argus service on a host shares (the broker URL and token, `ARGUS_ADMIN_TOKEN`, `HF_TOKEN`, the `S3_*`
+credentials) can be written once in the suite settings file, `~/.config/argus/suite.env` (mode 600;
+`python -m argus_cortex.settings --init` creates it), instead of in each repo's `.env`. Each engine reads it at
+startup for whatever its own environment leaves unset or empty, so a value in `.env` still wins. Under Compose, add
+[`compose.suite.yaml`](compose.suite.yaml) to mount the file read-only at `/etc/argus/suite.env`
+(`COMPOSE_FILE=compose.yaml:compose.suite.yaml` in `.env`); it is a separate file because a host without a suite
+file could not start with the mount in place. One limit today
+([argus-cortex#218](https://github.com/smk762/argus-cortex/issues/218)): the engines run as root, and the file is
+read only when root owns it, so the mounted file must be root-owned; one owned by your own user is ignored with a
+warning.
+
+Each engine container carries the suite's discovery labels (`argus.peer`, `argus.service`, `argus.health`,
+`argus.port`), which argus-iris's agents read to list the suite's services. The peer names, which are what callers
+ask for (`ARGUS_<PEER>_URL`), are `miso`, `xtts`, `tts` (Qwen) and `whisper`.
+
 Ports: Miso `8140`, XTTS `8141`, Qwen `8142`, Whisper `8144`; Wyoming bridges `10240` (XTTS), `10241` (Miso),
 `10242` (Qwen) and `10243` (Whisper), see [Home Assistant](docs/voice-cloning.md#home-assistant). They are published on
 `ECHO_BIND`, which defaults to `127.0.0.1`; set it to `0.0.0.0` or a LAN address to serve other machines. Miso downloads its ~33 GB checkpoint into `HF_HOME` on first use; the XTTS and Qwen images bake their

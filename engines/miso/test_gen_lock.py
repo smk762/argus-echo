@@ -143,22 +143,22 @@ class GenLockTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(body["holder"]["endpoint"], "synthesise")
                 self.assertEqual(resp.headers["retry-after"], "5")
 
-        health = await srv.health()
-        self.assertEqual(health["status"], "ok")
+        self.assertIsNone(await srv._health_unready())
+        health = await srv._health_extra()
         self.assertIs(health["busy"], True)
         self.assertEqual(health["active"]["endpoint"], "synthesise")
 
         with mock.patch.object(srv, "STUCK_AFTER_S", 0.0):
             await asyncio.sleep(0.15)
-            stuck = await srv.health()
-        self.assertEqual(stuck.status_code, 503)
-        self.assertEqual(json.loads(stuck.body)["status"], "stuck")
+            stuck = await srv._health_unready()  # what GET /health answers with 503 (test_health.py)
+        self.assertEqual(stuck["status"], "stuck")
+        self.assertEqual(stuck["active"]["endpoint"], "synthesise")
 
         release.set()
         with mock.patch.object(srv._storage, "put", return_value="http://x/a.wav"):
             self.assertIn("audio_url", await first)
         self.assertTrue(await self._until_released())
-        idle = await srv.health()
+        idle = await srv._health_extra()
         self.assertIs(idle["busy"], False)
         self.assertIsNone(idle["active"])
 

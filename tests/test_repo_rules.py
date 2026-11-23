@@ -90,3 +90,51 @@ def test_the_install_scan_joins_continuation_lines() -> None:
     assert _install_commands(dockerfile, "pip install") == [
         "RUN --mount=type=cache pip install -c /tmp/constraints.txt torch torchaudio"
     ]
+
+
+# Each engine's compose service, the argus.peer name callers ask for, and (in gpu-tenant.yaml) its container.
+ENGINE_PEERS = {"miso": "miso", "xtts": "xtts", "qwen": "tts", "whisper": "whisper"}
+
+
+def _compose_service(name: str) -> str:
+    """The text of one service's block in compose.yaml (two-space indented, up to the next service)."""
+    match = re.search(
+        rf"^  {re.escape(name)}:\n(?P<body>(?:(?:    .*|\s*)\n)+)", (ROOT / "compose.yaml").read_text(), re.M
+    )
+    assert match, f"compose.yaml has no service {name}"
+    return match["body"]
+
+
+def test_every_engine_container_carries_the_discovery_labels() -> None:
+    # argus-iris's agents list the suite's services from these labels (argus-cortex's service module); ARGUS_PEER
+    # repeats the name in the environment, because a process cannot read its own labels, and /health reports it.
+    for service, peer in ENGINE_PEERS.items():
+        block = _compose_service(service)
+        for line in (
+            f"argus.peer: {peer}",
+            "argus.service: argus-echo",
+            "argus.health: /health",
+            'argus.port: "8031"',
+            f"ARGUS_PEER: {peer}",
+        ):
+            assert re.search(rf"^\s+{re.escape(line)}(\s+#.*)?$", block, re.M), f"{service}: no `{line}`"
+        assert ':8031"' in block, f"{service}: argus.port must be the container port it publishes"
+
+
+def test_a_wyoming_bridge_is_not_labelled_as_a_peer() -> None:
+    # The bridges speak Wyoming and serve no /health, so a directory built from the labels must not list them.
+    for service in ("wyoming-xtts", "wyoming-miso", "wyoming-qwen", "wyoming-whisper"):
+        assert "argus.peer" not in _compose_service(service)
+
+
+def test_the_suite_file_mount_is_opt_in() -> None:
+    # compose cannot make a bind mount optional, so the mount lives in an override file a host opts into.
+    assert "suite.env" not in "".join(
+        line
+        for line in (ROOT / "compose.yaml").read_text().splitlines(keepends=True)
+        if not line.lstrip().startswith("#")
+    )
+    suite = (ROOT / "compose.suite.yaml").read_text()
+    assert "target: /etc/argus/suite.env" in suite and "read_only: true" in suite
+    for service in ENGINE_PEERS:
+        assert re.search(rf"^  {service}:\n    volumes:\n      - \*suite-env$", suite, re.M), service

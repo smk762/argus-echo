@@ -9,4 +9,4 @@ uvicorn[standard]
 python-multipart
 structlog
 numpy
-argus-cortex[server,audio,gpu,remote,yaml]>=0.15,<0.16
+argus-cortex[server,audio,gpu,remote,yaml]>=0.16.1,<0.17

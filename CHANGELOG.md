@@ -3,6 +3,23 @@
 ## [Unreleased]
 
 ### Added
+- **`GET /health` is also argus-cortex's `ServiceHealth`** on every engine (`argus_cortex.service.install_health`,
+  smk762/argus-cortex#212): `service` (`argus-echo`), `version` (the echo release, as `image.version`), `build`
+  (the commit), `status`, `started_at`, `checks`, `peer`, `wire`, `read_only` and `service_version`, beside every
+  field it had, which keep their names and meaning; `GET /health?checks=0` skips the check. The `503` answers are
+  unchanged, body and status: `{"status": "loading"}`, Miso's `stuck` and XTTS's `gpu_error`.
+- **Discovery labels** on each engine container in `compose.yaml` (`argus.peer`, `argus.service: argus-echo`,
+  `argus.health: /health`, `argus.port: "8031"`), which argus-iris's agents read. The peer names are `miso`, `xtts`,
+  `tts` (Qwen) and `whisper`; compose repeats each as `ARGUS_PEER`, and `/health` reports it as `peer`. The Wyoming
+  bridges serve no `/health` and are not labelled.
+- **The suite settings file.** Each engine copies argus-cortex's suite file (`~/.config/argus/suite.env`, or
+  `/etc/argus/suite.env` in a container) into its environment at startup, for whatever is unset or empty there
+  (`HF_TOKEN`, the `S3_*` credentials, `ARGUS_ADMIN_TOKEN`, the broker URL and token). `compose.suite.yaml` mounts
+  it, opt-in (`COMPOSE_FILE=compose.yaml:compose.suite.yaml`). The engines run as root, so today the mounted file
+  must be root-owned (smk762/argus-cortex#218).
+- `argus-echo check` reports a `service` finding (the service, version, status, peer and any failed check) when
+  `/health` is a `ServiceHealth`, and fails one that carries `service_version` but is not valid. An engine from
+  before this change has no such finding and still passes.
 - **Every engine registers with argus-iris on its own.** With `ARGUS_GPU_BROKER_URL` set (and `ARGUS_GPU_BROKER_TOKEN`
   when the broker has one), Miso, XTTS, Qwen and Whisper register `gpu-tenant.yaml` (tenant `argus-echo`) at
   startup through argus-cortex 0.15's `aregistered`, renew it every 5 minutes and sign off on shutdown; the
@@ -12,8 +29,21 @@
   copy) and passes the two variables. No iris `services:` entry is needed any more.
 
 ### Changed
-- argus-cortex `>=0.15,<0.16` for the package and every engine (with the `[remote,yaml]` extras in the engines);
-  the XTTS and Qwen images pin `argus-cortex==0.15.0`, and Miso moves from a git commit to the release.
+- argus-cortex `>=0.16.1,<0.17` for the package and every engine (with the `[remote,yaml]` extras in the engines);
+  the XTTS and Qwen images pin `argus-cortex==0.16.1`, and Miso moves from a git commit to the release.
+- **`/health` `status` is `degraded` while `model_state` is `error`** (the last load failed), where it was `ok`.
+  It is still a `200`, and `error` still holds the reason on Miso and Whisper.
+- **Miso finds the speech-to-text engine as an argus-cortex peer.** `MISO_STT_URL`, then `MISO_WHISPER_URL`, then
+  the suite-wide `ARGUS_WHISPER_URL` (environment or suite file). An empty `MISO_STT_URL` used to mean "no
+  transcription"; it now falls through to `ARGUS_WHISPER_URL`, so a host that sets that name gets `/clone-voice`
+  transcripts from it (and a `502`/`503`/`504` when it fails) without setting anything for Miso. `MISO_STT_URL=off`
+  keeps transcription off. A value that is not an absolute `http(s)` URL now stops Miso at startup, naming the
+  variable, instead of failing on the first clone.
+- compose: a Wyoming bridge whose `WYOMING_*_ENGINE_URL` is unset uses the engine's suite-wide URL when the shell
+  or `.env` sets it (`ARGUS_XTTS_URL`, `ARGUS_MISO_URL`, `ARGUS_TTS_URL` for Qwen, `ARGUS_WHISPER_URL`), then the
+  engine in the compose project as before; `MISO_STT_URL` falls back to `ARGUS_WHISPER_URL` the same way.
+- `GET /health` is no longer listed in an engine's `/openapi.json` (`install_health` registers it outside the
+  document).
 
 ### Documentation
 - XTTS-v2 is the suite's cloning engine (#51): README, docs/voice-cloning.md, docs/api.md and docs/xtts.md say to
