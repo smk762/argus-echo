@@ -65,6 +65,52 @@ def test_health_that_is_not_resident_health_fails() -> None:
     assert "ResidentHealth" in report.findings[0].detail
 
 
+# What an engine on argus-cortex 0.16 adds to /health: ServiceHealth's fields beside the ones above.
+SERVICE = {
+    "service_version": "1.1",
+    "service": "argus-echo",
+    "version": "0.4.0",
+    "status": "ok",
+    "started_at": "2026-11-23T10:00:00Z",
+    "wire": {},
+    "capabilities": ["tts"],
+    "checks": {"model": {"ok": True, "detail": None, "latency_ms": 0.1, "required": True}},
+    "read_only": False,
+    "build": "abc123",
+    "peer": "miso",
+}
+
+
+def _finding(report, name: str):
+    return next((f for f in report.findings if f.name == name), None)
+
+
+def test_a_service_health_body_passes_and_names_the_service() -> None:
+    report = check("http://e", transport=engine(health={**HEALTH, **SERVICE}))
+    assert report.ok, report.findings
+    assert _finding(report, "service").detail == "argus-echo 0.4.0 status=ok peer=miso"
+    assert "capabilities=tts" in _finding(report, "GET /health").detail
+
+
+def test_a_degraded_engine_passes_and_names_the_failed_check() -> None:
+    failed = {"model": {"ok": False, "detail": "error", "required": True}}
+    health = {**HEALTH, **SERVICE, "status": "degraded", "model_state": "error", "checks": failed}
+    report = check("http://e", transport=engine(health=health))
+    assert report.ok, report.findings  # the contract is served; whether the model loaded is not a contract check
+    assert _finding(report, "service").detail.endswith("status=degraded peer=miso; failed checks: model")
+
+
+def test_an_engine_from_before_service_health_is_not_failed_for_it() -> None:
+    report = check("http://e", transport=engine())
+    assert report.ok and _finding(report, "service") is None
+
+
+def test_a_malformed_service_health_fails() -> None:
+    report = check("http://e", transport=engine(health={**HEALTH, **SERVICE, "status": "loading"}))
+    assert not report.ok
+    assert _finding(report, "service").detail.startswith("not argus-cortex ServiceHealth: status")
+
+
 def test_engine_without_clone_list_is_not_a_failure() -> None:
     report = check("http://e", transport=engine(clones=404))
     assert report.ok

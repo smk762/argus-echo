@@ -16,6 +16,7 @@ import soundfile as sf
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from argus_cortex.gpu_wire import ResidentHealth  # noqa: E402
+from argus_cortex.service import ServiceHealth  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
@@ -245,6 +246,30 @@ class HealthTest(EngineTest):
         self.assertEqual(body["engine"], "whisper")  # clients key on it (docs/api.md)
         self.assertEqual(body["model_state"], "unloaded")
         self.assertEqual(FakeBackend.instances, [])  # health loads nothing
+
+    def test_health_is_service_health_and_keeps_every_earlier_field(self):
+        body = self.client.get("/health").json()
+        health = ServiceHealth.model_validate(body)
+        self.assertEqual((health.service, health.status, health.capability_names), ("argus-echo", "ok", ("stt",)))
+        self.assertIs(body["checks"]["model"]["ok"], True)
+        before = {"status", "engine", "model", "revision", "device", "compute_type", "capabilities", "model_state",
+                  "busy", "idle_s", "keep_alive_gpu", "keep_alive_cpu", "streams", "gpu", "image"}
+        self.assertLessEqual(before, set(body))  # what clients read before it was a ServiceHealth
+        self.assertIs(body["busy"], False)  # ResidentHealth's fields stay top-level
+
+    def test_loading_is_still_503_with_the_body_it_always_had(self):
+        with mock.patch.object(stt_server.mgr, "state", stt_server.State.LOADING):
+            r = self.client.get("/health")
+        self.assertEqual((r.status_code, r.json()), (503, {"status": "loading"}))
+
+    def test_a_failed_load_is_degraded_and_still_200_with_its_error(self):
+        with mock.patch.object(stt_server.mgr, "state", stt_server.State.ERROR), \
+                mock.patch.object(stt_server.mgr, "error", "load failed"):
+            r = self.client.get("/health")
+        self.assertEqual(r.status_code, 200)  # argus-iris raises on anything else
+        body = r.json()
+        self.assertEqual((body["status"], body["model_state"], body["error"]), ("degraded", "error", "load failed"))
+        self.assertIs(body["checks"]["model"]["ok"], False)
 
     def test_health_reports_the_image_and_runtime_libraries(self):
         import importlib.metadata

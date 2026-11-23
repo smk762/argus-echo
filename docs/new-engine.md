@@ -13,9 +13,13 @@ from whichever engine is nearest in kind. Each item names where whisper does it.
 - [ ] **The contract for each capability it serves**, exactly as docs/api.md and
       `src/argus_echo/contract/<capability>.py` state it. A new capability needs its contract module, its docs/api.md
       section and its `argus-echo check` suite first ([#2](https://github.com/smk762/argus-echo/issues/2)).
-- [ ] **`GET /health` is argus-cortex `ResidentHealth`**: top-level `model_state`, `busy` (a bool), `idle_s`, and a
-      memory-only `gpu` block, plus `engine`, `model`, `device` and **`capabilities`** (`health()`, `_gpu_block()`).
-      `503 {"status": "loading"}` while loading.
+- [ ] **`GET /health` is argus-cortex `ResidentHealth` and `ServiceHealth`**, served by
+      `argus_cortex.service.install_health(app, service="argus-echo", version=ECHO_VERSION, build=ECHO_REVISION,
+      capabilities=CAPABILITIES, checks={"model": ...}, extra=_health_fields, check_ttl_s=0)`: top-level
+      `model_state`, `busy` (a bool), `idle_s`, and a memory-only `gpu` block, plus `engine`, `model`, `device` and
+      **`capabilities`** (`_health_fields()`, `_gpu_block()`). A failed load is `status: degraded`, still `200`
+      (argus-iris raises on anything else). `503 {"status": "loading"}` while loading, answered by the
+      `_UnreadyHealth` middleware (`_health_unready()`), not by `readiness=`.
 - [ ] **A model manager**: `unloaded -> loading -> gpu <-> cpu -> unloaded`. Work holds a lease for its whole run;
       evict and unload wait for leases to drop; keep-alive timers demote GPU to RAM, then free it; a negative
       keep-alive pins that stage; a load runs shielded so a cancelled request can't strand `loading`

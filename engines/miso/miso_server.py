@@ -67,9 +67,12 @@ Env vars:
   MISO_STT_URL          — echo's speech-to-text engine (whisper, `POST /transcribe`).
                           When set, /clone-voice with an empty `reference_text`
                           transcribes each clip there; a failure is a 502/503/504,
-                          never a silent empty transcript. Unset (default) leaves
-                          such clones without a transcript. MISO_WHISPER_URL is the
-                          old name, read when MISO_STT_URL is unset.
+                          never a silent empty transcript. Resolved as an argus-cortex
+                          peer: MISO_STT_URL, then MISO_WHISPER_URL (the old name), then
+                          the suite-wide ARGUS_WHISPER_URL. None set (default) leaves
+                          such clones without a transcript; `off` does the same
+                          whatever the suite sets. A value that is not an http(s) URL
+                          stops the server at startup.
   MISO_STT_TIMEOUT_S    — per-clip timeout for that call (default 60)
   Idle lifecycle (unloaded → cpu → gpu, like the XTTS and ModernBERT sidecars):
   MISO_KEEP_ALIVE_GPU   — idle s on GPU before leaving it (default 300).
@@ -132,6 +135,9 @@ import structlog
 from argus_cortex.auth import bearer
 from argus_cortex.gpu import aregistered, coordinator_from_env
 from argus_cortex.resident import admin_evict, admin_wake
+from argus_cortex.peers import peer_url
+from argus_cortex.service import DependencyCheck, install_health
+from argus_cortex import settings as suite_settings
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import HTTPConnection
 from argus_cortex.limits import BadInput, TooLarge, read_upload
@@ -140,6 +146,11 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = structlog.get_logger("miso_server")
+
+# Values the suite's services share (HF_TOKEN, the S3 credentials, ARGUS_ADMIN_TOKEN) may live in argus-cortex's suite
+# file (/etc/argus/suite.env in a container). Copy the ones this process was not given into the environment before
+# anything below, or a library, reads it. What the environment already sets wins; no file, nothing happens.
+suite_settings.apply()
 
 # The image's identity, baked in at build time (release.yml); None for a local build. /health reports it as `image`.
 ECHO_VERSION: Optional[str] = os.getenv("ECHO_VERSION", "").strip() or None
@@ -202,7 +213,14 @@ FRAME_MS = 80  # one Miso/Mimi frame
 # Head-room on the prompt-length estimate (Mimi frame rounding, tokenizer drift).
 CONTEXT_TOKEN_MARGIN = 8
 # Fills an empty /clone-voice reference_text. Env only: a request can't point Miso at a URL.
-STT_URL = (os.getenv("MISO_STT_URL", "").strip() or os.getenv("MISO_WHISPER_URL", "").strip()).rstrip("/")
+# argus-cortex's peer order: MISO_STT_URL, the old MISO_WHISPER_URL, then the suite-wide ARGUS_WHISPER_URL. A blank
+# one falls through to the next, `off` stops there, and a value that is not an http(s) URL stops the server at
+# startup (PeerRefused names the variable, never the value).
+def _stt_url() -> str:
+    return peer_url("whisper", "MISO_STT_URL", "MISO_WHISPER_URL") or ""
+
+
+STT_URL = _stt_url()
 STT_TIMEOUT_S = float(os.getenv("MISO_STT_TIMEOUT_S", "60"))
 # Tests swap in an httpx.MockTransport; None is a real network transport.
 _STT_TRANSPORT = None
@@ -2767,19 +2785,38 @@ def _runtime() -> dict:
     return out
 
 
-@app.get("/health")
-async def health():
+async def _health_unready() -> Optional[dict]:
+    """The body of a ``503`` from ``/health``, or None while the engine serves: ``{"status": "loading"}`` while the
+    model loads, and the engine's fields with ``"status": "stuck"`` when the GPU lock has been held past any possible
+    generation (that fails the container healthcheck). These are the bodies Miso has always sent, not ServiceHealth."""
     if _mgr.state == TTSState.LOADING:
-        return JSONResponse(status_code=503, content={"status": "loading"})
+        return {"status": "loading"}
     busy = _mgr.busy_info()
-    body = {
-        "status": "ok",
+    if _is_stuck(busy):
+        return {
+            "status": "stuck",
+            "capabilities": ["tts"],
+            **_health_fields(busy),
+            "image": _image(await asyncio.to_thread(_runtime)),
+            "stuck_after_s": STUCK_AFTER_S,
+        }
+    return None
+
+
+def _image(runtime: dict) -> dict:
+    # The release and revision baked in at build time, and the runtime libraries (_runtime); a container can't see
+    # its own image digest.
+    return {"version": ECHO_VERSION, "revision": ECHO_REVISION, "runtime": runtime}
+
+
+def _health_fields(busy: Optional[dict]) -> dict:
+    """Miso's own ``/health`` fields, beside ServiceHealth's (``image`` is added by the caller)."""
+    return {
         # A bool, as argus-cortex's ResidentHealth and argus-iris expect;
         # who holds the GPU lock is in `active` (smk762/voluptas#26).
         "busy": busy is not None,
         "active": busy,
         "engine": "miso",
-        "capabilities": ["tts"],  # the echo contracts this engine serves (docs/api.md)
         "model": MODEL_SOURCE,
         "device": DEVICE,
         "model_state": _mgr.state.value,
@@ -2791,16 +2828,50 @@ async def health():
         "error": _mgr.error,
         "rss_mb": _rss_mb(),
         "gpu": _gpu_memory_info(),
-        # The release and revision baked in at build time, and the runtime libraries (_runtime); a container can't
-        # see its own image digest.
-        "image": {"version": ECHO_VERSION, "revision": ECHO_REVISION, "runtime": await asyncio.to_thread(_runtime)},
     }
-    if _is_stuck(busy):
-        # Held past any possible generation: fail the container healthcheck.
-        body["status"] = "stuck"
-        body["stuck_after_s"] = STUCK_AFTER_S
-        return JSONResponse(status_code=503, content=body)
-    return body
+
+
+async def _health_extra() -> dict:
+    return {**_health_fields(_mgr.busy_info()), "image": _image(await asyncio.to_thread(_runtime))}
+
+
+async def _model_check() -> DependencyCheck:
+    """A model that failed to load makes the engine ``degraded`` (still 200: the next request retries the load)."""
+    failed = _mgr.state == TTSState.ERROR
+    return DependencyCheck(ok=not failed, detail="error" if failed else None)
+
+
+class _UnreadyHealth:
+    """Answers ``GET /health`` with the engine's own ``503`` while it cannot serve (``_health_unready``); every
+    other request, and ``/health`` while it serves, goes on to the app. Pure ASGI, so streams are not buffered."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope["method"] == "GET" and scope["path"] == "/health":
+            body = await _health_unready()
+            if body is not None:
+                response = JSONResponse(body, status_code=503, headers={"Cache-Control": "no-store"})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# GET /health is argus-cortex's ServiceHealth (service, version, status, started_at, capabilities, checks, build,
+# peer) with ResidentHealth's fields and Miso's own beside it. No readiness=: the 503s stay the ones above, which
+# argus-proof and the container healthcheck read. The check only reads state, so it is not cached.
+app.add_middleware(_UnreadyHealth)
+install_health(
+    app,
+    service="argus-echo",
+    version=ECHO_VERSION,
+    build=ECHO_REVISION,
+    capabilities=["tts"],  # the echo contracts this engine serves (docs/api.md)
+    checks={"model": _model_check},
+    extra=_health_extra,
+    check_ttl_s=0,
+)
 
 
 # ── GET /media/{key} ──────────────────────────────────────────────────────────

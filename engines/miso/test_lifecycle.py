@@ -230,7 +230,7 @@ class LifecycleTest(unittest.IsolatedAsyncioTestCase):
     async def test_health_reports_lifecycle(self):
         self._configure(gpu=-1, cpu=0)
         with mock.patch.object(srv, "_mgr", self.mgr):
-            body = await srv.health()
+            body = await srv._health_extra()
         self.assertEqual(body["model_state"], "unloaded")
         self.assertIn("rss_mb", body)
         self.assertEqual(body["keep_alive_gpu"], -1)

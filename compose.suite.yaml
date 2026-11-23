@@ -1,0 +1,36 @@
+# Optional: mount the suite settings file (argus_cortex.settings) into the engine containers, read-only.
+#
+#   python -m argus_cortex.settings --init                # creates ~/.config/argus/suite.env, mode 600
+#   COMPOSE_FILE=compose.yaml:compose.suite.yaml          # in .env, or pass both files with -f
+#
+# A separate file because compose cannot make a bind mount optional: with it in compose.yaml, a host without a
+# suite file would not start. Each engine copies the file's values into its environment at startup, for whatever
+# its own environment leaves unset or blank (HF_TOKEN, the S3 credentials, ARGUS_ADMIN_TOKEN, the broker URL and
+# token), so anything set in .env or the environment still wins.
+#
+# Known limit (smk762/argus-cortex#218): the engines run as root, and argus-cortex reads the file only when root
+# owns it and nobody else can write it; a file owned by your own user is ignored with a warning, and the engine
+# starts as if there were none. So today the mounted file must be root-owned (keep it mode 600). ARGUS_SUITE_ENV
+# names another path, for example a root-owned copy.
+#
+# The Wyoming bridges are left out: they read only the engine URL compose gives them.
+x-suite-env: &suite-env
+  type: bind
+  source: "${ARGUS_SUITE_ENV:-${HOME}/.config/argus/suite.env}"
+  target: /etc/argus/suite.env
+  read_only: true
+  bind: {create_host_path: false}
+
+services:
+  miso:
+    volumes:
+      - *suite-env
+  xtts:
+    volumes:
+      - *suite-env
+  qwen:
+    volumes:
+      - *suite-env
+  whisper:
+    volumes:
+      - *suite-env

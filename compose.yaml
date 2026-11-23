@@ -9,6 +9,10 @@
 # Every port is published as ${ECHO_BIND}:<port>. ECHO_BIND defaults to loopback; set it to
 # 0.0.0.0 or a LAN address to serve other machines. /admin/* is closed until
 # ARGUS_ADMIN_TOKEN is set. Settings: .env.example; reference: docs/.
+#
+# Each engine container is labelled argus.peer, the name callers ask for (ARGUS_<PEER>_URL in argus_cortex.peers):
+# miso, xtts, tts (Qwen) and whisper. argus-iris's agents read the labels to list the suite's services.
+# compose.suite.yaml (optional) mounts the suite settings file into the engines.
 
 x-gpu: &gpu
   deploy:
@@ -41,6 +45,11 @@ services:
     image: ghcr.io/smk762/argus-echo-miso:${ECHO_TAG:-local}
     container_name: argus-echo-miso
     restart: unless-stopped
+    labels:
+      argus.peer: miso
+      argus.service: argus-echo
+      argus.health: /health
+      argus.port: "8031"
     ports:
       - "${ECHO_BIND:-127.0.0.1}:${MISO_PORT:-8140}:8031"
     environment:
@@ -63,9 +72,11 @@ services:
       MISO_KEEP_ALIVE_GPU: ${MISO_KEEP_ALIVE_GPU:-300}
       MISO_KEEP_ALIVE_CPU: ${MISO_KEEP_ALIVE_CPU:-0}
       # Speech-to-text engine that transcribes /clone-voice clips sent without reference_text
-      # (e.g. http://whisper:8031 with the whisper profile). Empty: such clones have no transcript.
-      MISO_STT_URL: ${MISO_STT_URL:-}
+      # (e.g. http://whisper:8031 with the whisper profile). Empty: the suite-wide ARGUS_WHISPER_URL (here or in the
+      # suite file); neither: such clones have no transcript. `off` keeps it off whatever the suite sets.
+      MISO_STT_URL: ${MISO_STT_URL:-${ARGUS_WHISPER_URL:-}}
       MISO_STT_TIMEOUT_S: ${MISO_STT_TIMEOUT_S:-60}
+      ARGUS_PEER: miso  # the argus.peer label above, which a process cannot read; /health repeats it
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       # argus-iris GPU broker: set the URL (and its token) and the engine registers gpu-tenant.yaml at startup.
@@ -94,6 +105,11 @@ services:
     image: ghcr.io/smk762/argus-echo-xtts:${ECHO_TAG:-local}
     container_name: argus-echo-xtts
     restart: unless-stopped
+    labels:
+      argus.peer: xtts
+      argus.service: argus-echo
+      argus.health: /health
+      argus.port: "8031"
     ports:
       - "${ECHO_BIND:-127.0.0.1}:${XTTS_PORT:-8141}:8031"
     environment:
@@ -108,6 +124,7 @@ services:
       XTTS_OOM_RETRY_AFTER_S: ${XTTS_OOM_RETRY_AFTER_S:-30}
       # Fine-tuned checkpoints POST /admin/load reads (docs/xtts.md#fine-tuned-checkpoints), mounted read-only.
       XTTS_CHECKPOINT_ROOT: /checkpoints
+      ARGUS_PEER: xtts  # the argus.peer label above, which a process cannot read; /health repeats it
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       # argus-iris GPU broker: set the URL (and its token) and the engine registers gpu-tenant.yaml at startup.
@@ -131,6 +148,11 @@ services:
     image: ghcr.io/smk762/argus-echo-qwen:${QWEN_TAG:-${ECHO_TAG:-local}}
     container_name: argus-echo-qwen
     restart: unless-stopped
+    labels:
+      argus.peer: tts
+      argus.service: argus-echo
+      argus.health: /health
+      argus.port: "8031"
     ports:
       - "${ECHO_BIND:-127.0.0.1}:${QWEN_PORT:-8142}:8031"
     environment:
@@ -147,6 +169,7 @@ services:
       # Fine-tuned checkpoints POST /admin/load reads (docs/qwen.md#fine-tuned-checkpoints), mounted read-only
       # from QWEN_CHECKPOINT_ROOT.
       TTS_CHECKPOINT_ROOT: /checkpoints
+      ARGUS_PEER: tts  # the argus.peer label above, which a process cannot read; /health repeats it
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       # argus-iris GPU broker: set the URL (and its token) and the engine registers gpu-tenant.yaml at startup.
@@ -169,6 +192,11 @@ services:
     image: ghcr.io/smk762/argus-echo-whisper:${ECHO_TAG:-local}
     container_name: argus-echo-whisper
     restart: unless-stopped
+    labels:
+      argus.peer: whisper
+      argus.service: argus-echo
+      argus.health: /health
+      argus.port: "8031"
     ports:
       - "${ECHO_BIND:-127.0.0.1}:${WHISPER_PORT:-8144}:8031"
     environment:
@@ -188,6 +216,7 @@ services:
       STT_DOWNLOAD_TIMEOUT: ${WHISPER_DOWNLOAD_TIMEOUT:-30}
       STT_INPUT_FORMATS: ${WHISPER_INPUT_FORMATS:-wav,w64,mp3,ogg,flac,webm,matroska,mp4,m4a,aac,aiff,caf,amr,au}
       STT_DECODE_TIMEOUT: ${WHISPER_DECODE_TIMEOUT:-120}
+      ARGUS_PEER: whisper  # the argus.peer label above, which a process cannot read; /health repeats it
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
       # argus-iris GPU broker: set the URL (and its token) and the engine registers gpu-tenant.yaml at startup.
@@ -202,7 +231,9 @@ services:
     <<: *gpu
 
   # Wyoming TTS bridges (CPU). Each forwards to one engine's /synthesise/stream; point
-  # *_ENGINE_URL elsewhere to bridge an engine on another host.
+  # *_ENGINE_URL elsewhere to bridge an engine on another host. Unset, the engine's suite-wide URL is used when
+  # this shell or .env sets it (ARGUS_XTTS_URL, ARGUS_MISO_URL, ARGUS_TTS_URL for Qwen, ARGUS_WHISPER_URL), else the
+  # engine in this compose project. The bridges serve Wyoming, not HTTP, so they carry no argus.peer label.
   wyoming-xtts:
     profiles: [wyoming-xtts]
     build:
@@ -213,7 +244,7 @@ services:
     ports:
       - "${ECHO_BIND:-127.0.0.1}:${WYOMING_XTTS_PORT:-10240}:10200"
     environment:
-      TTS_URL: ${WYOMING_XTTS_ENGINE_URL:-http://xtts:8031}
+      TTS_URL: ${WYOMING_XTTS_ENGINE_URL:-${ARGUS_XTTS_URL:-http://xtts:8031}}
 
   wyoming-miso:
     profiles: [wyoming-miso]
@@ -225,7 +256,7 @@ services:
     ports:
       - "${ECHO_BIND:-127.0.0.1}:${WYOMING_MISO_PORT:-10241}:10200"
     environment:
-      TTS_URL: ${WYOMING_MISO_ENGINE_URL:-http://miso:8031}
+      TTS_URL: ${WYOMING_MISO_ENGINE_URL:-${ARGUS_MISO_URL:-http://miso:8031}}
       WYOMING_TTS_PROGRAM_NAME: miso
       WYOMING_TTS_PROGRAM_DESC: Miso TTS 8B (voice cloning)
       WYOMING_TTS_ATTRIBUTION_NAME: Miso Labs
@@ -246,7 +277,7 @@ services:
     ports:
       - "${ECHO_BIND:-127.0.0.1}:${WYOMING_QWEN_PORT:-10242}:10200"
     environment:
-      TTS_URL: ${WYOMING_QWEN_ENGINE_URL:-http://qwen:8031}
+      TTS_URL: ${WYOMING_QWEN_ENGINE_URL:-${ARGUS_TTS_URL:-http://qwen:8031}}
       XTTS_DEFAULT_SPEAKER: ${WYOMING_QWEN_SPEAKER:-ryan}
       WYOMING_TTS_PROGRAM_NAME: qwen
       WYOMING_TTS_PROGRAM_DESC: Qwen3-TTS (built-in speakers)
@@ -268,7 +299,7 @@ services:
     ports:
       - "${ECHO_BIND:-127.0.0.1}:${WYOMING_WHISPER_PORT:-10243}:10300"
     environment:
-      STT_URL: ${WYOMING_WHISPER_ENGINE_URL:-http://whisper:8031}
+      STT_URL: ${WYOMING_WHISPER_ENGINE_URL:-${ARGUS_WHISPER_URL:-http://whisper:8031}}
       # Blank: the language Home Assistant sends, else detect.
       WYOMING_ASR_LANGUAGE: ${WYOMING_WHISPER_LANGUAGE:-}
       WYOMING_ASR_TIMEOUT: ${WYOMING_WHISPER_TIMEOUT:-120}

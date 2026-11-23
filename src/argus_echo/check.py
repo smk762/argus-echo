@@ -15,6 +15,7 @@ from pathlib import Path
 
 import httpx
 from argus_cortex.gpu_wire import ResidentHealth
+from argus_cortex.service import ServiceHealth
 from pydantic import ValidationError
 
 from argus_echo.contract import (
@@ -108,6 +109,7 @@ def check(
                     f"engine={engine} model={extra.get('model')} model_state={health.model_state} busy={health.busy} "
                     f"capabilities={','.join(capabilities)}",
                 )
+                _check_service(report, extra)
                 _check_identity(report, extra)
 
         if "tts" in capabilities:
@@ -119,6 +121,25 @@ def check(
             else:
                 report.add(f"POST {TRANSCRIBE_PATH}", True, "skipped: transcribing loads the model (--transcribe)")
     return report
+
+
+def _check_service(report: Report, health: dict) -> None:
+    """Report who the engine says it is when ``/health`` is also argus-cortex's ``ServiceHealth`` (engines since
+    argus-cortex 0.16; it carries ``service_version``). An older engine sends none of it and is not failed for that."""
+    if "service_version" not in health:
+        return
+    try:
+        service = ServiceHealth.model_validate(health)
+    except ValidationError as exc:
+        error = exc.errors()[0]
+        where = ".".join(str(part) for part in error["loc"]) or "body"
+        report.add("service", False, f"not argus-cortex ServiceHealth: {where}: {error['msg']}")
+        return
+    failed = sorted(name for name, result in service.checks.items() if not result.ok and result.required)
+    detail = f"{service.service} {service.version} status={service.status} peer={service.peer or 'unset'}"
+    if failed:
+        detail += f"; failed checks: {', '.join(failed)}"
+    report.add("service", True, detail)
 
 
 def _check_identity(report: Report, health: dict) -> None:

@@ -96,12 +96,19 @@ import structlog
 from argus_cortex.auth import bearer
 from argus_cortex.gpu import aregistered, coordinator_from_env
 from argus_cortex.fs import PathRefused, safe_join
+from argus_cortex.service import DependencyCheck, install_health
+from argus_cortex import settings as suite_settings
 from starlette.requests import HTTPConnection, Request
 from fastapi import Depends, FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = structlog.get_logger(__name__)
+
+# Values the suite's services share (HF_TOKEN, the S3 credentials, ARGUS_ADMIN_TOKEN) may live in argus-cortex's suite
+# file (/etc/argus/suite.env in a container). Copy the ones this process was not given into the environment before
+# anything below, or a library, reads it. What the environment already sets wins; no file, nothing happens.
+suite_settings.apply()
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -2469,14 +2476,10 @@ async def list_speakers():
 # ── GET /health ───────────────────────────────────────────────────────────────
 
 
-@app.get("/health")
-async def health():
-    if _mgr.state == TTSState.LOADING:
-        return JSONResponse(status_code=503, content={"status": "loading"})
-    body = {
-        "status": "ok",
+async def _health_fields() -> dict:
+    """XTTS's own ``/health`` fields, beside ServiceHealth's."""
+    return {
         "engine": "xtts-v2",
-        "capabilities": ["tts"],  # the echo contracts this engine serves (docs/api.md)
         "model": XTTS_MODEL,
         "device": DEVICE,
         "model_state": _mgr.state.value,
@@ -2488,12 +2491,57 @@ async def health():
         "weights": _mgr.weights,
         "image": await asyncio.to_thread(_image),
     }
+
+
+async def _health_unready() -> Optional[dict]:
+    """The body of a ``503`` from ``/health``, or None while the engine serves: ``{"status": "loading"}`` while the
+    model loads, and the engine's fields with ``"status": "gpu_error"`` after a fatal CUDA error (that fails the
+    container healthcheck, so the worker is recycled; argus-proof reads it as "needs a restart"). These are the
+    bodies XTTS has always sent, not ServiceHealth."""
+    if _mgr.state == TTSState.LOADING:
+        return {"status": "loading"}
     if _gpu_fault is not None:
-        # A fatal CUDA error: fail the container healthcheck so the worker is recycled.
-        body["status"] = "gpu_error"
-        body["error"] = _gpu_fault
-        return JSONResponse(status_code=503, content=body)
-    return body
+        return {"status": "gpu_error", "capabilities": ["tts"], **await _health_fields(), "error": _gpu_fault}
+    return None
+
+
+async def _model_check() -> DependencyCheck:
+    """A model that failed to load makes the engine ``degraded`` (still 200: the next request retries the load)."""
+    failed = _mgr.state == TTSState.ERROR
+    return DependencyCheck(ok=not failed, detail="error" if failed else None)
+
+
+class _UnreadyHealth:
+    """Answers ``GET /health`` with the engine's own ``503`` while it cannot serve (``_health_unready``); every
+    other request, and ``/health`` while it serves, goes on to the app. Pure ASGI, so streams are not buffered."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope["method"] == "GET" and scope["path"] == "/health":
+            body = await _health_unready()
+            if body is not None:
+                response = JSONResponse(body, status_code=503, headers={"Cache-Control": "no-store"})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# GET /health is argus-cortex's ServiceHealth (service, version, status, started_at, capabilities, checks, build,
+# peer) with ResidentHealth's fields and the engine's own beside it. No readiness=: the 503s stay the ones above,
+# which argus-proof and the container healthcheck read. The check only reads state, so it is not cached.
+app.add_middleware(_UnreadyHealth)
+install_health(
+    app,
+    service="argus-echo",
+    version=ECHO_VERSION,
+    build=ECHO_REVISION,
+    capabilities=["tts"],  # the echo contracts this engine serves (docs/api.md)
+    checks={"model": _model_check},
+    extra=_health_fields,
+    check_ttl_s=0,
+)
 
 
 # ── Resident contract (argus-iris argus-http adapter) ─────────────────────────

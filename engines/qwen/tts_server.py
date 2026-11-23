@@ -77,12 +77,19 @@ from argus_cortex.auth import bearer
 from argus_cortex.gpu import aregistered, coordinator_from_env
 from argus_cortex.fs import PathRefused, safe_join
 from argus_cortex.limits import BadInput, TooLarge, read_upload
+from argus_cortex.service import DependencyCheck, install_health
+from argus_cortex import settings as suite_settings
 from starlette.requests import ClientDisconnect, HTTPConnection
 from fastapi import Depends, FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = structlog.get_logger(__name__)
+
+# Values the suite's services share (HF_TOKEN, the S3 credentials, ARGUS_ADMIN_TOKEN) may live in argus-cortex's suite
+# file (/etc/argus/suite.env in a container). Copy the ones this process was not given into the environment before
+# anything below, or a library, reads it. What the environment already sets wins; no file, nothing happens.
+suite_settings.apply()
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -2486,15 +2493,10 @@ async def list_speakers():
 # ── GET /health ───────────────────────────────────────────────────────────────
 
 
-@app.get("/health")
-async def health():
-    if _mgr.state == TTSState.LOADING:
-        return JSONResponse(status_code=503, content={"status": "loading"})
-    gpu_info = _resident_gpu()
+async def _health_fields() -> dict:
+    """Qwen's own ``/health`` fields, beside ServiceHealth's."""
     return {
-        "status": "ok",
         "engine": _ENGINE,
-        "capabilities": ["tts"],  # the echo contracts this engine serves (docs/api.md)
         "model": MODEL_SIZE,
         "model_size": MODEL_SIZE,
         "device": DEVICE,
@@ -2505,10 +2507,55 @@ async def health():
         "idle_s": _idle_s(),
         "keep_alive_gpu": KEEP_ALIVE_GPU,
         "keep_alive_cpu": KEEP_ALIVE_CPU,
-        "gpu": gpu_info,
+        "gpu": _resident_gpu(),
         "weights": _mgr.weights,
         "image": await asyncio.to_thread(_image),
     }
+
+
+async def _health_unready() -> Optional[dict]:
+    """The body of a ``503`` from ``/health``, or None while the engine serves: ``{"status": "loading"}`` while the
+    models load, the body Qwen has always sent then (not ServiceHealth)."""
+    return {"status": "loading"} if _mgr.state == TTSState.LOADING else None
+
+
+async def _model_check() -> DependencyCheck:
+    """A model that failed to load makes the engine ``degraded`` (still 200: the next request retries the load)."""
+    failed = _mgr.state == TTSState.ERROR
+    return DependencyCheck(ok=not failed, detail="error" if failed else None)
+
+
+class _UnreadyHealth:
+    """Answers ``GET /health`` with the engine's own ``503`` while it cannot serve (``_health_unready``); every
+    other request, and ``/health`` while it serves, goes on to the app. Pure ASGI, so streams are not buffered."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http" and scope["method"] == "GET" and scope["path"] == "/health":
+            body = await _health_unready()
+            if body is not None:
+                response = JSONResponse(body, status_code=503, headers={"Cache-Control": "no-store"})
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# GET /health is argus-cortex's ServiceHealth (service, version, status, started_at, capabilities, checks, build,
+# peer) with ResidentHealth's fields and the engine's own beside it. No readiness=: the 503s stay the ones above,
+# which the container healthcheck reads. The check only reads state, so it is not cached.
+app.add_middleware(_UnreadyHealth)
+install_health(
+    app,
+    service="argus-echo",
+    version=ECHO_VERSION,
+    build=ECHO_REVISION,
+    capabilities=["tts"],  # the echo contracts this engine serves (docs/api.md)
+    checks={"model": _model_check},
+    extra=_health_fields,
+    check_ttl_s=0,
+)
 
 
 # ── Resident contract (argus-iris argus-http adapter) ─────────────────────────

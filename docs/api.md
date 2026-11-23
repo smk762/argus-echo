@@ -198,9 +198,31 @@ itself; see [qwen.md](qwen.md#clones). See
 `loading`, `cpu`, `gpu`, `error`), `busy`, `idle_s`, and a `gpu` memory block, plus `engine`, `model`,
 `device` and `capabilities`. `engine` is exactly one of `miso`, `xtts-v2`, `qwen-tts` or `whisper`, and clients
 may key on it. `capabilities` lists the contracts the engine serves (`["tts"]` or `["stt"]`; `argus-echo check`
-runs only those suites, and treats an engine that names none as `tts`). It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
+runs only those suites, and treats an engine that names none as `tts`).
+
+The same `200` body is argus-cortex's `ServiceHealth`, the shape every Argus service answers `/health` with:
+
+| Field | Value |
+| --- | --- |
+| `service_version` | The health contract's version (`1.1`) |
+| `service` | `argus-echo`, on every engine; `engine` says which one |
+| `version` | The echo release the image was built from (`image.version`), or `0.0.0+unknown` for a local build |
+| `build` | The git commit (`image.revision`), or `null` |
+| `status` | `ok`, or `degraded` when a required check failed. Both are `200` |
+| `checks` | `{"model": {"ok", "detail", "latency_ms", "required"}}`: `ok` is false while `model_state` is `error` (the last load failed; the next request tries again) |
+| `started_at` | When the process started (UTC) |
+| `peer` | The container's `argus.peer` label (`miso`, `xtts`, `tts` for Qwen, `whisper`), which compose passes as `ARGUS_PEER`; `null` when it was not told |
+| `capabilities` | As above |
+| `wire`, `read_only` | `{}` and `false`: echo's contracts carry no version number, and no engine has a read-only mode |
+
+`GET /health?checks=0` skips the check. The route is not listed in the engine's `/openapi.json`.
+
+It answers `503 {"status": "loading"}` while a model loads. XTTS also answers `503` with
 `"status": "gpu_error"` after a CUDA error that is not an out-of-memory: such an error breaks the process's GPU
 context, so the worker needs a restart. (An out-of-memory is a `503 GPU OOM` on the request and can be retried.)
+Miso answers `503` with `"status": "stuck"` ([miso-api.md](miso-api.md#get-health)). These `503` bodies are the
+engines' own, not `ServiceHealth` (whose `status` is only `ok`, `degraded` or `starting`): the ones with fields
+keep every field above except the `ServiceHealth` ones.
 
 Two blocks identify what is running, so a client (argus-proof's run manifest) can pin it:
 
@@ -344,7 +366,7 @@ client (Home Assistant) reaches it through the `wyoming-whisper` bridge, which p
 | POST | `/transcribe` | One clip in, one transcript out |
 | POST | `/transcriptions` | agent-composer's JSON route: a URL or base64 clip in, composer's transcript shape out |
 | WS | `/transcribe/stream` | Live PCM in, partial and final transcripts out |
-| GET | `/health` | `ResidentHealth` plus `engine`, `model`, `revision`, `device`, `capabilities`, `streams` |
+| GET | `/health` | `ResidentHealth` and `ServiceHealth`, plus `engine`, `model`, `revision` (the model's), `device`, `streams` |
 | POST | `/admin/{evict,unload,wake}` | As above; evict moves the weights to host RAM |
 
 ### `POST /transcribe`

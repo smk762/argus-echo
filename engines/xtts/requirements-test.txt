@@ -1,7 +1,7 @@
 # What the server and its tests need. The tests stub torch and the model, so neither is
 # listed. CI (engines.yml) and ai-code-auditor's validate_patch install this file; the
 # Dockerfile installs the runtime packages itself.
-argus-cortex[server,remote,yaml]>=0.15,<0.16
+argus-cortex[server,remote,yaml]>=0.16.1,<0.17
 fastapi
 httpx
 structlog

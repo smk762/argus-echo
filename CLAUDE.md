@@ -29,13 +29,14 @@ it **UNENFORCED** until something checks it. When a rule bites, add a check rath
 | A new suite-rule violation (argus-ci's lint catalogue) | CI `suite-rules` job; `.suite-rules-baseline.json` may only shrink |
 | A CLAUDE.md without the argus-suite block | CI `suite` job (argus-ci suite-check) |
 | An engine's `/admin/*` open while `ARGUS_ADMIN_TOKEN` is unset, unless `ARGUS_ADMIN_INSECURE=1` | `engines/miso/test_admin_uploads.py`; xtts/qwen admin tests (CI `engines`) |
-| A `/health` that isn't argus-cortex `ResidentHealth`, or that doesn't name the engine's capabilities | each engine's `test_health` (`engines/miso/test_health.py`, `engines/{xtts,qwen}/tests/test_health.py`, `engines/whisper/tests/test_stt_server.py`; CI `engines`); `argus-echo check` against a running engine |
+| A `/health` that isn't argus-cortex `ResidentHealth` and `ServiceHealth`, that doesn't name the engine's capabilities, that drops a field it had, or whose `503` bodies change (`loading`, Miso's `stuck`, XTTS's `gpu_error`, which argus-proof reads) | each engine's `test_health` (`engines/miso/test_health.py`, `engines/{xtts,qwen}/tests/test_health.py`, `engines/whisper/tests/test_stt_server.py`; CI `engines`); `argus-echo check` against a running engine |
 | Two engines sharing an S3 bucket (clone keys collide, formats differ) | `tests/test_repo_rules.py::test_no_two_engines_share_an_s3_bucket` (distinct `S3_BUCKET_NAME` defaults and variables in `compose.yaml`) |
 | An engine importing `argus_echo` (their environments conflict) | `tests/test_repo_rules.py::test_no_engine_imports_argus_echo` |
 | `check` sending TTS requests to an engine that advertises only `stt` | `tests/test_stt.py::test_an_stt_engine_gets_no_tts_checks_and_a_read_only_check_loads_nothing` |
 | An STT upload decoded before its byte, format and duration caps (it goes through `argus_cortex.limits.open_audio`) | `engines/whisper/tests/test_stt_server.py` (`test_upload_over_the_cap_is_413_and_never_loads`, `test_not_wav_or_flac_is_400`, `test_audio_over_the_duration_cap_is_413`) |
 | An STT stream holding the model lease while it waits for audio | **UNENFORCED** (by design in `_stream`; needs a test that an idle open stream lets keep-alive evict) |
 | `gpu-tenant.yaml` that iris would refuse | CI `engines` / `gpu-tenant` job |
+| An engine container without the `argus.peer` labels (`miso`, `xtts`, `tts` for Qwen, `whisper`), a labelled Wyoming bridge, or the suite file mounted in `compose.yaml` itself | `tests/test_repo_rules.py` (`test_every_engine_container_carries_the_discovery_labels`, `test_a_wyoming_bridge_is_not_labelled_as_a_peer`, `test_the_suite_file_mount_is_opt_in`) |
 | A GPU engine that doesn't register `gpu-tenant.yaml` with iris when `ARGUS_GPU_BROKER_URL` is set, or that registers (or waits on a broker) when it isn't | each engine's `test_broker_registration` (CI `engines`) |
 | A demote to the CPU that leaves model weights or allocator cache on the GPU (qwen-tts's speech tokenizer, cuBLAS's workspace) | `engines/qwen/tests/test_gpu_residue.py`, `engines/xtts/tests/test_gpu_residue.py` (fakes; the real-GPU figures are in #22's PR) |
 | An XTTS, Qwen or Miso image install that resolves a package version at build time (every pip/uv install takes `-c` an exact-pin file: `constraints.txt`, Miso's `server-constraints.txt` beside `uv.lock`) | `tests/test_repo_rules.py::test_every_image_install_is_pinned_to_exact_versions` |
@@ -69,6 +70,7 @@ Run one test: `uv run --no-sync pytest tests/test_x.py::test_name -q`.
 - **`src/` layout, `py.typed`, Pydantic v2, `structlog`.** Ruff line-length 120; keep it clean (`make lint`) before committing.
 - **A change to a contract changes every engine of that capability.** Edit each engine that advertises it and `contract/<capability>.py` together, and say in docs/api.md which engines differ. A new engine adds its capabilities to `/health` and a `test_health` that validates them.
 - **`GET /speakers` loads the model on XTTS and Qwen** (it takes a model lease). Nothing read-only may call it on an unloaded engine; `check` skips it.
+- **Each engine calls `argus_cortex.settings.apply()` at import**, before it reads its configuration, so shared values may come from the suite file. Engine tests turn the file off in `conftest.py` (`ARGUS_ENV_FILE=off`).
 - **Engines keep their own environment variable prefixes** (`MISO_*`, `XTTS_*`, `TTS_*` for Qwen); compose maps `QWEN_*` onto Qwen's `TTS_*`.
 - The engines are linted for errors only (ruff E9/F63/F7/F82); `engines/` is excluded from the package's ruff config until they are cleaned up.
 
