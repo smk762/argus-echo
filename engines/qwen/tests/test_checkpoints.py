@@ -25,6 +25,7 @@ if "torch" not in sys.modules:
     sys.modules["torch"] = _torch
 
 import numpy as np  # noqa: E402
+from argus_cortex.hashing import sha256_hex  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 import tts_server  # noqa: E402
@@ -32,10 +33,6 @@ from tts_server import TTSModelManager, TTSState  # noqa: E402
 
 TOKEN = "s3cret"
 AUTH = {"Authorization": f"Bearer {TOKEN}"}
-
-
-def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
 
 
 def _write_model(path: Path, *, tts_model_type="custom_voice", weights=b"weights", model_type="qwen3_tts") -> Path:
@@ -186,9 +183,9 @@ class AdminLoadTests(CheckpointTestCase):
         weights = body["weights"]
         self.assertEqual(weights["checkpoint"], "forge/run-7")
         files = {f["name"]: f["sha256"] for f in weights["files"]}
-        self.assertEqual(files["custom_voice/model.safetensors"], _sha(b"fine-tuned"))
-        self.assertEqual(files["custom_voice/speech_tokenizer/model.safetensors"], _sha(b"codec"))
-        self.assertEqual(files["base/model.safetensors"], _sha(b"stock base"))  # the other slot is pinned too
+        self.assertEqual(files["custom_voice/model.safetensors"], sha256_hex(b"fine-tuned"))
+        self.assertEqual(files["custom_voice/speech_tokenizer/model.safetensors"], sha256_hex(b"codec"))
+        self.assertEqual(files["base/model.safetensors"], sha256_hex(b"stock base"))  # the other slot is pinned too
         self.assertEqual(len(files), 12)  # 6 files a slot; dotfiles skipped
         health = self.client.get("/health").json()
         self.assertEqual(health["weights"], weights)
@@ -200,7 +197,7 @@ class AdminLoadTests(CheckpointTestCase):
         self.lease_once()
         self.assertEqual(self.loads, list(self.stock))  # the next load is stock
         files = {f["name"]: f["sha256"] for f in self.mgr.weights["files"]}
-        self.assertEqual(files["custom_voice/model.safetensors"], _sha(b"stock cv"))
+        self.assertEqual(files["custom_voice/model.safetensors"], sha256_hex(b"stock cv"))
 
     def test_a_base_checkpoint_loads_even_when_only_custom_voice_is_configured(self):
         ckpt = _write_model(self.root / "clone-ft", tts_model_type="base")

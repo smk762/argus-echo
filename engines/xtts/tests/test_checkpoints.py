@@ -15,6 +15,7 @@ import types
 import numpy as np
 import pytest
 import xtts_server as xs
+from argus_cortex.hashing import sha256_hex
 from fastapi.testclient import TestClient
 
 TOKEN = "s3cret"
@@ -131,10 +132,6 @@ def client(monkeypatch, mgr):
     return TestClient(xs.app, raise_server_exceptions=False)
 
 
-def _sha(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 # ── the admin route ──────────────────────────────────────────────────────────
 
 
@@ -197,9 +194,9 @@ def test_load_reports_the_checkpoint_and_its_hashes_then_unload_returns_to_stock
     weights = r.json()["weights"]
     assert weights["checkpoint"] == "forge/run-7"
     assert weights["files"] == [
-        {"name": "config.json", "sha256": _sha(b'{"model": "xtts"}'), "bytes": 17},
-        {"name": "model.pth", "sha256": _sha(b"fine-tuned"), "bytes": 10},
-        {"name": "vocab.json", "sha256": _sha(b"{}"), "bytes": 2},
+        {"name": "config.json", "sha256": sha256_hex(b'{"model": "xtts"}'), "bytes": 17},
+        {"name": "model.pth", "sha256": sha256_hex(b"fine-tuned"), "bytes": 10},
+        {"name": "vocab.json", "sha256": sha256_hex(b"{}"), "bytes": 2},
     ]
     health = client.get("/health").json()
     assert health["weights"] == weights and health["model_state"] == "cpu"
@@ -215,8 +212,8 @@ def test_load_reports_the_checkpoint_and_its_hashes_then_unload_returns_to_stock
     asyncio.run(next_request())
     assert _FakeXtts.loads[-1] == str(coqui.stock)  # the next load is stock
     files = {f["name"]: f["sha256"] for f in mgr.weights["files"]}
-    assert files["model.pth"] == _sha(b"stock weights")
-    assert files["speakers_xtts.pth"] == _sha(b"speakers")
+    assert files["model.pth"] == sha256_hex(b"stock weights")
+    assert files["speakers_xtts.pth"] == sha256_hex(b"speakers")
     assert mgr.weights["checkpoint"] is None
 
 
