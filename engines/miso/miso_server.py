@@ -130,6 +130,7 @@ from typing import Optional
 
 import structlog
 from argus_cortex.auth import bearer
+from argus_cortex.resident import admin_evict, admin_wake
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import HTTPConnection
 from argus_cortex.limits import BadInput, TooLarge, read_upload
@@ -2840,9 +2841,9 @@ async def _require_admin(conn: HTTPConnection) -> None:
 
 
 @app.post("/admin/evict", dependencies=[Depends(_require_admin)])
-async def admin_evict():
-    await _mgr.demote_to_cpu()
-    return {"status": "evicted", "model_state": _mgr.state.value}
+async def post_admin_evict():
+    # The manager swallows a failed demote and records the resulting state.
+    return await admin_evict(_mgr)
 
 
 @app.post("/admin/unload", dependencies=[Depends(_require_admin)])
@@ -2852,12 +2853,8 @@ async def admin_unload():
 
 
 @app.post("/admin/wake", dependencies=[Depends(_require_admin)])
-async def admin_wake():
-    try:
-        await _mgr.ensure_ready()
-    except Exception as exc:
-        return _load_failed_response(exc)
-    return {"status": "ready", "model_state": _mgr.state.value}
+async def post_admin_wake():
+    return await admin_wake(_mgr, _load_failed_response)
 
 
 if __name__ == "__main__":
