@@ -68,6 +68,9 @@ services:
       MISO_STT_TIMEOUT_S: ${MISO_STT_TIMEOUT_S:-60}
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
+      # argus-iris GPU broker: set the URL (and its token) and the engine registers gpu-tenant.yaml at startup.
+      ARGUS_GPU_BROKER_URL: ${ARGUS_GPU_BROKER_URL:-}
+      ARGUS_GPU_BROKER_TOKEN: ${ARGUS_GPU_BROKER_TOKEN:-}
       # Mimi's streaming decoder under CUDA graphs cuts every streamed utterance short.
       NO_CUDA_GRAPH: ${MISO_NO_CUDA_GRAPH:-1}
       NO_TORCH_COMPILE: "1"
@@ -78,6 +81,7 @@ services:
       # at an existing cache to reuse it.
       - ${HF_HOME:-./cache/huggingface}:/hf-cache
       - ${MISO_DATA_DIR:-./data/miso}:/data
+      - ${ECHO_GPU_TENANT:-./gpu-tenant.yaml}:/app/gpu-tenant.yaml:ro
     healthcheck:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5).read()"]
@@ -106,9 +110,13 @@ services:
       XTTS_CHECKPOINT_ROOT: /checkpoints
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
+      # argus-iris GPU broker: set the URL (and its token) and the engine registers gpu-tenant.yaml at startup.
+      ARGUS_GPU_BROKER_URL: ${ARGUS_GPU_BROKER_URL:-}
+      ARGUS_GPU_BROKER_TOKEN: ${ARGUS_GPU_BROKER_TOKEN:-}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
     volumes:
       - ${XTTS_CHECKPOINT_ROOT:-./checkpoints/xtts}:/checkpoints:ro
+      - ${ECHO_GPU_TENANT:-./gpu-tenant.yaml}:/app/gpu-tenant.yaml:ro
     healthcheck:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5).read()"]
@@ -141,9 +149,13 @@ services:
       TTS_CHECKPOINT_ROOT: /checkpoints
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
+      # argus-iris GPU broker: set the URL (and its token) and the engine registers gpu-tenant.yaml at startup.
+      ARGUS_GPU_BROKER_URL: ${ARGUS_GPU_BROKER_URL:-}
+      ARGUS_GPU_BROKER_TOKEN: ${ARGUS_GPU_BROKER_TOKEN:-}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
     volumes:
       - ${QWEN_CHECKPOINT_ROOT:-./checkpoints/qwen}:/checkpoints:ro
+      - ${ECHO_GPU_TENANT:-./gpu-tenant.yaml}:/app/gpu-tenant.yaml:ro
     healthcheck:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5).read()"]
@@ -178,7 +190,12 @@ services:
       STT_DECODE_TIMEOUT: ${WHISPER_DECODE_TIMEOUT:-120}
       ARGUS_ADMIN_TOKEN: ${ARGUS_ADMIN_TOKEN:-}
       ARGUS_ADMIN_INSECURE: ${ARGUS_ADMIN_INSECURE:-}
+      # argus-iris GPU broker: set the URL (and its token) and the engine registers gpu-tenant.yaml at startup.
+      ARGUS_GPU_BROKER_URL: ${ARGUS_GPU_BROKER_URL:-}
+      ARGUS_GPU_BROKER_TOKEN: ${ARGUS_GPU_BROKER_TOKEN:-}
       NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    volumes:
+      - ${ECHO_GPU_TENANT:-./gpu-tenant.yaml}:/app/gpu-tenant.yaml:ro
     healthcheck:
       <<: *health
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8031/health', timeout=5).read()"]

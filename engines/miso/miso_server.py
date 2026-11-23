@@ -130,6 +130,7 @@ from typing import Optional
 
 import structlog
 from argus_cortex.auth import bearer
+from argus_cortex.gpu import aregistered, coordinator_from_env
 from argus_cortex.resident import admin_evict, admin_wake
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import HTTPConnection
@@ -1587,15 +1588,18 @@ async def _stuck_watchdog() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if PRELOAD:
-        try:
-            await _mgr.ensure_ready()
-        except Exception:
-            logger.warning("preload_failed", hint="the first request retries the load; /health shows the error", exc_info=True)
-    watchdog = asyncio.create_task(_stuck_watchdog())
-    yield
-    watchdog.cancel()
-    await _mgr.unload()
+    # Registers gpu-tenant.yaml with argus-iris when ARGUS_GPU_BROKER_URL is set (a no-op otherwise), renews it, and
+    # signs off on the way out. It never blocks startup or fails on the broker's account.
+    async with aregistered(coordinator_from_env()):
+        if PRELOAD:
+            try:
+                await _mgr.ensure_ready()
+            except Exception:
+                logger.warning("preload_failed", hint="the first request retries the load; /health shows the error", exc_info=True)
+        watchdog = asyncio.create_task(_stuck_watchdog())
+        yield
+        watchdog.cancel()
+        await _mgr.unload()
 
 
 app = FastAPI(title="Voice Stack — Miso TTS 8B", version="1.0.0", lifespan=lifespan)

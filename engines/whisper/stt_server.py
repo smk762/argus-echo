@@ -79,6 +79,7 @@ from typing import Any, Callable, Optional, Protocol
 import numpy as np
 import structlog
 from argus_cortex.auth import bearer
+from argus_cortex.gpu import aregistered, coordinator_from_env
 from argus_cortex.limits import (
     DEFAULT_SAMPLE_RATES,
     BadInput,
@@ -470,10 +471,13 @@ async def run_transcription(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if PRELOAD:
-        await mgr.ensure_loaded()
-    yield
-    await mgr.unload(force=True)
+    # Registers gpu-tenant.yaml with argus-iris when ARGUS_GPU_BROKER_URL is set (a no-op otherwise), renews it, and
+    # signs off on the way out. It never blocks startup or fails on the broker's account.
+    async with aregistered(coordinator_from_env()):
+        if PRELOAD:
+            await mgr.ensure_loaded()
+        yield
+        await mgr.unload(force=True)
 
 
 app = FastAPI(title="argus-echo — Whisper STT", version="1.0.0", lifespan=lifespan)

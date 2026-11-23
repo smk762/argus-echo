@@ -120,15 +120,26 @@ wheels = [
 
 [[package]]
 name = "argus-cortex"
-version = "0.14.1.dev5+g0a5306bf2"
-source = { git = "https://github.com/smk762/argus-cortex.git?rev=0a5306bf2c3ebd49bb269cc6e7c08044e5d6502b#0a5306bf2c3ebd49bb269cc6e7c08044e5d6502b" }
+version = "0.15.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "pydantic" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/6c/19/f57acd7c54ab5045c80c1a843c26fbcd7482e2446045a075bfbd49bd743e/argus_cortex-0.15.0.tar.gz", hash = "sha256:2af68111d82dcafc8bb7d92870424106a7462921dc6e6e8b81d6249f47d40ba3", size = 354554, upload-time = "2026-11-23T09:02:16.213Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/27/5b/2079bb088aa9c13e87e94fb462852fe83c1e229cdd7e0746beaa1fcb98d7/argus_cortex-0.15.0-py3-none-any.whl", hash = "sha256:ec23662383bcb6440263c04b5df4b23cf4ea260990a3839627a695e7acf03326", size = 137948, upload-time = "2026-11-23T09:02:14.654Z" },
+]
 
 [package.optional-dependencies]
+remote = [
+    { name = "certifi" },
+    { name = "httpx" },
+]
 server = [
     { name = "starlette" },
+]
+yaml = [
+    { name = "pyyaml" },
 ]
 
 [[package]]
@@ -730,7 +741,7 @@ name = "miso-tts"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "argus-cortex", extra = ["server"] },
+    { name = "argus-cortex", extra = ["remote", "server", "yaml"] },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'" },
     { name = "httpx" },
     { name = "huggingface-hub" },
@@ -748,7 +759,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "argus-cortex", extras = ["server"], git = "https://github.com/smk762/argus-cortex.git?rev=0a5306bf2c3ebd49bb269cc6e7c08044e5d6502b" },
+    { name = "argus-cortex", extras = ["server", "remote", "yaml"], specifier = ">=0.15,<0.16" },
     { name = "bitsandbytes", marker = "sys_platform == 'linux'", specifier = "==0.49.2" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "huggingface-hub", specifier = ">=0.34,<1.0" },

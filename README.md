@@ -38,6 +38,13 @@ docker compose --profile miso up -d --build                  # 24 GB card
 docker compose --profile xtts --profile qwen up -d --build   # 8 GB card
 ```
 
+To share the GPU through [argus-iris](https://github.com/smk762/argus-iris), set `ARGUS_GPU_BROKER_URL` (and
+`ARGUS_GPU_BROKER_TOKEN` if the broker has one) next to `ARGUS_ADMIN_TOKEN` in `.env`. That is all: each engine
+registers [gpu-tenant.yaml](gpu-tenant.yaml) at startup, and iris places each resident on the node whose agent
+reports its container, calling its `/admin/*` routes with the admin token the engine sent. Every engine registered
+with one broker must share one `ARGUS_ADMIN_TOKEN`. Unset, nothing registers; a broker that is down never stops an
+engine starting.
+
 Ports: Miso `8140`, XTTS `8141`, Qwen `8142`, Whisper `8144`; Wyoming bridges `10240` (XTTS), `10241` (Miso),
 `10242` (Qwen) and `10243` (Whisper), see [Home Assistant](docs/voice-cloning.md#home-assistant). They are published on
 `ECHO_BIND`, which defaults to `127.0.0.1`; set it to `0.0.0.0` or a LAN address to serve other machines. Miso downloads its ~33 GB checkpoint into `HF_HOME` on first use; the XTTS and Qwen images bake their
@@ -105,9 +112,7 @@ Each engine's tests run in its own environment, with the models stubbed (no GPU 
 [.github/workflows/engines.yml](.github/workflows/engines.yml), for example:
 
 ```sh
-cd engines/xtts && uv run --no-project --with "argus-cortex[server]>=0.8,<0.10" --with fastapi --with httpx \
-  --with structlog --with boto3 --with numpy --with soundfile --with python-multipart --with pytest \
-  python -m pytest -q tests
+cd engines/xtts && uv run --no-project --python 3.11 --with-requirements requirements-test.txt python -m pytest -q tests
 ```
 
 ## Licence

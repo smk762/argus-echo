@@ -3,9 +3,11 @@
 #
 # echo takes no leases: its engines are observed residents that iris unloads, evicts and
 # wakes through the argus-http adapter. No `node` and no `base_url`: each engine runs on
-# whichever host can hold it (Miso needs ~17 GB VRAM; XTTS, Qwen and Whisper fit in 8 GB), and the
-# deployment tells iris where, in iris's own `services` config. Container names match
-# compose.yaml.
+# whichever host can hold it (Miso needs ~17 GB VRAM; XTTS, Qwen and Whisper fit in 8 GB). Every
+# engine registers this file with iris at startup when ARGUS_GPU_BROKER_URL is set (compose mounts
+# it at /app/gpu-tenant.yaml), and iris places each resident on the node whose agent reports its
+# container, at that container's published port. Container names match compose.yaml; each
+# publishes one port, so no resident needs `port`.
 tenant_version: "1.0"
 tenant: argus-echo
 description: Speech servers (Miso TTS 8B, XTTS-v2, Qwen3-TTS; Whisper speech-to-text) behind one HTTP contract per capability.

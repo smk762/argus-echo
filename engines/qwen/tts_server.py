@@ -74,6 +74,7 @@ from urllib.parse import quote, urlsplit
 
 import structlog
 from argus_cortex.auth import bearer
+from argus_cortex.gpu import aregistered, coordinator_from_env
 from argus_cortex.fs import PathRefused, safe_join
 from argus_cortex.limits import BadInput, TooLarge, read_upload
 from starlette.requests import ClientDisconnect, HTTPConnection
@@ -1085,10 +1086,13 @@ def _get_supported_languages() -> list[str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _require_s3_credentials()  # fail at startup, not on the first upload
-    if PRELOAD:
-        await _mgr.ensure_gpu()
-    yield
-    await _mgr.unload()
+    # Registers gpu-tenant.yaml with argus-iris when ARGUS_GPU_BROKER_URL is set (a no-op otherwise), renews it, and
+    # signs off on the way out. It never blocks startup or fails on the broker's account.
+    async with aregistered(coordinator_from_env()):
+        if PRELOAD:
+            await _mgr.ensure_gpu()
+        yield
+        await _mgr.unload()
 
 
 app = FastAPI(title="Voice Stack — Qwen3-TTS", version="1.1.0", lifespan=lifespan)

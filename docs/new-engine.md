@@ -53,8 +53,12 @@ from whichever engine is nearest in kind. Each item names where whisper does it.
 ## Wiring
 
 - [ ] **`compose.yaml`**: a profile named after the engine, `ports: "${ECHO_BIND:-127.0.0.1}:${<ENGINE>_PORT:-81xx}:8031"`,
-      the env mapping, `ARGUS_ADMIN_TOKEN`/`ARGUS_ADMIN_INSECURE`, the shared `*health` healthcheck and `*gpu` blocks.
+      the env mapping, `ARGUS_ADMIN_TOKEN`/`ARGUS_ADMIN_INSECURE`, `ARGUS_GPU_BROKER_URL`/`ARGUS_GPU_BROKER_TOKEN`,
+      the `gpu-tenant.yaml` mount at `/app/gpu-tenant.yaml`, the shared `*health` healthcheck and `*gpu` blocks.
       Add it to `.env.example`.
+- [ ] **Broker registration**: the lifespan wraps its body in
+      `async with aregistered(coordinator_from_env()):` (`argus_cortex.gpu`, with cortex's `[remote,yaml]` extras),
+      and a `test_broker_registration` like whisper's.
 - [ ] **`gpu-tenant.yaml`**: a resident with the **measured** peak `vram_mb` (say how it was measured in a comment),
       `health_path`, `unload_path`, `evict_path`, `warm_path`, `admin_auth: true`.
 - [ ] **CI**: the engine in `.github/workflows/engines.yml`'s test matrix and the `compose` job's profile loop, and in

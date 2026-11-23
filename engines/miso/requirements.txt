@@ -10,5 +10,5 @@ torchtune==0.6.1
 torchao==0.14.1
 safetensors>=0.5.3
 silentcipher @ git+https://github.com/SesameAILabs/silentcipher@d46d7d0893a583d8968ab3a6626e2289faec9152
-argus-cortex[server] @ git+https://github.com/smk762/argus-cortex.git@0a5306bf2c3ebd49bb269cc6e7c08044e5d6502b
+argus-cortex[server,remote,yaml]>=0.15,<0.16
 httpx>=0.27

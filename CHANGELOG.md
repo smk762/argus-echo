@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Added
+- **Every engine registers with argus-iris on its own.** With `ARGUS_GPU_BROKER_URL` set (and `ARGUS_GPU_BROKER_TOKEN`
+  when the broker has one), Miso, XTTS, Qwen and Whisper register `gpu-tenant.yaml` (tenant `argus-echo`) at
+  startup through argus-cortex 0.15's `aregistered`, renew it every 5 minutes and sign off on shutdown; the
+  registration carries `ARGUS_ADMIN_TOKEN`, which iris uses for `/admin/*`. iris places each resident on the node
+  whose agent reports its container. Unset, nothing registers; a broker that is down never stops an engine
+  starting. compose mounts the manifest at `/app/gpu-tenant.yaml` (`ECHO_GPU_TENANT` points at a deployment's own
+  copy) and passes the two variables. No iris `services:` entry is needed any more.
+
+### Changed
+- argus-cortex `>=0.15,<0.16` for the package and every engine (with the `[remote,yaml]` extras in the engines);
+  the XTTS and Qwen images pin `argus-cortex==0.15.0`, and Miso moves from a git commit to the release.
+
 ### Documentation
 - XTTS-v2 is the suite's cloning engine (#51): README, docs/voice-cloning.md, docs/api.md and docs/xtts.md say to
   clone on XTTS, that fine-tunes go through argus-forge's XTTS-v2 path, and that its weights are non-commercial
