@@ -184,6 +184,85 @@ def test_clone_with_enough_speech_reaches_the_model(client, monkeypatch, tmp_pat
     assert len(reached_model) == 1
 
 
+class _Lease:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def _clone_reports(client, monkeypatch, tmp_path, overrides):
+    """Clone from one clip per override (None: preprocessing fails); returns the response, what reached the model
+    and the meta stored."""
+    work = tmp_path / "work"
+    work.mkdir()
+    queue = list(overrides)
+    reached, stored = [], {}
+
+    def preprocess(raw_path):
+        override = queue.pop(0)
+        if override is None:
+            raise ValueError("cannot decode")
+        out = work / f"proc-{len(list(work.iterdir()))}.wav"
+        out.write_bytes(b"")
+        return str(out), {"applied": [], "warnings": [], "kept_seconds": 4.0, **override}
+
+    class _Tensor:
+        def detach(self):
+            return self
+
+        cpu = detach
+
+    def latents(paths):
+        reached.extend(paths)
+        return _Tensor(), _Tensor()
+
+    torch = types.ModuleType("torch")
+    torch.save = lambda obj, buf: buf.write(b"STORED")
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(xs, "PREPROCESS", True)
+    monkeypatch.setattr(xs, "_preprocess_clip", preprocess)
+    monkeypatch.setattr(xs, "_audio_duration", lambda path: None)
+    monkeypatch.setattr(xs, "_conditioning_latents", latents)
+    monkeypatch.setattr(xs._mgr, "lease", lambda *a, **k: _Lease())
+    monkeypatch.setattr(xs, "_upload_to_s3", lambda data, key, ct="": stored.__setitem__(key, data))
+    monkeypatch.setattr(xs, "_clone_cache", xs.OrderedDict())
+    files = [("audio", (f"c{i}.wav", b"x" * 10, "audio/wav")) for i in range(len(overrides))]
+    r = client.post("/clone-voice", files=files, data={"companion_id": "abc"})
+    assert list(work.iterdir()) == []  # a skipped clip's file is removed too
+    return r, reached, stored
+
+
+# The VAD keeps the whole clip when it hears no speech, so kept_seconds alone doesn't show it.
+SILENT = {"warnings": ["vad_no_speech"], "kept_seconds": 20.0}
+
+
+@pytest.mark.parametrize("bad", [SILENT, {"kept_seconds": 0.0}, {"kept_seconds": 0.2}])
+def test_a_clip_with_no_speech_is_left_out_of_the_clone(client, monkeypatch, tmp_path, bad):
+    r, reached, stored = _clone_reports(client, monkeypatch, tmp_path, [{}, dict(bad, warnings=list(bad.get("warnings", [])))])
+    assert r.status_code == 200, r.text
+    assert len(reached) == 1
+    body = r.json()
+    assert (body["num_clips"], body["duration"]) == (1, 4.0)
+    assert "skipped_no_speech" not in body["clips"][0]["warnings"]
+    assert "skipped_no_speech" in body["clips"][1]["warnings"]
+    assert json.loads(stored["voice_clones/abc/meta.json"])["num_clips"] == 1
+
+
+def test_only_silent_clips_is_422_however_long(client, monkeypatch, tmp_path):
+    r, reached, stored = _clone_reports(client, monkeypatch, tmp_path, [dict(SILENT, warnings=["vad_no_speech"])])
+    assert r.status_code == 422
+    assert "skipped_no_speech" in r.json()["clips"][0]["warnings"]
+    assert (reached, stored) == ([], {})
+
+
+def test_an_unprobeable_clip_beside_a_silent_one_is_left_to_the_model(client, monkeypatch, tmp_path):
+    r, reached, _ = _clone_reports(client, monkeypatch, tmp_path, [None, dict(SILENT, warnings=["vad_no_speech"])])
+    assert r.status_code == 200, r.text
+    assert len(reached) == 1
+
+
 def test_clone_with_unprobeable_clips_is_left_to_the_model(client, monkeypatch, tmp_path):
     reached_model = []
 

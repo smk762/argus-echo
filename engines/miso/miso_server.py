@@ -2507,7 +2507,7 @@ def _safetensors_metadata(data: bytes) -> dict:
         raise ValueError("prompt.safetensors has a malformed header")
     try:
         header = json.loads(data[8 : 8 + header_len].decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise ValueError(f"prompt.safetensors has a malformed header: {exc}") from exc
     if not isinstance(header, dict):
         raise ValueError("prompt.safetensors has a malformed header")
@@ -2657,7 +2657,7 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
         meta_bytes = _read(meta_name)
         try:
             src_meta = json.loads(meta_bytes.decode("utf-8"))
-        except (ValueError, json.JSONDecodeError):
+        except (ValueError, RecursionError):  # RecursionError: JSON nested past the parser's limit
             src_meta = {}
         if not isinstance(src_meta, dict):
             src_meta = {}  # valid JSON, but not an object: as good as no sidecar
