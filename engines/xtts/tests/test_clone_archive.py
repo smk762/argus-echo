@@ -11,6 +11,7 @@ import os
 import pickle
 import struct
 import sys
+import threading
 import types
 import zipfile
 
@@ -170,3 +171,72 @@ def test_an_archive_with_no_prompt_is_422(env):
     r = _import(env, _zip({"meta.json": "{}"}))
     assert r.status_code == 422
     assert "prompt.safetensors" in r.json()["error"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"name": ["x"], "num_clips": "3", "total_seconds": "long"},
+        {"name": {"a": 1}, "num_clips": -2, "total_seconds": -1.5},
+        {"name": 7, "num_clips": True, "total_seconds": True},
+        {"name": None, "num_clips": 2.5, "total_seconds": float("nan")},
+        {"name": "\ud800", "num_clips": [], "total_seconds": float("inf")},
+        {"name": " ", "num_clips": 10**400, "total_seconds": 10**400},
+    ],
+)
+def test_sidecar_fields_of_the_wrong_type_are_not_stored(env, bad):
+    r = _import(env, _zip({"prompt.safetensors": _prompt(), "meta.json": json.dumps(bad)}), companion_id="bob")
+    assert r.status_code == 200, r.text
+    stored = json.loads(env.s3.objects["voice_clones/bob/meta.json"])
+    for meta in (r.json(), stored):
+        assert (meta["name"], meta["num_clips"], meta["total_seconds"]) == ("bob", 0, 0)
+    assert r.json()["duration"] == 0
+
+
+def test_valid_sidecar_fields_are_kept(env):
+    meta = {"name": " Bob ", "num_clips": 3, "total_seconds": 7}
+    r = _import(env, _zip({"prompt.safetensors": _prompt(), "meta.json": json.dumps(meta)}), companion_id="bob")
+    assert (r.json()["name"], r.json()["num_clips"], r.json()["duration"]) == ("Bob", 3, 7.0)
+
+
+def test_deeply_nested_json_is_not_a_server_error(env):
+    nested = b"[" * 50_000
+    r = _import(env, _zip({"prompt.safetensors": _prompt(), "meta.json": nested}), companion_id="bob")
+    assert r.status_code == 200, r.text
+    prompt = len(nested).to_bytes(8, "little") + nested
+    assert _import(env, _zip({"prompt.safetensors": prompt}), companion_id="al").status_code == 422
+
+
+@pytest.mark.parametrize("replace", [False, True])
+def test_concurrent_imports_of_one_id_do_not_interleave(env, monkeypatch, replace):
+    """The first import pauses inside its prompt upload until the second has had its chance to run."""
+    first_uploading, release = threading.Event(), threading.Event()
+    uploads = []
+
+    def upload(data, key, ct=""):
+        uploads.append((threading.current_thread().name, key.rsplit("/", 1)[-1]))
+        if len(uploads) == 1:
+            first_uploading.set()
+            release.wait(10)
+        env.s3.objects[key] = data
+
+    monkeypatch.setattr(xs, "_upload_to_s3", upload)
+    results = {}
+
+    def run(name):
+        try:
+            results[name] = xs._import_clone(_zip({"prompt.safetensors": _prompt()}), "bob", name, replace)["name"]
+        except xs.CloneExistsError:
+            results[name] = "exists"
+
+    a, b = (threading.Thread(target=run, args=(n,), name=n) for n in ("A", "B"))
+    a.start()
+    assert first_uploading.wait(10)
+    b.start()
+    b.join(0.5)  # without a lock B finishes here, between A's check and A's writes
+    release.set()
+    a.join(10)
+    b.join(10)
+    assert results == {"A": "A", "B": "B" if replace else "exists"}
+    owners = ["A", "A", "B", "B"] if replace else ["A", "A"]
+    assert uploads == [(n, f) for n, f in zip(owners, ["prompt.pt", "meta.json"] * 2)]

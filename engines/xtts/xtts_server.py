@@ -929,6 +929,15 @@ _mgr = XTTSModelManager()
 _s3_client = None
 _clone_cache: OrderedDict = OrderedDict()
 _clone_cache_lock = threading.Lock()
+# Held across a stored clone's check and writes (prompt.pt, meta.json, cache entry), so concurrent imports, clones and
+# deletes of one id can't overwrite or mix. Striped by id: a fixed number of locks, and unrelated ids rarely wait.
+_clone_write_locks = tuple(threading.Lock() for _ in range(64))
+
+
+def _clone_write_lock(companion_id: str) -> threading.Lock:
+    return _clone_write_locks[hash(companion_id) % len(_clone_write_locks)]
+
+
 _vad_model = None
 _vad_lock = threading.Lock()
 
@@ -1927,6 +1936,32 @@ async def analyze_clips(audio: list[UploadFile] = File(...)):
 _COMPANION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _COMPANION_ID_ERROR = "companion_id must be 1-64 characters of A-Z, a-z, 0-9, '_' or '-'"
 
+# A preprocessed clip with less speech than this is left out of the clone.
+_MIN_CLIP_SPEECH_S = 0.5
+
+
+def _no_usable_speech(report: dict) -> bool:
+    """Whether a preprocessed clip should be left out of the conditioning. When the VAD finds no speech,
+    ``_preprocess_clip`` keeps the whole clip, so its ``kept_seconds`` is then noise, not speech."""
+    kept = report.get("kept_seconds")
+    return "vad_no_speech" in report.get("warnings", ()) or (kept is not None and kept < _MIN_CLIP_SPEECH_S)
+
+
+def _store_clone(companion_id: str, prompt: dict, meta: dict) -> None:
+    """Write a clone's prompt.pt and meta.json and cache its latents. Hold ``_clone_write_lock(companion_id)``."""
+    import torch
+
+    buf = io.BytesIO()
+    torch.save(prompt, buf)
+    s3_key = f"voice_clones/{companion_id}/prompt.pt"
+    _upload_to_s3(buf.getvalue(), s3_key, "application/octet-stream")
+    _upload_to_s3(json.dumps(meta).encode("utf-8"), f"voice_clones/{companion_id}/meta.json", "application/json")
+    with _clone_cache_lock:
+        _clone_cache[s3_key] = prompt
+        _clone_cache.move_to_end(s3_key)  # a re-clone keeps its old place otherwise, and is evicted first
+        if len(_clone_cache) > _CLONE_CACHE_MAX:
+            _clone_cache.popitem(last=False)
+
 
 @app.post("/clone-voice")
 async def clone_voice(
@@ -1965,6 +2000,7 @@ async def clone_voice(
         return JSONResponse(status_code=413, content={"error": f"At most {MAX_CLIPS} clips per request"})
 
     raw_paths: list[str] = []
+    proc_paths: list[str] = []
     latent_paths: list[str] = []  # what we feed to XTTS (preprocessed when enabled)
     reports: list[dict] = []
     try:
@@ -1978,9 +2014,15 @@ async def clone_voice(
             if PREPROCESS:
                 try:
                     proc_path, report = await asyncio.to_thread(_preprocess_clip, raw_path)
+                    proc_paths.append(proc_path)
                     report["name"] = clip.filename
-                    latent_paths.append(proc_path)
                     reports.append(report)
+                    if _no_usable_speech(report):
+                        # Its embedding would be averaged into the clone's, and its length is not speech.
+                        report["warnings"].append("skipped_no_speech")
+                        logger.warning("clip_skipped_no_speech", name=clip.filename)
+                        continue
+                    latent_paths.append(proc_path)
                     total_duration += report.get("kept_seconds") or 0.0
                     measured = measured or report.get("kept_seconds") is not None
                     continue
@@ -1995,12 +2037,15 @@ async def clone_voice(
             measured = measured or dur is not None
 
         # Nothing measured means no clip could be probed (e.g. exotic container);
-        # let get_conditioning_latents be the real arbiter then. A measured total
-        # of 0 is different: preprocessing found no speech in any clip.
-        if measured and total_duration < 3.0:
+        # let get_conditioning_latents be the real arbiter then. No clips left is
+        # different: preprocessing found no speech in any of them.
+        if not latent_paths or (measured and total_duration < 3.0):
             return JSONResponse(
                 status_code=422,
-                content={"error": "Usable speech totals under 3 seconds after preprocessing (6+ recommended)"},
+                content={
+                    "error": "Usable speech totals under 3 seconds after preprocessing (6+ recommended)",
+                    "clips": reports,
+                },
             )
 
         try:
@@ -2016,49 +2061,37 @@ async def clone_voice(
                 return refused
             raise
     finally:
-        for path in set(raw_paths + latent_paths):
+        for path in raw_paths + proc_paths:
             try:
                 os.unlink(path)
             except OSError:
                 pass
 
-    import torch
-
     prompt = {
         "gpt_cond_latent": gpt_cond_latent.detach().cpu(),
         "speaker_embedding": speaker_embedding.detach().cpu(),
     }
-    buf = io.BytesIO()
-    torch.save(prompt, buf)
-    prompt_bytes = buf.getvalue()
-
     s3_key = f"voice_clones/{companion_id}/prompt.pt"
-    await asyncio.to_thread(_upload_to_s3, prompt_bytes, s3_key, "application/octet-stream")
-
     meta = {
         "voice_clone_id": s3_key,
         "companion_id": companion_id,
         "name": voice_name or companion_id,
-        "num_clips": len(clips),
+        "num_clips": len(latent_paths),  # the clips used
         "total_seconds": round(total_duration, 2),
         "preprocessed": PREPROCESS,
         "created_at": time.time(),
     }
-    meta_key = f"voice_clones/{companion_id}/meta.json"
-    await asyncio.to_thread(
-        _upload_to_s3, json.dumps(meta).encode("utf-8"), meta_key, "application/json"
-    )
 
-    with _clone_cache_lock:
-        _clone_cache[s3_key] = prompt
-        _clone_cache.move_to_end(s3_key)  # a re-clone keeps its old place otherwise, and is evicted first
-        if len(_clone_cache) > _CLONE_CACHE_MAX:
-            _clone_cache.popitem(last=False)
+    def _store() -> None:
+        with _clone_write_lock(companion_id):
+            _store_clone(companion_id, prompt, meta)
+
+    await asyncio.to_thread(_store)
 
     logger.info(
         "voice_cloned",
         companion_id=companion_id,
-        clips=len(clips),
+        clips=len(latent_paths),
         duration=round(total_duration, 2),
         s3_key=s3_key,
     )
@@ -2162,7 +2195,7 @@ def _safetensors_metadata(data: bytes) -> dict:
         raise ValueError("prompt.safetensors has a malformed header")
     try:
         header = json.loads(data[8 : 8 + header_len].decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+    except (ValueError, RecursionError) as exc:
         raise ValueError(f"prompt.safetensors has a malformed header: {exc}") from exc
     if not isinstance(header, dict):
         raise ValueError("prompt.safetensors has a malformed header")
@@ -2298,7 +2331,11 @@ async def delete_clone(companion_id: str):
     if not _COMPANION_ID_RE.fullmatch(companion_id):
         return JSONResponse(status_code=422, content={"error": _COMPANION_ID_ERROR})
     try:
-        objects = await asyncio.to_thread(_delete_clone, companion_id)
+        def _delete() -> int:
+            with _clone_write_lock(companion_id):
+                return _delete_clone(companion_id)
+
+        objects = await asyncio.to_thread(_delete)
     except FileNotFoundError as exc:
         return JSONResponse(status_code=404, content={"error": str(exc)})
     except Exception as exc:
@@ -2354,8 +2391,6 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
     """
     import zipfile
 
-    import torch
-
     try:
         z = zipfile.ZipFile(io.BytesIO(zip_bytes))
     except zipfile.BadZipFile as exc:
@@ -2385,42 +2420,41 @@ def _import_clone(zip_bytes: bytes, companion_override: str, name_override: str,
         meta_raw = _read_member(z, meta_name, _MAX_META_BYTES)  # oversized: ValueError → 422
         try:
             src_meta = json.loads(meta_raw.decode("utf-8"))
-        except (ValueError, json.JSONDecodeError):
+        except (ValueError, RecursionError):  # RecursionError: JSON nested past the parser's limit
             src_meta = {}
         if not isinstance(src_meta, dict):
             src_meta = {}
 
     def _text(value) -> str:
-        return value.strip() if isinstance(value, str) else ""
+        # A lone surrogate (valid JSON, "\ud800") can't be encoded, so it would break every response naming the clone.
+        return value.encode("utf-8", "ignore").decode("utf-8").strip() if isinstance(value, str) else ""
+
+    def _number(value, high: int):
+        # Compared, not converted: a JSON integer can be too large for a float, and NaN fails the comparison.
+        valid = isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= high
+        return value if valid else 0
+
+    num_clips = _number(src_meta.get("num_clips"), 1000)
 
     companion_id = _text(companion_override) or _text(src_meta.get("companion_id"))
     companion_id = _slug_id(companion_id or _text(name_override) or _text(src_meta.get("name")) or "imported-voice")
     if not _COMPANION_ID_RE.fullmatch(companion_id):  # _slug_id guarantees it; belt and braces
         raise ValueError(_COMPANION_ID_ERROR)
-    if not replace and _s3_object_exists(f"voice_clones/{companion_id}/prompt.pt"):
-        raise CloneExistsError(f"Voice clone {companion_id!r} already exists; send replace=true to overwrite")
 
-    buf = io.BytesIO()
-    torch.save(prompt, buf)
     s3_key = f"voice_clones/{companion_id}/prompt.pt"
-    _upload_to_s3(buf.getvalue(), s3_key, "application/octet-stream")
-
     meta = {
         "voice_clone_id": s3_key,
         "companion_id": companion_id,
-        "name": name_override or src_meta.get("name") or companion_id,
-        "num_clips": src_meta.get("num_clips", 0),
-        "total_seconds": src_meta.get("total_seconds", 0),
+        "name": _text(name_override) or _text(src_meta.get("name")) or companion_id,
+        "num_clips": num_clips if isinstance(num_clips, int) else 0,
+        "total_seconds": float(_number(src_meta.get("total_seconds"), 86400)),
         "imported": True,
         "created_at": time.time(),
     }
-    _upload_to_s3(json.dumps(meta).encode("utf-8"), f"voice_clones/{companion_id}/meta.json", "application/json")
-
-    with _clone_cache_lock:
-        _clone_cache[s3_key] = prompt
-        _clone_cache.move_to_end(s3_key)
-        if len(_clone_cache) > _CLONE_CACHE_MAX:
-            _clone_cache.popitem(last=False)
+    with _clone_write_lock(companion_id):
+        if not replace and _s3_object_exists(s3_key):
+            raise CloneExistsError(f"Voice clone {companion_id!r} already exists; send replace=true to overwrite")
+        _store_clone(companion_id, prompt, meta)
 
     logger.info("voice_imported", companion_id=companion_id, s3_key=s3_key)
     return {**meta, "duration": meta["total_seconds"]}

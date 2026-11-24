@@ -37,6 +37,8 @@ and consent in depth; this page is what each engine does with what you send.
   conditioning window (`XTTS_GPT_COND_LEN`, 30 s).
 - Each clip is standardised before the latents are computed: mono, resample, high-pass, VAD trim, denoise when
   the SNR is low, loudness normalisation. `/clone-voice` returns a report per clip.
+  A clip with no detected speech (or under 0.5 s of it) is left out and reported as `skipped_no_speech`; if none is
+  left, the answer is `422`.
 
 ## Miso
 

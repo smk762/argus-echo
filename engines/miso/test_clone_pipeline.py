@@ -335,6 +335,16 @@ class ImportCloneTest(_LocalStorageCase):
             out = srv._import_clone(_archive({"ref_audio": torch.zeros(SR)}, meta), "", "Voice", replace=True)
             self.assertEqual(out["companion_id"], "voice", meta)
 
+    def test_deeply_nested_meta_is_ignored(self):
+        for nested in ("[" * 100_000, '{"a":' * 100_000):
+            out = srv._import_clone(_archive({"ref_audio": torch.zeros(SR)}, nested), "", "Voice", replace=True)
+            self.assertEqual(out["companion_id"], "voice")
+
+    def test_deeply_nested_prompt_header_is_a_validation_error(self):
+        header = b"[" * 100_000
+        with self.assertRaisesRegex(ValueError, "malformed header"):
+            srv._safetensors_metadata(len(header).to_bytes(8, "little") + header)
+
     def test_non_string_meta_ids_are_ignored(self):
         out = srv._import_clone(_archive({"ref_audio": torch.zeros(SR)}, {"companion_id": 7, "name": ["x"]}), "", "")
         self.assertEqual(out["companion_id"], "imported-voice")
