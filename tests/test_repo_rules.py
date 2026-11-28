@@ -99,7 +99,7 @@ ENGINE_PEERS = {"miso": "miso", "xtts": "xtts", "qwen": "tts", "whisper": "whisp
 def _compose_service(name: str) -> str:
     """The text of one service's block in compose.yaml (two-space indented, up to the next service)."""
     match = re.search(
-        rf"^  {re.escape(name)}:\n(?P<body>(?:(?:    .*|\s*)\n)+)", (ROOT / "compose.yaml").read_text(), re.M
+        rf"^  {re.escape(name)}:(?:\s+#.*)?\n(?P<body>(?:(?:    .*|\s*)\n)+)", (ROOT / "compose.yaml").read_text(), re.M
     )
     assert match, f"compose.yaml has no service {name}"
     return match["body"]
@@ -125,6 +125,9 @@ def test_a_wyoming_bridge_is_not_labelled_as_a_peer() -> None:
     # The bridges speak Wyoming and serve no /health, so a directory built from the labels must not list them.
     for service in ("wyoming-xtts", "wyoming-miso", "wyoming-qwen", "wyoming-whisper"):
         assert "argus.peer" not in _compose_service(service)
+        # argus-ci's service-peer-label rule needs the not-a-peer mark on the service's own line.
+        compose = (ROOT / "compose.yaml").read_text()
+        assert re.search(rf"^  {service}:\s+# nosemgrep: service-peer-label\s+\S", compose, re.M), service
 
 
 def test_the_suite_file_mount_is_opt_in() -> None:

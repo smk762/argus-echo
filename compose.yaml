@@ -234,7 +234,7 @@ services:
   # *_ENGINE_URL elsewhere to bridge an engine on another host. Unset, the engine's suite-wide URL is used when
   # this shell or .env sets it (ARGUS_XTTS_URL, ARGUS_MISO_URL, ARGUS_TTS_URL for Qwen, ARGUS_WHISPER_URL), else the
   # engine in this compose project. The bridges serve Wyoming, not HTTP, so they carry no argus.peer label.
-  wyoming-xtts:
+  wyoming-xtts:  # nosemgrep: service-peer-label  a Wyoming bridge: serves Wyoming TTS (TCP), not HTTP, no /health
     profiles: [wyoming-xtts]
     build:
       context: ./engines/wyoming
@@ -246,7 +246,7 @@ services:
     environment:
       TTS_URL: ${WYOMING_XTTS_ENGINE_URL:-${ARGUS_XTTS_URL:-http://xtts:8031}}
 
-  wyoming-miso:
+  wyoming-miso:  # nosemgrep: service-peer-label  a Wyoming bridge: serves Wyoming TTS (TCP), not HTTP, no /health
     profiles: [wyoming-miso]
     build:
       context: ./engines/wyoming
@@ -267,7 +267,7 @@ services:
   # Qwen renders the whole clip before sending it, so first audio arrives only when
   # the utterance is done (Miso and XTTS start within a sentence). Qwen has no
   # GET /clones, so only the default speaker is advertised.
-  wyoming-qwen:
+  wyoming-qwen:  # nosemgrep: service-peer-label  a Wyoming bridge: serves Wyoming TTS (TCP), not HTTP, no /health
     profiles: [wyoming-qwen]
     build:
       context: ./engines/wyoming
@@ -288,7 +288,7 @@ services:
 
   # Wyoming ASR bridge (CPU, same image): buffers each utterance and posts it to the
   # whisper engine's POST /transcribe. Home Assistant adds it as a speech-to-text service.
-  wyoming-whisper:
+  wyoming-whisper:  # nosemgrep: service-peer-label  a Wyoming bridge: serves Wyoming ASR (TCP), not HTTP, no /health
     profiles: [wyoming-whisper]
     build:
       context: ./engines/wyoming
