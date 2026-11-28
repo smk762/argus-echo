@@ -363,8 +363,8 @@ The body also carries `capabilities`, `image` and argus-cortex's `ServiceHealth`
 
 ## GET /media/{key}
 
-Serves files from the local storage backend, for example
-`/media/generated/voice/<uuid>.wav` or `/media/voice_clones/<id>/meta.json`.
+Serves files from the local storage backend by storage key, for example the
+keys `generated/voice/<uuid>.wav` or `voice_clones/<id>/meta.json`.
 `404` if the file is missing, or always when `MISO_STORAGE_BACKEND=s3` (URLs
 then point at S3 directly).
 
