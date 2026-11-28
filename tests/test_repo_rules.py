@@ -92,6 +92,29 @@ def test_the_install_scan_joins_continuation_lines() -> None:
     ]
 
 
+def _splits_text(engine: str) -> bool:
+    """The engine's server asks coqui-tts to split long text into sentences, which needs spaCy."""
+    return any(re.search(r"enable_text_splitting\s*=\s*True", p.read_text()) for p in (ENGINES / engine).glob("*.py"))
+
+
+def test_an_engine_that_splits_text_installs_spacy() -> None:
+    # coqui-tts doesn't declare spaCy, but splits text over the language's limit (250 characters for English) with
+    # it: without it, every long utterance fails with "enable_text_splitting=True requires Spacy".
+    splitters = [engine for engine in PINNED_IMAGES if _splits_text(engine)]
+    assert "xtts" in splitters
+    for engine in splitters:
+        command, _flag, constraints = PINNED_IMAGES[engine]
+        installs = _install_commands((ENGINES / engine / "Dockerfile").read_text(), command)
+        assert any(re.search(r"(?<![\w-])spacy(?![\w-])", i) for i in installs), f"{engine}: no `spacy` install"
+        pins = (ENGINES / engine / constraints).read_text().splitlines()
+        assert any(line.startswith("spacy==") for line in pins), f"{engine}: {constraints} doesn't pin spacy"
+
+
+def test_the_spacy_scan_bites() -> None:
+    install = "RUN pip install -c /tmp/constraints.txt coqui-tts spacy-legacy"
+    assert not re.search(r"(?<![\w-])spacy(?![\w-])", install)
+
+
 # Each engine's compose service, the argus.peer name callers ask for, and (in gpu-tenant.yaml) its container.
 ENGINE_PEERS = {"miso": "miso", "xtts": "xtts", "qwen": "tts", "whisper": "whisper"}
 
