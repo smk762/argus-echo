@@ -3,6 +3,10 @@
 ## [Unreleased]
 
 ### Added
+- **The published docs stay importable by the handbook** (smk762/argus-handbook#28). `tests/test_docs_publishable.py`
+  holds `README.md` and `docs/*.md` to docs.dragonhound.dev's import rules: a `#` title first, no raw HTML, the
+  handbook's opsec gate, relative links that resolve, and every guide linked from the README. `docs/miso-api.md`
+  now gives its `/media/{key}` examples as storage keys, since the gate read the full URL path as a host mount.
 - **`GET /health` is also argus-cortex's `ServiceHealth`** on every engine (`argus_cortex.service.install_health`,
   smk762/argus-cortex#212): `service` (`argus-echo`), `version` (the echo release, as `image.version`), `build`
   (the commit), `status`, `started_at`, `checks`, `peer`, `wire`, `read_only` and `service_version`, beside every
