@@ -94,10 +94,7 @@ def test_the_install_scan_joins_continuation_lines() -> None:
 
 def _splits_text(engine: str) -> bool:
     """The engine's server asks coqui-tts to split long text into sentences, which needs spaCy."""
-    return any(
-        re.search(r"enable_text_splitting\s*=\s*True", p.read_text())
-        for p in (ENGINES / engine).glob("*.py")
-    )
+    return any(re.search(r"enable_text_splitting\s*=\s*True", p.read_text()) for p in (ENGINES / engine).glob("*.py"))
 
 
 def test_an_engine_that_splits_text_installs_spacy() -> None:
