@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed
+- **XTTS speaks text longer than one sentence limit.** The engine synthesises with `enable_text_splitting=True`,
+  and coqui-tts splits text over the language's character limit (250 for English) into sentences with spaCy, which
+  it doesn't declare and the image didn't install: every such utterance failed with
+  `enable_text_splitting=True requires Spacy`, a streamed one as an empty body. The XTTS image now installs
+  `spacy` (pinned in `constraints.txt` with its dependencies; the sentencizer needs no downloaded model), and
+  `tests/test_repo_rules.py` fails if an engine splits text without it.
+
 ### Added
 - **The published docs stay importable by the handbook** (smk762/argus-handbook#28). `tests/test_docs_publishable.py`
   holds `README.md` and `docs/*.md` to docs.dragonhound.dev's import rules: a `#` title first, no raw HTML, the

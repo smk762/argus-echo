@@ -40,9 +40,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # (VAD silence trimming, LUFS loudness normalisation, and stationary denoise of
 # HVAC hum seeded from the VAD gaps). The silero-vad wheel bundles its model, so
 # no network/torch.hub fetch is needed at runtime.
+#
+# spacy: xtts_server.py synthesises with enable_text_splitting=True, and coqui-tts splits text longer than the
+# language's character limit (250 for English) into sentences with spaCy, which it doesn't declare as a dependency
+# (only its zh/languages extras pull spaCy in). Without it, any utterance over the limit fails with
+# "enable_text_splitting=True requires Spacy". The sentencizer needs no downloaded language model.
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install -c /tmp/constraints.txt fastapi "uvicorn[standard]" structlog python-multipart \
-        coqui-tts "transformers==4.57.5" boto3 soundfile safetensors \
+        coqui-tts "transformers==4.57.5" boto3 soundfile safetensors spacy \
         silero-vad pyloudnorm noisereduce "argus-cortex[server,remote,yaml]>=0.16.1,<0.17"
 
 # Accept the Coqui Public Model License non-interactively so the model can be
