@@ -87,6 +87,8 @@
 - Whisper frees a backend whose load or move failed before loading another, and its eviction loop no longer starts
   a second, untracked one after moving the model to RAM.
 - Qwen: a model listing no speakers gives the missing-speaker `422`, not a `500`.
+- XTTS `/clone-voice` applies the 3-second speech minimum only when every clip going to the model was measured: a
+  short measured clip beside one whose length could not be read is left to the model instead of refused with `422`.
 - XTTS: re-cloning or re-importing a voice makes it the newest in the clone cache; the self-seeded denoise reports
   the strength it used.
 
