@@ -38,6 +38,17 @@ docker compose --profile miso up -d --build                  # 24 GB card
 docker compose --profile xtts --profile qwen up -d --build   # 8 GB card
 ```
 
+With no profile compose answers `no service selected`. To stop typing them, name this host's engines once in `.env`
+(`COMPOSE_PROFILES=xtts,qwen`), after which `docker compose up -d` works, or use the Makefile:
+
+```sh
+make launch ENGINES="xtts qwen"   # start them; ENGINES wins over COMPOSE_PROFILES for that command
+make rebuild                      # build the images from this checkout, then start; uses COMPOSE_PROFILES
+make status                       # every argus-echo container
+make logs                         # follow the chosen engines' logs
+make stop                         # stop and remove them all
+```
+
 To share the GPU through [argus-iris](https://github.com/smk762/argus-iris), set `ARGUS_GPU_BROKER_URL` (and
 `ARGUS_GPU_BROKER_TOKEN` if the broker has one) next to `ARGUS_ADMIN_TOKEN` in `.env`. That is all: each engine
 registers [gpu-tenant.yaml](gpu-tenant.yaml) at startup, and iris places each resident on the node whose agent
