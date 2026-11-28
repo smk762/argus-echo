@@ -33,6 +33,7 @@
   copy) and passes the two variables. No iris `services:` entry is needed any more.
 
 ### Changed
+- The four Wyoming bridges in `compose.yaml` are marked `# nosemgrep: service-peer-label` (they serve Wyoming, not HTTP), so argus-ci's `service-peer-label` rule passes.
 - argus-cortex `>=0.16.1,<0.17` for the package and every engine (with the `[remote,yaml]` extras in the engines);
   the XTTS and Qwen images pin `argus-cortex==0.16.1`, and Miso moves from a git commit to the release.
 - **`/health` `status` is `degraded` while `model_state` is `error`** (the last load failed), where it was `ok`.
