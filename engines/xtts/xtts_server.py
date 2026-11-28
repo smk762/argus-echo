@@ -2009,7 +2009,7 @@ async def clone_voice(
         except _ClipTooLarge as exc:
             return JSONResponse(status_code=413, content={"error": str(exc)})
         total_duration = 0.0
-        measured = False  # some clip's duration is known (even if it is 0 s of speech)
+        unmeasured = False  # some clip going to the model has no known duration
         for clip, raw_path in zip(clips, raw_paths):
             if PREPROCESS:
                 try:
@@ -2024,7 +2024,7 @@ async def clone_voice(
                         continue
                     latent_paths.append(proc_path)
                     total_duration += report.get("kept_seconds") or 0.0
-                    measured = measured or report.get("kept_seconds") is not None
+                    unmeasured = unmeasured or report.get("kept_seconds") is None
                     continue
                 except Exception as exc:
                     logger.warning("clip_preprocess_failed", name=clip.filename, error=str(exc))
@@ -2034,12 +2034,14 @@ async def clone_voice(
             latent_paths.append(raw_path)
             dur = await asyncio.to_thread(_audio_duration, raw_path)
             total_duration += dur or 0.0
-            measured = measured or dur is not None
+            unmeasured = unmeasured or dur is None
 
-        # Nothing measured means no clip could be probed (e.g. exotic container);
-        # let get_conditioning_latents be the real arbiter then. No clips left is
-        # different: preprocessing found no speech in any of them.
-        if not latent_paths or (measured and total_duration < 3.0):
+        # A clip that could not be probed (e.g. an exotic container) may hold any
+        # amount of speech, so the minimum applies only when every clip going to
+        # the model was measured; otherwise get_conditioning_latents is the real
+        # arbiter. No clips left is different: preprocessing found no speech in
+        # any of them.
+        if not latent_paths or (not unmeasured and total_duration < 3.0):
             return JSONResponse(
                 status_code=422,
                 content={

@@ -263,6 +263,20 @@ def test_an_unprobeable_clip_beside_a_silent_one_is_left_to_the_model(client, mo
     assert len(reached) == 1
 
 
+def test_a_short_measured_clip_beside_an_unprobeable_one_is_left_to_the_model(client, monkeypatch, tmp_path):
+    # 1 s measured, the other clip's length unknown (preprocessing failed, the raw probe reads None): it may hold
+    # plenty of speech, so the 3 s minimum is not applied on the measured second alone.
+    r, reached, _ = _clone_reports(client, monkeypatch, tmp_path, [{"kept_seconds": 1.0}, None])
+    assert r.status_code == 200, r.text
+    assert len(reached) == 2
+
+
+def test_short_clips_that_were_all_measured_are_still_422(client, monkeypatch, tmp_path):
+    r, reached, stored = _clone_reports(client, monkeypatch, tmp_path, [{"kept_seconds": 1.0}, {"kept_seconds": 1.5}])
+    assert r.status_code == 422 and "under 3 seconds" in r.json()["error"]
+    assert (reached, stored) == ([], {})
+
+
 def test_clone_with_unprobeable_clips_is_left_to_the_model(client, monkeypatch, tmp_path):
     reached_model = []
 
